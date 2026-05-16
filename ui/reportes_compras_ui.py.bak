@@ -1,0 +1,482 @@
+# -*- coding: utf-8 -*-
+"""
+Interfaz de usuario para reportes de compras a proveedores
+"""
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime, timedelta
+from typing import Optional
+from ui_config import COLORS, FONTS
+import os
+
+
+class ReportesComprasUI:
+    """Interfaz para visualizar reportes de compras a proveedores"""
+    
+    def __init__(self, parent, reportes_service, proveedores_repo, productos_repo, auth_manager):
+        self.parent = parent
+        self.service = reportes_service
+        self.proveedores_repo = proveedores_repo
+        self.productos_repo = productos_repo
+        self.auth = auth_manager
+        
+        self.compras_actuales = []
+        
+        self.crear_interfaz()
+        self.cargar_datos_iniciales()
+    
+    def crear_interfaz(self):
+        """Crea la interfaz principal"""
+        # Header
+        header = tk.Frame(self.parent, bg=COLORS['bg_secondary'])
+        header.pack(fill='x', padx=20, pady=(20, 10))
+        
+        tk.Label(header, text="[REPORTE] Reporte de Compras a Proveedores",
+                font=FONTS['large'], bg=COLORS['bg_secondary'],
+                fg=COLORS['text_primary']).pack(side='left')
+        
+        # Botón exportar
+        tk.Button(header, text="📤 Exportar CSV",
+                 font=FONTS['body'], bg=COLORS['success'], fg='white',
+                 cursor='hand2', command=self.exportar_csv).pack(side='right', padx=5)
+        
+        # Botón actualizar
+        tk.Button(header, text="🔄 Actualizar",
+                 font=FONTS['body'], bg=COLORS['info'], fg='white',
+                 cursor='hand2', command=self.aplicar_filtros).pack(side='right')
+        
+        # Contenedor principal con scroll
+        main_container = tk.Frame(self.parent, bg=COLORS['bg_secondary'])
+        main_container.pack(fill='both', expand=True, padx=20, pady=10)
+        
+        # Canvas y scrollbar
+        canvas = tk.Canvas(main_container, bg=COLORS['bg_secondary'], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_container, orient='vertical', command=canvas.yview)
+        
+        self.scrollable_frame = tk.Frame(canvas, bg=COLORS['bg_secondary'])
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=self.scrollable_frame, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        # Crear secciones
+        self.crear_seccion_filtros()
+        self.crear_seccion_estadisticas()
+        self.crear_seccion_graficos()
+        self.crear_seccion_tabla()
+    
+    def crear_seccion_filtros(self):
+        """Crea la sección de filtros"""
+        filtros_frame = tk.LabelFrame(self.scrollable_frame, text="🔍 Filtros",
+                                     font=FONTS['body_bold'], bg='white',
+                                     fg=COLORS['text_primary'], padx=15, pady=15)
+        filtros_frame.pack(fill='x', pady=(0, 15))
+        
+        # Fila 1: Proveedor y Producto
+        fila1 = tk.Frame(filtros_frame, bg='white')
+        fila1.pack(fill='x', pady=5)
+        
+        # Filtro Proveedor
+        tk.Label(fila1, text="Proveedor:", font=FONTS['body'],
+                bg='white').pack(side='left', padx=(0, 10))
+        
+        # [OK] CORRECCIÓN: Obtener proveedores directamente desde el servicio
+        try:
+            proveedores = self.service.obtener_proveedores_activos()
+            self.proveedores_dict = {p['nombre']: p['id'] for p in proveedores}
+            valores_prov = ["-- Todos --"] + list(self.proveedores_dict.keys())
+        except Exception as e:
+            print(f"Error cargando proveedores: {e}")
+            self.proveedores_dict = {}
+            valores_prov = ["-- Todos --"]
+        
+        self.proveedor_combo = ttk.Combobox(fila1, values=valores_prov,
+                                           font=FONTS['body'], state='readonly', width=25)
+        self.proveedor_combo.set("-- Todos --")
+        self.proveedor_combo.pack(side='left', padx=(0, 20))
+        
+        # Filtro Producto
+        tk.Label(fila1, text="Producto:", font=FONTS['body'],
+                bg='white').pack(side='left', padx=(0, 10))
+        
+        productos = self.productos_repo.listar()
+        self.productos_dict = {p.nombre: p.id for p in productos if p.activo}
+        valores_prod = ["-- Todos --"] + list(self.productos_dict.keys())
+        
+        self.producto_combo = ttk.Combobox(fila1, values=valores_prod,
+                                          font=FONTS['body'], state='readonly', width=30)
+        self.producto_combo.set("-- Todos --")
+        self.producto_combo.pack(side='left')
+        
+        # Fila 2: Fechas
+        fila2 = tk.Frame(filtros_frame, bg='white')
+        fila2.pack(fill='x', pady=5)
+        
+        tk.Label(fila2, text="Desde:", font=FONTS['body'],
+                bg='white').pack(side='left', padx=(0, 10))
+        
+        self.fecha_inicio = tk.Entry(fila2, font=FONTS['body'], width=12)
+        self.fecha_inicio.insert(0, (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'))
+        self.fecha_inicio.pack(side='left', padx=(0, 20))
+        
+        tk.Label(fila2, text="Hasta:", font=FONTS['body'],
+                bg='white').pack(side='left', padx=(0, 10))
+        
+        self.fecha_fin = tk.Entry(fila2, font=FONTS['body'], width=12)
+        self.fecha_fin.insert(0, datetime.now().strftime('%Y-%m-%d'))
+        self.fecha_fin.pack(side='left', padx=(0, 20))
+        
+        # Botón aplicar
+        tk.Button(fila2, text="🔍 Aplicar Filtros",
+                 font=FONTS['body'], bg=COLORS['primary'], fg='white',
+                 cursor='hand2', command=self.aplicar_filtros).pack(side='left', padx=10)
+        
+        # Botón limpiar
+        tk.Button(fila2, text="🗑️ Limpiar",
+                 font=FONTS['body'], bg=COLORS['secondary'], fg='white',
+                 cursor='hand2', command=self.limpiar_filtros).pack(side='left')
+    
+    def crear_seccion_estadisticas(self):
+        """Crea las tarjetas de estadísticas"""
+        self.stats_frame = tk.Frame(self.scrollable_frame, bg=COLORS['bg_secondary'])
+        self.stats_frame.pack(fill='x', pady=(0, 15))
+        
+        # Se llenarán con datos reales
+        self.cards = {}
+    
+    def crear_card_estadistica(self, titulo, valor, subtitulo, color, icono):
+        """Crea una tarjeta de estadística"""
+        card = tk.Frame(self.stats_frame, bg='white', relief='solid', borderwidth=1)
+        card.pack(side='left', fill='both', expand=True, padx=5)
+        
+        # Barra superior de color
+        tk.Frame(card, bg=color, height=5).pack(fill='x')
+        
+        # Contenido
+        content = tk.Frame(card, bg='white')
+        content.pack(fill='both', expand=True, padx=15, pady=15)
+        
+        tk.Label(content, text=icono, font=('Segoe UI', 24),
+                bg='white').pack()
+        tk.Label(content, text=titulo, font=FONTS['small'],
+                bg='white', fg=COLORS['text_secondary']).pack()
+        tk.Label(content, text=valor, font=FONTS['heading'],
+                bg='white', fg=COLORS['text_primary']).pack(pady=5)
+        tk.Label(content, text=subtitulo, font=FONTS['small'],
+                bg='white', fg=COLORS['text_light']).pack()
+    
+    def crear_seccion_graficos(self):
+        """Crea la sección de gráficos"""
+        graficos_frame = tk.Frame(self.scrollable_frame, bg=COLORS['bg_secondary'])
+        graficos_frame.pack(fill='x', pady=(0, 15))
+        
+        # Gráfico: Top proveedores
+        self.grafico_proveedores_frame = tk.LabelFrame(
+            graficos_frame, text="📈 Top 5 Proveedores por Monto Comprado",
+            font=FONTS['body_bold'], bg='white', fg=COLORS['text_primary'],
+            padx=15, pady=15
+        )
+        self.grafico_proveedores_frame.pack(side='left', fill='both', expand=True, padx=(0, 10))
+        
+        # Gráfico: Productos más comprados
+        self.grafico_productos_frame = tk.LabelFrame(
+            graficos_frame, text="📦 Top 5 Productos Más Comprados",
+            font=FONTS['body_bold'], bg='white', fg=COLORS['text_primary'],
+            padx=15, pady=15
+        )
+        self.grafico_productos_frame.pack(side='left', fill='both', expand=True)
+    
+    def crear_grafico_barras(self, parent, datos, key_nombre, key_valor, color):
+        """Crea un gráfico de barras simple"""
+        # Limpiar frame
+        for widget in parent.winfo_children():
+            widget.destroy()
+        
+        if not datos:
+            tk.Label(parent, text="No hay datos para mostrar",
+                    font=FONTS['body'], bg='white', fg=COLORS['text_light']).pack(pady=20)
+            return
+        
+        # Encontrar valor máximo para escala
+        max_valor = max([d[key_valor] for d in datos]) if datos else 1
+        
+        # Crear barras
+        for item in datos:
+            nombre = item[key_nombre]
+            valor = item[key_valor]
+            porcentaje = (valor / max_valor * 100) if max_valor > 0 else 0
+            
+            # Frame de la barra
+            barra_frame = tk.Frame(parent, bg='white')
+            barra_frame.pack(fill='x', pady=3)
+            
+            # Nombre
+            tk.Label(barra_frame, text=nombre[:30], font=FONTS['small'],
+                    bg='white', fg=COLORS['text_secondary'], width=25,
+                    anchor='w').pack(side='left')
+            
+            # Barra visual
+            barra_container = tk.Frame(barra_frame, bg=COLORS['bg_secondary'],
+                                      height=20, width=200)
+            barra_container.pack(side='left', padx=10)
+            barra_container.pack_propagate(False)
+            
+            barra = tk.Frame(barra_container, bg=color, width=int(porcentaje * 2))
+            barra.pack(side='left', fill='y')
+            
+            # Valor
+            tk.Label(barra_frame, text=f"${valor:,.0f}",
+                    font=FONTS['small'], bg='white',
+                    fg=COLORS['text_primary']).pack(side='left')
+    
+    def crear_seccion_tabla(self):
+        """Crea la tabla detallada de compras"""
+        tabla_frame = tk.LabelFrame(self.scrollable_frame, text="📋 Detalle de Compras",
+                                   font=FONTS['body_bold'], bg='white',
+                                   fg=COLORS['text_primary'], padx=10, pady=10)
+        tabla_frame.pack(fill='both', expand=True)
+        
+        # Frame para Treeview y scrollbar
+        tree_frame = tk.Frame(tabla_frame, bg='white')
+        tree_frame.pack(fill='both', expand=True)
+        
+        # Scrollbars
+        scroll_y = ttk.Scrollbar(tree_frame, orient='vertical')
+        scroll_x = ttk.Scrollbar(tree_frame, orient='horizontal')
+        
+        # Treeview
+        columnas = ('fecha', 'proveedor', 'factura', 'producto', 'cantidad', 
+                   'precio_unit', 'total', 'usuario')
+        
+        self.tree = ttk.Treeview(tree_frame, columns=columnas, show='headings',
+                                yscrollcommand=scroll_y.set,
+                                xscrollcommand=scroll_x.set, height=15)
+        
+        # Configurar scrollbars
+        scroll_y.config(command=self.tree.yview)
+        scroll_x.config(command=self.tree.xview)
+        
+        # Encabezados
+        self.tree.heading('fecha', text='Fecha')
+        self.tree.heading('proveedor', text='Proveedor')
+        self.tree.heading('factura', text='# Factura')
+        self.tree.heading('producto', text='Producto')
+        self.tree.heading('cantidad', text='Cantidad')
+        self.tree.heading('precio_unit', text='Precio Unit.')
+        self.tree.heading('total', text='Total')
+        self.tree.heading('usuario', text='Usuario')
+        
+        # Anchos de columna
+        self.tree.column('fecha', width=100)
+        self.tree.column('proveedor', width=150)
+        self.tree.column('factura', width=100)
+        self.tree.column('producto', width=200)
+        self.tree.column('cantidad', width=80)
+        self.tree.column('precio_unit', width=100)
+        self.tree.column('total', width=100)
+        self.tree.column('usuario', width=120)
+        
+        # Empaquetar
+        scroll_y.pack(side='right', fill='y')
+        scroll_x.pack(side='bottom', fill='x')
+        self.tree.pack(side='left', fill='both', expand=True)
+        
+        # Etiqueta de totales
+        self.label_totales = tk.Label(tabla_frame, text="",
+                                      font=FONTS['body_bold'], bg='white',
+                                      fg=COLORS['text_primary'])
+        self.label_totales.pack(pady=10)
+    
+    def cargar_datos_iniciales(self):
+        """Carga los datos iniciales"""
+        self.aplicar_filtros()
+    
+    def aplicar_filtros(self):
+        """Aplica los filtros y actualiza la visualización"""
+        try:
+            # Obtener filtros
+            proveedor_sel = self.proveedor_combo.get()
+            proveedor_id = self.proveedores_dict.get(proveedor_sel) if proveedor_sel != "-- Todos --" else None
+            
+            producto_sel = self.producto_combo.get()
+            producto_id = self.productos_dict.get(producto_sel) if producto_sel != "-- Todos --" else None
+            
+            fecha_inicio = self.fecha_inicio.get()
+            fecha_fin = self.fecha_fin.get()
+            
+            # Obtener datos
+            self.compras_actuales = self.service.obtener_compras_por_proveedor(
+                proveedor_id=proveedor_id,
+                producto_id=producto_id,
+                fecha_inicio=fecha_inicio,
+                fecha_fin=fecha_fin
+            )
+            
+            # Actualizar visualización
+            self.actualizar_estadisticas(fecha_inicio, fecha_fin, proveedor_id)
+            self.actualizar_graficos(fecha_inicio, fecha_fin)
+            self.actualizar_tabla()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al aplicar filtros: {str(e)}")
+    
+    def actualizar_estadisticas(self, fecha_inicio, fecha_fin, proveedor_id):
+        """Actualiza las tarjetas de estadísticas"""
+        # Limpiar cards existentes
+        for widget in self.stats_frame.winfo_children():
+            widget.destroy()
+        
+        try:
+            stats = self.service.obtener_estadisticas_generales(fecha_inicio, fecha_fin)
+            
+            self.crear_card_estadistica(
+                "Total Compras",
+                f"{stats['total_compras']}",
+                "operaciones realizadas",
+                COLORS['info'],
+                "🛒"
+            )
+            
+            self.crear_card_estadistica(
+                "Monto Total",
+                f"${stats['monto_total']:,.0f}",
+                "invertido en compras",
+                COLORS['success'],
+                "💰"
+            )
+            
+            self.crear_card_estadistica(
+                "Proveedores",
+                f"{stats['proveedores_activos']}",
+                "proveedores diferentes",
+                COLORS['primary'],
+                "🏪"
+            )
+            
+            self.crear_card_estadistica(
+                "Productos",
+                f"{stats['productos_comprados']}",
+                "productos distintos",
+                COLORS['warning'],
+                "📦"
+            )
+            
+            self.crear_card_estadistica(
+                "Unidades",
+                f"{stats['unidades_totales']:,.0f}",
+                "unidades compradas",
+                COLORS['secondary'],
+                "[REPORTE]"
+            )
+            
+        except Exception as e:
+            print(f"Error actualizando estadísticas: {e}")
+    
+    def actualizar_graficos(self, fecha_inicio, fecha_fin):
+        """Actualiza los gráficos"""
+        try:
+            # Top proveedores
+            top_proveedores = self.service.obtener_proveedores_principales(
+                limite=5, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin
+            )
+            self.crear_grafico_barras(
+                self.grafico_proveedores_frame,
+                top_proveedores,
+                'proveedor_nombre',
+                'monto_total',
+                COLORS['primary']
+            )
+            
+            # Top productos
+            top_productos = self.service.obtener_productos_mas_comprados(
+                limite=5, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin
+            )
+            self.crear_grafico_barras(
+                self.grafico_productos_frame,
+                top_productos,
+                'nombre',
+                'monto_total',
+                COLORS['success']
+            )
+            
+        except Exception as e:
+            print(f"Error actualizando gráficos: {e}")
+    
+    def actualizar_tabla(self):
+        """Actualiza la tabla con las compras"""
+        # Limpiar tabla
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        total_general = 0
+        total_unidades = 0
+        
+        for compra in self.compras_actuales:
+            fecha = compra['fecha'][:10] if compra['fecha'] else ''
+            proveedor = compra['proveedor_nombre']
+            factura = compra.get('num_factura', '')
+            producto = compra['producto_nombre']
+            cantidad = compra['cantidad']
+            precio_unit = compra['precio_unitario']
+            total = compra['costo_total']
+            usuario = compra.get('usuario_nombre', '')
+            
+            self.tree.insert('', 'end', values=(
+                fecha,
+                proveedor,
+                factura,
+                producto,
+                cantidad,
+                f"${precio_unit:,.2f}",
+                f"${total:,.2f}",
+                usuario
+            ))
+            
+            total_general += total
+            total_unidades += cantidad
+        
+        # Actualizar etiqueta de totales
+        texto_totales = f"Total Registros: {len(self.compras_actuales)} | "
+        texto_totales += f"Total Unidades: {total_unidades:,.0f} | "
+        texto_totales += f"Total Invertido: ${total_general:,.2f}"
+        self.label_totales.config(text=texto_totales)
+    
+    def limpiar_filtros(self):
+        """Limpia todos los filtros"""
+        self.proveedor_combo.set("-- Todos --")
+        self.producto_combo.set("-- Todos --")
+        self.fecha_inicio.delete(0, tk.END)
+        self.fecha_inicio.insert(0, (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'))
+        self.fecha_fin.delete(0, tk.END)
+        self.fecha_fin.insert(0, datetime.now().strftime('%Y-%m-%d'))
+        self.aplicar_filtros()
+    
+    def exportar_csv(self):
+        """Exporta el reporte actual a CSV"""
+        if not self.compras_actuales:
+            messagebox.showwarning("Advertencia", "No hay datos para exportar")
+            return
+        
+        try:
+            archivo = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV", "*.csv"), ("Todos", "*.*")],
+                initialfile=f"reporte_compras_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            )
+            
+            if archivo:
+                self.service.exportar_reporte_csv(self.compras_actuales, archivo)
+                messagebox.showinfo("Éxito", f"Reporte exportado correctamente:\n{archivo}")
+                
+                # Preguntar si desea abrir el archivo
+                if messagebox.askyesno("Abrir archivo", "¿Desea abrir el archivo exportado?"):
+                    os.startfile(archivo)
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al exportar: {str(e)}")

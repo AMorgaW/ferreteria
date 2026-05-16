@@ -1,0 +1,1929 @@
+"""
+PUNTO DE VENTA MODERNO - Diseño Atractivo e Interactivo
+Interfaz rediseñada completamente con estilo e-commerce
+"""
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+from datetime import datetime
+from ui_config_modern import COLORS_MODERN as COLORS, FONTS_MODERN as FONTS, ICONS
+from unidades_venta_manager import UnidadesVentaManager
+
+
+class ProductCard(tk.Frame):
+    """Tarjeta de producto estilo e-commerce"""
+
+    def __init__(self, parent, producto, callback):
+        super().__init__(parent, bg=COLORS['bg_card'], relief='raised', borderwidth=1)
+        self.producto = producto
+        self.callback = callback
+
+        # Evento de hover
+        self.bind('<Enter>', self.on_enter)
+        self.bind('<Leave>', self.on_leave)
+        self.bind('<Button-1>', self.on_click)
+
+        self.crear_ui()
+
+    def crear_ui(self):
+        """Crea la tarjeta del producto - COMPACTA"""
+        # Padding interno reducido
+        main = tk.Frame(self, bg=COLORS['bg_card'], padx=8, pady=8)
+        main.pack(fill='both', expand=True)
+
+        # Icono del producto (más pequeño)
+        icon_label = tk.Label(main, text=ICONS['product'],
+                             font=('Segoe UI', 24),
+                             bg=COLORS['bg_card'])
+        icon_label.pack()
+        icon_label.bind('<Button-1>', self.on_click)
+
+        # Nombre del producto (más compacto)
+        nombre = self.producto.get('nombre', 'Sin nombre')[:25]
+        nombre_label = tk.Label(main, text=nombre,
+                               font=FONTS['small'],
+                               bg=COLORS['bg_card'],
+                               fg=COLORS['text_primary'],
+                               wraplength=140)
+        nombre_label.pack(pady=(5, 3))
+        nombre_label.bind('<Button-1>', self.on_click)
+
+        # Marca (si existe) para desambiguar productos
+        marca = (self.producto.get('marca') or '').strip()
+        if marca:
+            marca_label = tk.Label(main, text=marca[:25],
+                                  font=FONTS['small'],
+                                  bg=COLORS['bg_card'],
+                                  fg=COLORS['text_secondary'],
+                                  wraplength=140)
+            marca_label.pack(pady=(0, 3))
+            marca_label.bind('<Button-1>', self.on_click)
+
+        # Precio (más compacto)
+        precio = self.producto.get('precio_venta', 0)
+        precio_label = tk.Label(main, text=f"${precio:,.0f}",
+                               font=FONTS['body_bold'],
+                               bg=COLORS['bg_card'],
+                               fg=COLORS['primary'])
+        precio_label.pack(pady=3)
+        precio_label.bind('<Button-1>', self.on_click)
+
+        # Stock (con indicador visual, más compacto)
+        stock = self.producto.get('stock', 0)
+        if stock > 10:
+            stock_color = COLORS['success']
+            stock_text = f"Stock: {stock}"
+        elif stock > 0:
+            stock_color = COLORS['warning']
+            stock_text = f"Stock: {stock}"
+        else:
+            stock_color = COLORS['danger']
+            stock_text = "Sin stock"
+
+        stock_label = tk.Label(main, text=stock_text,
+                              font=FONTS['small'],
+                              bg=COLORS['bg_card'],
+                              fg=stock_color)
+        stock_label.pack(pady=3)
+        stock_label.bind('<Button-1>', self.on_click)
+
+        # Botón agregar (más pequeño, sin icono)
+        if stock > 0:
+            btn = tk.Button(main, text="Agregar",
+                           font=FONTS['small'],
+                           bg=COLORS['primary'],
+                           fg='white',
+                           activebackground=COLORS['primary_dark'],
+                           cursor='hand2',
+                           relief='flat',
+                           command=self.on_click)
+            btn.pack(fill='x', pady=(5, 0), ipady=5)
+
+    def on_enter(self, event):
+        """Efecto hover"""
+        self.config(bg=COLORS['bg_hover'], relief='raised', borderwidth=2)
+        for child in self.winfo_children():
+            if isinstance(child, tk.Frame):
+                child.config(bg=COLORS['bg_hover'])
+                for subchild in child.winfo_children():
+                    if isinstance(subchild, tk.Label):
+                        subchild.config(bg=COLORS['bg_hover'])
+
+    def on_leave(self, event):
+        """Quitar efecto hover"""
+        self.config(bg=COLORS['bg_card'], relief='raised', borderwidth=1)
+        for child in self.winfo_children():
+            if isinstance(child, tk.Frame):
+                child.config(bg=COLORS['bg_card'])
+                for subchild in child.winfo_children():
+                    if isinstance(subchild, tk.Label):
+                        subchild.config(bg=COLORS['bg_card'])
+
+    def on_click(self, event=None):
+        """Llamar al callback"""
+        if self.producto.get('stock', 0) > 0:
+            self.callback(self.producto)
+
+
+class DialogoCantidadModern(tk.Toplevel):
+    """Diálogo moderno para ingresar cantidad con soporte dinámico de unidades"""
+
+    def __init__(self, parent, producto, db_manager):
+        super().__init__(parent)
+        self.title("Cantidad")
+        self.cantidad = None
+        self.producto = producto
+        self.db_manager = db_manager
+        self.unidades_manager = UnidadesVentaManager(db_manager)
+        
+        # Obtener información del producto
+        self.producto_nombre = producto.get('nombre', 'Producto')
+        self.stock_disponible = producto.get('stock', 0)
+        self.categoria = producto.get('categoria', '')
+        
+        # Obtener unidades de venta disponibles para este producto
+        self.unidades_disponibles = self.unidades_manager.obtener_unidades_venta_producto(self.producto)
+        
+        # Configurar ventana (ajustar altura según número de opciones)
+        width = 650  # Más ancho para mejor legibilidad
+        base_height = 500  # Altura base aumentada
+        opciones_height = len(self.unidades_disponibles) * 100 if len(self.unidades_disponibles) > 1 else 0
+        height = base_height + opciones_height
+        self.geometry(f"{width}x{height}")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        # Centrar
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f"+{x}+{y}")
+
+        self.crear_ui()
+
+        self.entry_cantidad.focus()
+        self.entry_cantidad.select_range(0, tk.END)
+
+    def crear_ui(self):
+        """Crea la interfaz moderna"""
+        # Frame principal con color de fondo
+        main_frame = tk.Frame(self, bg='white')
+        main_frame.pack(fill='both', expand=True)
+
+        # Header con gradiente simulado
+        header = tk.Frame(main_frame, bg=COLORS['primary'], height=100)
+        header.pack(fill='x')
+        header.pack_propagate(False)
+
+        # Contenedor del header
+        header_content = tk.Frame(header, bg=COLORS['primary'])
+        header_content.pack(expand=True)
+
+        tk.Label(header_content, text="📦",
+                font=('Segoe UI Emoji', 36),
+                bg=COLORS['primary'], fg='white').pack(pady=(5, 0))
+        
+        tk.Label(header_content, text=self.producto_nombre,
+                font=('Segoe UI', 16, 'bold'),
+                bg=COLORS['primary'], fg='white',
+                wraplength=600).pack(pady=(5, 10))
+
+        # Contenido
+        content = tk.Frame(main_frame, bg='white', padx=35, pady=25)
+        content.pack(fill='both', expand=True)
+
+        # Stock disponible (destacado con mejor diseño)
+        stock_frame = tk.Frame(content, bg=COLORS['success_light'], 
+                              relief='solid', borderwidth=2, 
+                              highlightthickness=0)
+        stock_frame.pack(fill='x', pady=(0, 25))
+        
+        stock_inner = tk.Frame(stock_frame, bg=COLORS['success_light'])
+        stock_inner.pack(padx=25, pady=18)
+
+        tk.Label(stock_inner, text="✓ Stock Disponible",
+                font=('Segoe UI', 11, 'bold'),
+                bg=COLORS['success_light'],
+                fg=COLORS['success']).pack()
+        
+        # Usar el manager para formatear el stock con unidades alternativas
+        stock_formateado = self.unidades_manager.formatear_stock_display(self.producto)
+        
+        tk.Label(stock_inner, text=stock_formateado,
+                font=('Segoe UI', 20, 'bold'),
+                bg=COLORS['success_light'],
+                fg=COLORS['text_primary']).pack(pady=(5, 0))
+        
+        # Si hay múltiples unidades de venta, mostrar opciones
+        if len(self.unidades_disponibles) > 1:
+            tk.Label(content, text="Seleccione el Tipo de Venta",
+                    font=('Segoe UI', 13, 'bold'),
+                    bg='white',
+                    fg=COLORS['text_primary']).pack(anchor='w', pady=(5, 15))
+            
+            tipo_frame = tk.Frame(content, bg='white')
+            tipo_frame.pack(fill='x', pady=(0, 20))
+            
+            # Variable para la unidad seleccionada (usar el nombre de la primera unidad como default)
+            primera_unidad = self.unidades_disponibles[0]['nombre']
+            self.unidad_seleccionada = tk.StringVar(value=primera_unidad)
+            
+            # Crear botones dinámicamente para cada unidad disponible
+            self.radio_buttons = []
+            num_opciones = len(self.unidades_disponibles)
+            
+            for idx, unidad_info in enumerate(self.unidades_disponibles):
+                nombre_unidad = unidad_info['nombre']
+                factor = unidad_info['factor']
+                
+                # Frame individual para cada opción con mejor estructura
+                opcion_container = tk.Frame(tipo_frame, bg='white')
+                opcion_container.pack(side='left', fill='both', expand=True, padx=6)
+                
+                # Botón principal - SOLO MUESTRA EL NOMBRE DE LA FRACCIÓN
+                # Extraer solo la parte importante (ej: "3/4 Galón" de nombre completo)
+                texto_boton = nombre_unidad  # Por ejemplo: "Galón", "3/4 Galón", "1/2 Galón"
+                
+                radio_btn = tk.Radiobutton(opcion_container,
+                                          text=texto_boton,
+                                          variable=self.unidad_seleccionada,
+                                          value=nombre_unidad,
+                                          font=('Segoe UI', 18, 'bold'),  # GRANDE Y LEGIBLE
+                                          bg='#E8E8E8',
+                                          fg='#2C3E50',
+                                          selectcolor='#10B981',  # Verde más vibrante
+                                          activebackground='#10B981',
+                                          activeforeground='white',
+                                          relief='solid',
+                                          borderwidth=2,
+                                          indicatoron=False,
+                                          height=3,  # Altura consistente
+                                          cursor='hand2',
+                                          wraplength=140,
+                                          justify='center',
+                                          padx=15,
+                                          pady=15,
+                                          command=self.actualizar_seleccion_venta)
+                radio_btn.pack(fill='both', expand=True)
+                self.radio_buttons.append(radio_btn)
+                
+                # Etiqueta descriptiva DEBAJO (secundaria, más pequeña)
+                if factor == 1:
+                    descripcion = "Unidad base"
+                    color_desc = COLORS['text_secondary']
+                else:
+                    descripcion = f"= {factor} unid. base"
+                    color_desc = COLORS['info']
+                
+                tk.Label(opcion_container, 
+                        text=descripcion,
+                        font=('Segoe UI', 11),  # Más pequeño que el texto principal
+                        bg='white',
+                        fg=color_desc).pack(pady=(8, 0))
+        else:
+            # Solo una unidad disponible, usar directamente
+            self.unidad_seleccionada = tk.StringVar(value=self.unidades_disponibles[0]['nombre'])
+            self.radio_buttons = []
+        
+        # Frame para el campo de cantidad (dinámico) - CREAR ANTES DE USARLO
+        self.cantidad_container = tk.Frame(content, bg='white')
+        self.cantidad_container.pack(fill='x', pady=(20, 20))
+        
+        # Aplicar colores iniciales y mostrar campo
+        if len(self.unidades_disponibles) > 1:
+            self.actualizar_seleccion_venta()
+        else:
+            self.mostrar_campo_cantidad()
+
+        # Separador
+        tk.Frame(content, bg=COLORS['border'], height=1).pack(fill='x', pady=15)
+
+        # Botones de acción
+        action_frame = tk.Frame(content, bg='white')
+        action_frame.pack(fill='x')
+
+        btn_cancel = tk.Button(action_frame, text="✗ Cancelar",
+                              font=('Segoe UI', 13),
+                              bg=COLORS['bg_secondary'],
+                              fg=COLORS['text_primary'],
+                              cursor='hand2',
+                              relief='raised',
+                              borderwidth=2,
+                              command=self.cancelar)
+        btn_cancel.pack(side='left', fill='x', expand=True, padx=(0, 10), ipady=16)
+
+        btn_ok = tk.Button(action_frame, text="✓ Confirmar y Agregar",
+                          font=('Segoe UI', 13, 'bold'),
+                          bg=COLORS['success'],
+                          fg='white',
+                          cursor='hand2',
+                          relief='raised',
+                          borderwidth=2,
+                          activebackground='#0D9F6E',
+                          command=self.aceptar)
+        btn_ok.pack(side='left', fill='x', expand=True, padx=(10, 0), ipady=16)
+
+    def actualizar_seleccion_venta(self):
+        """Actualiza los colores de los botones según la selección y muestra campo de cantidad"""
+        unidad_actual = self.unidad_seleccionada.get()
+        
+        # Actualizar colores de todos los botones con mejor contraste
+        for idx, unidad_info in enumerate(self.unidades_disponibles):
+            if unidad_info['nombre'] == unidad_actual:
+                # Seleccionado: Verde vibrante con texto blanco
+                self.radio_buttons[idx].config(
+                    bg='#10B981', 
+                    fg='white',
+                    relief='solid',
+                    borderwidth=3
+                )
+            else:
+                # No seleccionado: Gris claro con texto oscuro
+                self.radio_buttons[idx].config(
+                    bg='#E8E8E8', 
+                    fg='#2C3E50',
+                    relief='solid',
+                    borderwidth=2
+                )
+        
+        # Mostrar el campo de cantidad
+        self.mostrar_campo_cantidad()
+    
+    def mostrar_campo_cantidad(self):
+        """Muestra el campo de cantidad dinámico según la unidad seleccionada"""
+        # Limpiar contenedor
+        for widget in self.cantidad_container.winfo_children():
+            widget.destroy()
+        
+        # Obtener información de la unidad seleccionada
+        unidad_actual = self.unidad_seleccionada.get()
+        unidad_info = next((u for u in self.unidades_disponibles if u['nombre'] == unidad_actual), None)
+        
+        if not unidad_info:
+            return
+        
+        factor = unidad_info['factor']
+        
+        # Determinar etiqueta y texto de ayuda
+        etiqueta = f"Cantidad de {unidad_actual}"
+        texto_ayuda = None if factor == 1 else f"1 {unidad_actual} = {factor} unidades base"
+        
+        # Label del campo
+        tk.Label(self.cantidad_container, text=etiqueta,
+                font=('Segoe UI', 14, 'bold'),
+                bg='white',
+                fg=COLORS['text_primary']).pack(anchor='w', pady=(0, 10))
+        
+        # Campo de entrada (MUY GRANDE Y VISIBLE)
+        self.entry_cantidad = tk.Entry(self.cantidad_container, 
+                                       font=('Segoe UI', 52, 'bold'),
+                                       justify='center',
+                                       relief='solid',
+                                       borderwidth=4,
+                                       fg=COLORS['primary'],
+                                       bg='#FAFAFA',
+                                       highlightthickness=2,
+                                       highlightbackground=COLORS['primary'],
+                                       highlightcolor=COLORS['primary'])
+        self.entry_cantidad.pack(fill='x', ipady=30, pady=(5, 10))
+        self.entry_cantidad.insert(0, "1")
+        self.entry_cantidad.focus()
+        self.entry_cantidad.select_range(0, tk.END)
+        self.entry_cantidad.bind('<Return>', lambda e: self.aceptar())
+        self.entry_cantidad.bind('<KP_Enter>', lambda e: self.aceptar())
+        
+        # Texto de ayuda (mostrar solo si no es unidad base)
+        if texto_ayuda:
+            tk.Label(self.cantidad_container, text=texto_ayuda,
+                    font=('Segoe UI', 10),
+                    bg='white',
+                    fg=COLORS['info']).pack(pady=(8, 0))
+    
+    def aceptar(self):
+        """Valida y acepta la cantidad según la unidad seleccionada"""
+        try:
+            cantidad_str = self.entry_cantidad.get().strip()
+            cantidad_ingresada = float(cantidad_str)
+            
+            if cantidad_ingresada <= 0:
+                messagebox.showwarning("Cantidad inválida",
+                                     "La cantidad debe ser mayor a 0",
+                                     parent=self)
+                return
+            
+            # Validar si el producto permite decimales
+            permite_decimales = self.producto.get('permite_decimales', False)
+            
+            if not permite_decimales and cantidad_ingresada != int(cantidad_ingresada):
+                nombre_producto = self.producto.get('nombre', 'Este producto')
+                messagebox.showwarning(
+                    "Cantidad inválida",
+                    f"{nombre_producto} no permite cantidades decimales.\n\n"
+                    f"Solo puede ingresar números enteros (1, 2, 3, etc.).\n\n"
+                    f"Cantidad ingresada: {cantidad_ingresada}",
+                    parent=self
+                )
+                return
+            
+            # Obtener unidad seleccionada
+            unidad_actual = self.unidad_seleccionada.get()
+            
+            # Convertir a unidad base usando el manager
+            cantidad_base, _ = self.unidades_manager.convertir_a_unidad_base(
+                self.producto,
+                cantidad_ingresada,
+                unidad_actual
+            )
+            
+            # Validar stock disponible
+            es_valido, mensaje = self.unidades_manager.validar_stock_disponible(
+                self.producto,
+                cantidad_ingresada,
+                unidad_actual
+            )
+            
+            if not es_valido:
+                messagebox.showwarning("Stock insuficiente", mensaje, parent=self)
+                return
+            
+            # Guardar cantidad en unidades base
+            self.cantidad = cantidad_base
+            
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("Error", "Ingrese una cantidad válida", parent=self)
+
+    def cancelar(self):
+        self.cantidad = None
+        self.destroy()
+
+
+class VentasUIModern:
+    """Interfaz de Punto de Venta MODERNA"""
+
+    def __init__(self, parent, ventas_service, productos_repo, clientes_repo, auth, db_manager,
+                 cuentas_por_cobrar_service=None, abonos_ventas_repo=None,
+                 mezclas_service=None):
+        self.parent = parent
+        self.ventas_service = ventas_service
+        self.productos_repo = productos_repo
+        self.clientes_repo = clientes_repo
+        self.auth = auth
+        self.db_manager = db_manager
+        self.cuentas_service = cuentas_por_cobrar_service
+        self.abonos_repo = abonos_ventas_repo
+        self.mezclas_service = mezclas_service
+
+        self.carrito = []
+        self.cliente_seleccionado = None
+        self.productos_data = []
+
+        self.crear_ui()
+        self.cargar_productos()
+
+    def crear_ui(self):
+        """Crea la interfaz moderna"""
+        # Configurar colores del parent
+        self.parent.config(bg=COLORS['bg_main'])
+
+        # HEADER MODERNO con gradiente
+        self.crear_header()
+
+        # CONTENEDOR PRINCIPAL (2 columnas con mejor espaciado)
+        main_container = tk.Frame(self.parent, bg=COLORS['bg_main'])
+        main_container.pack(fill='both', expand=True, padx=15, pady=15)
+
+        # COLUMNA IZQUIERDA - Productos (70%)
+        left_frame = tk.Frame(main_container, bg=COLORS['bg_main'])
+        left_frame.pack(side='left', fill='both', expand=True, padx=(0, 10))
+
+        self.crear_seccion_productos(left_frame)
+
+        # COLUMNA DERECHA - Carrito (30%)
+        right_frame = tk.Frame(main_container, bg=COLORS['bg_card'], width=450)
+        right_frame.pack(side='right', fill='both', padx=(10, 0))
+        right_frame.pack_propagate(False)
+
+        self.crear_seccion_carrito(right_frame)
+
+    def crear_header(self):
+        """Header moderno con gradiente"""
+        header = tk.Frame(self.parent, bg=COLORS['primary'], height=90)
+        header.pack(fill='x')
+        header.pack_propagate(False)
+
+        # Título grande
+        title_frame = tk.Frame(header, bg=COLORS['primary'])
+        title_frame.pack(side='left', padx=30, expand=True, fill='both')
+
+        tk.Label(title_frame, text=f"{ICONS['cart']} Punto de Venta",
+                font=FONTS['title'],
+                bg=COLORS['primary'],
+                fg='white').pack(anchor='w', pady=10)
+        
+        # Botón de ventas a crédito (solo si el servicio está disponible)
+        if self.cuentas_service:
+            btn_creditos = tk.Button(title_frame, text="💳 Ventas a Crédito",
+                                    font=FONTS['body'], bg='#F59E0B', fg='white',
+                                    cursor='hand2', relief='flat', padx=15, pady=5,
+                                    command=self.ver_ventas_credito)
+            btn_creditos.pack(anchor='w', pady=(5, 0))
+
+        # Info usuario y hora
+        info_frame = tk.Frame(header, bg=COLORS['primary'])
+        info_frame.pack(side='right', padx=30)
+
+        if self.auth.usuario_actual:
+            tk.Label(info_frame,
+                    text=f"{ICONS['user']} {self.auth.usuario_actual.nombre_completo}",
+                    font=FONTS['body'],
+                    bg=COLORS['primary'],
+                    fg='white').pack(anchor='e')
+
+        self.hora_label = tk.Label(info_frame, text="",
+                                   font=FONTS['small'],
+                                   bg=COLORS['primary'],
+                                   fg='white')
+        self.hora_label.pack(anchor='e')
+        self.actualizar_hora()
+
+    def crear_seccion_productos(self, parent):
+        """Sección de productos con tarjetas"""
+        # Búsqueda moderna
+        search_card = tk.Frame(parent, bg=COLORS['bg_card'], relief='flat')
+        search_card.pack(fill='x', pady=(0, 15))
+
+        search_content = tk.Frame(search_card, bg=COLORS['bg_card'], padx=20, pady=15)
+        search_content.pack(fill='x')
+
+        tk.Label(search_content, text=f"{ICONS['search']} Buscar Producto",
+                font=FONTS['heading'],
+                bg=COLORS['bg_card'],
+                fg=COLORS['text_primary']).pack(anchor='w', pady=(0, 10))
+
+        # Campo de búsqueda grande
+        search_frame = tk.Frame(search_content, bg=COLORS['bg_card'])
+        search_frame.pack(fill='x', pady=(0, 10))
+
+        self.search_var = tk.StringVar()
+        self.search_var.trace('w', lambda *args: self.buscar_productos())
+
+        search_entry = tk.Entry(search_frame, textvariable=self.search_var,
+                               font=FONTS['large'],
+                               relief='solid',
+                               borderwidth=2)
+        search_entry.pack(fill='x', ipady=10)
+        search_entry.bind('<Return>', self.agregar_por_codigo_rapido)
+
+        # Filtro de categoría
+        filter_frame = tk.Frame(search_content, bg=COLORS['bg_card'])
+        filter_frame.pack(fill='x')
+
+        tk.Label(filter_frame, text="Categoría:",
+                font=FONTS['body_bold'],
+                bg=COLORS['bg_card'],
+                fg=COLORS['text_primary']).pack(side='left', padx=(0, 10))
+
+        self.categoria_var = tk.StringVar(value="Todas")
+        self.combo_categoria = ttk.Combobox(filter_frame,
+                                           textvariable=self.categoria_var,
+                                           font=FONTS['body'],
+                                           width=25, state='readonly')
+        self.combo_categoria.pack(side='left')
+        self.combo_categoria.bind('<<ComboboxSelected>>', lambda e: self.buscar_productos())
+
+        # Boton Nueva Mezcla de Pintura
+        if self.mezclas_service:
+            btn_mezcla = tk.Button(filter_frame, text="Nueva Mezcla",
+                                   font=FONTS['body_bold'],
+                                   bg='#7C3AED', fg='white',
+                                   activebackground='#6D28D9',
+                                   cursor='hand2', relief='flat',
+                                   command=self.abrir_mezcla_pintura)
+            btn_mezcla.pack(side='right', ipady=4, ipadx=12)
+
+        # Contenedor de productos con scroll
+        productos_card = tk.Frame(parent, bg=COLORS['bg_card'], relief='flat')
+        productos_card.pack(fill='both', expand=True)
+
+        tk.Label(productos_card, text=f"{ICONS['product']} Productos Disponibles",
+                font=FONTS['heading'],
+                bg=COLORS['bg_card'],
+                fg=COLORS['text_primary']).pack(anchor='w', padx=20, pady=(15, 10))
+
+        # Canvas con scroll para tarjetas
+        canvas_frame = tk.Frame(productos_card, bg=COLORS['bg_card'])
+        canvas_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        self.canvas = tk.Canvas(canvas_frame, bg=COLORS['bg_secondary'],
+                               highlightthickness=0)
+        scrollbar = ttk.Scrollbar(canvas_frame, orient='vertical',
+                                 command=self.canvas.yview)
+
+        self.productos_container = tk.Frame(self.canvas, bg=COLORS['bg_secondary'])
+
+        self.canvas.create_window((0, 0), window=self.productos_container, anchor='nw')
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        self.productos_container.bind('<Configure>',
+                                     lambda e: self.canvas.configure(
+                                         scrollregion=self.canvas.bbox('all')))
+
+    def crear_seccion_carrito(self, parent):
+        """Carrito moderno"""
+        # Header del carrito - AHORA ES UN BOTÓN "AUTORIZAR" - MÁS COMPACTO
+        header = tk.Button(parent,
+                          text="AUTORIZAR VENTA",
+                          font=FONTS['body_bold'],
+                          bg=COLORS['secondary'],
+                          fg='white',
+                          activebackground='#D1388B',
+                          activeforeground='white',
+                          cursor='hand2',
+                          relief='flat',
+                          command=self.procesar_venta)
+        header.pack(fill='x', ipady=6)
+
+        # Efecto hover para el botón autorizar
+        def on_hover_enter(e):
+            header.config(bg='#D1388B')
+
+        def on_hover_leave(e):
+            header.config(bg=COLORS['secondary'])
+
+        header.bind('<Enter>', on_hover_enter)
+        header.bind('<Leave>', on_hover_leave)
+
+        # MÉTODO DE PAGO - Justo debajo del botón autorizar
+        self.crear_metodo_pago_section(parent)
+
+        # Cliente - MÁS COMPACTO
+        cliente_card = tk.Frame(parent, bg=COLORS['bg_card'], padx=10, pady=5)
+        cliente_card.pack(fill='x')
+
+        cliente_row = tk.Frame(cliente_card, bg=COLORS['bg_card'])
+        cliente_row.pack(fill='x')
+
+        tk.Label(cliente_row, text="Cliente:",
+                font=FONTS['small'],
+                bg=COLORS['bg_card']).pack(side='left')
+
+        self.cliente_label = tk.Label(cliente_row,
+                                      text="Cliente General",
+                                      font=FONTS['small'],
+                                      bg=COLORS['bg_card'],
+                                      fg=COLORS['text_secondary'],
+                                      anchor='w')
+        self.cliente_label.pack(side='left', fill='x', expand=True, padx=5)
+
+        tk.Button(cliente_row, text="Cambiar",
+                 font=FONTS['small'],
+                 bg=COLORS['info'],
+                 fg='white',
+                 cursor='hand2',
+                 relief='flat',
+                 command=self.seleccionar_cliente).pack(side='right', ipady=3, ipadx=8)
+
+        # Separator
+        ttk.Separator(parent, orient='horizontal').pack(fill='x', padx=15, pady=5)
+
+        # Items del carrito - ALTURA AUMENTADA para ver mejor los productos
+        carrito_scroll_frame = tk.Frame(parent, bg=COLORS['bg_card'])
+        carrito_scroll_frame.pack(fill='x', padx=10)
+
+        canvas = tk.Canvas(carrito_scroll_frame, bg=COLORS['bg_card'],
+                          highlightthickness=0, height=200)
+        scrollbar = ttk.Scrollbar(carrito_scroll_frame, orient='vertical',
+                                 command=canvas.yview)
+
+        self.carrito_container = tk.Frame(canvas, bg=COLORS['bg_card'])
+
+        canvas.create_window((0, 0), window=self.carrito_container, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        self.carrito_container.bind('<Configure>',
+                                   lambda e: canvas.configure(
+                                       scrollregion=canvas.bbox('all')))
+
+        # Totales (más destacados)
+        self.crear_seccion_totales(parent)
+
+    def crear_metodo_pago_section(self, parent):
+        """Sección de método de pago y botones - COMPACTA"""
+        # Separador
+        ttk.Separator(parent, orient='horizontal').pack(fill='x', padx=10, pady=3)
+
+        # Frame contenedor - MÁS COMPACTO
+        metodo_frame = tk.Frame(parent, bg=COLORS['bg_card'], padx=10, pady=5)
+        metodo_frame.pack(fill='x')
+
+        # Título - Sin icono, más pequeño
+        tk.Label(metodo_frame, text="Método de Pago:",
+                font=FONTS['small'],
+                bg=COLORS['bg_card'],
+                fg=COLORS['text_primary']).pack(anchor='w', pady=(0, 3))
+
+        self.metodo_pago_var = tk.StringVar(value="EFECTIVO")
+
+        metodos = [
+            ("Efectivo", "EFECTIVO"),
+            ("Tarjeta", "TARJETA"),
+            ("Transferencia", "TRANSFERENCIA"),
+            ("Crédito", "CREDITO")
+        ]
+
+        # Grid de botones 2x2 - MÁS COMPACTO
+        metodos_grid = tk.Frame(metodo_frame, bg=COLORS['bg_card'])
+        metodos_grid.pack(fill='x', pady=(0, 5))
+
+        self.metodo_botones = {}
+
+        for idx, (texto, valor) in enumerate(metodos):
+            row = idx // 2
+            col = idx % 2
+
+            btn = tk.Button(metodos_grid,
+                           text=texto,
+                           font=FONTS['small'],
+                           bg=COLORS['bg_secondary'],
+                           fg=COLORS['text_primary'],
+                           activebackground=COLORS['primary'],
+                           activeforeground='white',
+                           relief='raised',
+                           borderwidth=1,
+                           cursor='hand2',
+                           command=lambda v=valor: self.seleccionar_metodo_pago(v))
+            btn.grid(row=row, column=col, padx=2, pady=2, sticky='ew', ipadx=6, ipady=4)
+            self.metodo_botones[valor] = btn
+
+            metodos_grid.grid_columnconfigure(col, weight=1)
+
+        # Resaltar botón por defecto
+        self.actualizar_botones_metodo_pago()
+
+        # BOTONES DE LIMPIAR Y CANCELAR - MÁS COMPACTOS
+        btn_secondary = tk.Frame(metodo_frame, bg=COLORS['bg_card'])
+        btn_secondary.pack(fill='x', pady=(3, 0))
+
+        tk.Button(btn_secondary, text="Limpiar",
+                 font=FONTS['small'],
+                 bg=COLORS['danger'],
+                 fg='white',
+                 cursor='hand2',
+                 relief='flat',
+                 command=self.limpiar_carrito).pack(side='left', fill='x', expand=True,
+                                                    padx=(0, 3), ipady=5)
+
+        tk.Button(btn_secondary, text="Cancelar",
+                 font=FONTS['small'],
+                 bg=COLORS['text_secondary'],
+                 fg='white',
+                 cursor='hand2',
+                 relief='flat',
+                 command=self.cancelar_venta).pack(side='right', fill='x', expand=True,
+                                                   padx=(3, 0), ipady=5)
+
+    def crear_seccion_totales(self, parent):
+        """Totales modernos - COMPACTOS"""
+        ttk.Separator(parent, orient='horizontal').pack(fill='x', padx=10, pady=3)
+
+        totales_frame = tk.Frame(parent, bg=COLORS['bg_card'], padx=10, pady=3)
+        totales_frame.pack(fill='x')
+
+        # Subtotal - MÁS COMPACTO
+        row1 = tk.Frame(totales_frame, bg=COLORS['bg_card'])
+        row1.pack(fill='x', pady=2)
+
+        tk.Label(row1, text="Subtotal:",
+                font=FONTS['small'],
+                bg=COLORS['bg_card']).pack(side='left')
+
+        self.subtotal_label = tk.Label(row1, text="$0",
+                                       font=FONTS['small'],
+                                       bg=COLORS['bg_card'],
+                                       fg=COLORS['text_primary'],
+                                       anchor='e')
+        self.subtotal_label.pack(side='right')
+
+        # Descuento - VALOR FIJO (no porcentaje)
+        row2 = tk.Frame(totales_frame, bg=COLORS['bg_card'])
+        row2.pack(fill='x', pady=2)
+
+        tk.Label(row2, text="Descuento $:",
+                font=FONTS['small'],
+                bg=COLORS['bg_card']).pack(side='left')
+
+        self.descuento_var = tk.StringVar(value="0")
+        self.descuento_var.trace('w', lambda *args: self.calcular_totales())
+
+        tk.Entry(row2, textvariable=self.descuento_var,
+                font=FONTS['small'], width=8,
+                justify='right',
+                relief='solid',
+                borderwidth=1).pack(side='right')
+
+        # Total - SIN ICONO, MÁS COMPACTO
+        ttk.Separator(totales_frame, orient='horizontal').pack(fill='x', pady=3)
+
+        row4 = tk.Frame(totales_frame, bg=COLORS['primary_light'], relief='flat')
+        row4.pack(fill='x', pady=2)
+
+        tk.Label(row4, text="TOTAL:",
+                font=FONTS['body_bold'],
+                bg=COLORS['primary_light'],
+                fg=COLORS['primary_dark']).pack(side='left', padx=5, pady=5)
+
+        self.total_label = tk.Label(row4, text="$0",
+                                    font=FONTS['body_bold'],
+                                    bg=COLORS['primary_light'],
+                                    fg=COLORS['primary_dark'],
+                                    anchor='e')
+        self.total_label.pack(side='right', padx=5, pady=5)
+
+    # =====================================
+    # MÉTODOS DE FUNCIONALIDAD
+    # =====================================
+
+    def actualizar_hora(self):
+        ahora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        self.hora_label.config(text=ahora)
+        self.parent.after(1000, self.actualizar_hora)
+
+    def cargar_productos(self):
+        """Carga productos"""
+        try:
+            productos = self.productos_repo.listar_productos(solo_activos=True)
+            self.productos_data = productos
+
+            print(f"[DEBUG MODERN] Productos cargados: {len(productos)}")
+
+            # Cargar categorías
+            categorias = ['Todas'] + self.productos_repo.obtener_categorias()
+            self.combo_categoria['values'] = categorias
+
+            self.mostrar_productos(productos)
+
+            if not productos:
+                messagebox.showinfo("Sin productos",
+                    "No hay productos en el sistema.\n"
+                    "Agregue productos primero en la sección 'Productos'.")
+
+        except Exception as e:
+            print(f"[ERROR] Error al cargar productos: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Error al cargar productos: {str(e)}")
+
+    def mostrar_productos(self, productos):
+        """Muestra productos como tarjetas"""
+        # Limpiar
+        for widget in self.productos_container.winfo_children():
+            widget.destroy()
+
+        print(f"[DEBUG] Mostrando {len(productos)} productos en tarjetas")
+
+        # Crear grid de tarjetas (4 columnas para ver más productos)
+        row_frame = None
+        for idx, prod in enumerate(productos):
+            if idx % 4 == 0:
+                row_frame = tk.Frame(self.productos_container, bg=COLORS['bg_secondary'])
+                row_frame.pack(fill='x', pady=3, padx=3)
+
+            card = ProductCard(row_frame, prod, self.mostrar_dialogo_cantidad_y_agregar)
+            card.pack(side='left', padx=3, ipadx=2, ipady=2)
+
+    def buscar_productos(self):
+        """Busca y filtra productos"""
+        busqueda = self.search_var.get().lower()
+        categoria = self.categoria_var.get()
+
+        if not hasattr(self, 'productos_data'):
+            return
+
+        productos_filtrados = []
+
+        for prod in self.productos_data:
+            if not prod.get('activo', True):
+                continue
+
+            nombre = prod.get('nombre', '').lower()
+            codigo = (prod.get('codigo_barras') or '').lower()
+            marca = (prod.get('marca') or '').lower()
+
+            if busqueda and not (busqueda in nombre or busqueda in codigo or busqueda in marca):
+                continue
+
+            if categoria != "Todas" and prod.get('categoria') != categoria:
+                continue
+
+            productos_filtrados.append(prod)
+
+        self.mostrar_productos(productos_filtrados)
+
+    def agregar_por_codigo_rapido(self, event):
+        codigo = self.search_var.get().strip()
+        if not codigo:
+            return
+
+        producto = self.productos_repo.obtener_por_codigo(codigo)
+        if not producto:
+            try:
+                producto = self.productos_repo.obtener_por_id(int(codigo))
+            except:
+                pass
+
+        if producto:
+            self.mostrar_dialogo_cantidad_y_agregar(producto)
+            self.search_var.set("")
+        else:
+            messagebox.showwarning("No encontrado",
+                                 f"No se encontró producto: {codigo}")
+
+    def mostrar_dialogo_cantidad_y_agregar(self, producto):
+        """Muestra diálogo moderno de cantidad"""
+        if producto.get('stock', 0) == 0:
+            messagebox.showwarning("Sin stock",
+                                 f"{producto.get('nombre')} no tiene stock disponible")
+            return
+
+        dialogo = DialogoCantidadModern(
+            self.parent,
+            producto,
+            self.db_manager
+        )
+        self.parent.wait_window(dialogo)
+
+        if dialogo.cantidad:
+            self.agregar_al_carrito(producto, dialogo.cantidad)
+
+    def agregar_al_carrito(self, producto, cantidad=1):
+        """Agrega producto al carrito"""
+        # Verificar si ya esta (solo productos normales, no mezclas)
+        prod_id = producto.get('id')
+        if prod_id is not None:
+            for item in self.carrito:
+                if not item.get('es_mezcla') and item['producto']['id'] == prod_id:
+                    item['cantidad'] += cantidad
+                    self.actualizar_carrito_ui()
+                    return
+
+        # Agregar nuevo
+        self.carrito.append({
+            'producto': producto,
+            'cantidad': cantidad,
+            'precio_unitario': producto.get('precio_venta', 0),
+            'descuento': 0
+        })
+
+        self.actualizar_carrito_ui()
+
+    def actualizar_carrito_ui(self):
+        """Actualiza visualización del carrito"""
+        # Limpiar
+        for widget in self.carrito_container.winfo_children():
+            widget.destroy()
+
+        # Agregar items - MÁS COMPACTOS
+        for idx, item in enumerate(self.carrito):
+            item_frame = tk.Frame(self.carrito_container, bg=COLORS['bg_secondary'],
+                                 relief='flat')
+            item_frame.pack(fill='x', pady=2, padx=3)
+
+            content = tk.Frame(item_frame, bg=COLORS['bg_secondary'], padx=5, pady=5)
+            content.pack(fill='x')
+
+            # Nombre (incluye marca si existe) - más compacto
+            nombre = item['producto'].get('nombre', '')
+            marca = (item['producto'].get('marca') or '').strip()
+            nombre_mostrar = f"{nombre} - {marca}" if marca else nombre
+            tk.Label(content, text=nombre_mostrar[:30],
+                font=FONTS['small'],
+                bg=COLORS['bg_secondary'],
+                fg=COLORS['text_primary']).pack(anchor='w')
+
+            # Cantidad y precio - en misma línea
+            info_frame = tk.Frame(content, bg=COLORS['bg_secondary'])
+            info_frame.pack(fill='x', pady=(2, 0))
+
+            tk.Label(info_frame, text=f"Cant: {item['cantidad']}",
+                    font=FONTS['small'],
+                    bg=COLORS['bg_secondary'],
+                    fg=COLORS['text_secondary']).pack(side='left')
+
+            total_item = item['cantidad'] * item['precio_unitario']
+            tk.Label(info_frame, text=f"${total_item:,.0f}",
+                    font=FONTS['small'],
+                    bg=COLORS['bg_secondary'],
+                    fg=COLORS['primary']).pack(side='right')
+
+            # Botones - MÁS COMPACTOS, sin iconos
+            btn_frame = tk.Frame(content, bg=COLORS['bg_secondary'])
+            btn_frame.pack(fill='x', pady=(3, 0))
+
+            tk.Button(btn_frame, text="Editar",
+                     font=FONTS['small'],
+                     bg=COLORS['info'],
+                     fg='white',
+                     cursor='hand2',
+                     relief='flat',
+                     command=lambda i=idx: self.editar_cantidad_item(i)).pack(side='left', padx=(0, 3), ipady=3, ipadx=6)
+
+            tk.Button(btn_frame, text="Quitar",
+                     font=FONTS['small'],
+                     bg=COLORS['danger'],
+                     fg='white',
+                     cursor='hand2',
+                     relief='flat',
+                     command=lambda i=idx: self.quitar_del_carrito(i)).pack(side='left', ipady=3, ipadx=6)
+
+        self.calcular_totales()
+
+    def calcular_totales(self):
+        """Calcula totales"""
+        subtotal = sum(item['cantidad'] * item['precio_unitario'] for item in self.carrito)
+
+        # Descuento es un valor fijo, no porcentaje
+        try:
+            descuento_monto = float(self.descuento_var.get() or 0)
+        except:
+            descuento_monto = 0
+            self.descuento_var.set("0")
+
+        # Total = Subtotal - Descuento (sin IVA)
+        total = subtotal - descuento_monto
+
+        self.subtotal_label.config(text=f"${subtotal:,.0f}")
+        self.total_label.config(text=f"${total:,.0f}")
+
+    def editar_cantidad_item(self, idx):
+        """Edita cantidad de un item"""
+        if idx >= len(self.carrito):
+            return
+
+        item = self.carrito[idx]
+        dialogo = DialogoCantidadModern(
+            self.parent,
+            item['producto'],
+            self.db_manager
+        )
+        self.parent.wait_window(dialogo)
+
+        if dialogo.cantidad:
+            item['cantidad'] = dialogo.cantidad
+            self.actualizar_carrito_ui()
+
+    def quitar_del_carrito(self, idx):
+        """Quita item del carrito"""
+        if idx >= len(self.carrito):
+            return
+        del self.carrito[idx]
+        self.actualizar_carrito_ui()
+
+    def limpiar_carrito(self):
+        """Limpia el carrito"""
+        if self.carrito:
+            if messagebox.askyesno("Confirmar", "¿Limpiar todo el carrito?"):
+                self.carrito = []
+                self.actualizar_carrito_ui()
+
+    def seleccionar_metodo_pago(self, metodo):
+        """Selecciona método de pago y actualiza botones"""
+        self.metodo_pago_var.set(metodo)
+        self.actualizar_botones_metodo_pago()
+
+    def actualizar_botones_metodo_pago(self):
+        """Actualiza el estilo de los botones de método de pago"""
+        metodo_actual = self.metodo_pago_var.get()
+
+        for valor, boton in self.metodo_botones.items():
+            if valor == metodo_actual:
+                # Botón seleccionado - resaltado
+                boton.config(
+                    bg=COLORS['primary'],
+                    fg='white',
+                    relief='sunken',
+                    borderwidth=3
+                )
+            else:
+                # Botón no seleccionado - normal
+                boton.config(
+                    bg=COLORS['bg_secondary'],
+                    fg=COLORS['text_primary'],
+                    relief='raised',
+                    borderwidth=2
+                )
+
+    def seleccionar_cliente(self):
+        """Selecciona cliente"""
+        messagebox.showinfo("En desarrollo", "Funcionalidad de cliente próximamente")
+
+    def procesar_venta(self):
+        """Procesa la venta"""
+        if not self.carrito:
+            messagebox.showwarning("Carrito vacío", "Agregue productos al carrito")
+            return
+
+        try:
+            metodo_pago = self.metodo_pago_var.get()
+            
+            # Si es crédito y no hay cliente seleccionado, solicitar datos
+            if metodo_pago == 'CREDITO' and not self.cliente_seleccionado:
+                cliente_id = self._solicitar_datos_cliente_credito()
+                if not cliente_id:
+                    return  # Usuario canceló
+            else:
+                cliente_id = self.cliente_seleccionado.id if self.cliente_seleccionado else None
+
+            # Si es crédito y hay cliente, verificar si tiene facturas pendientes
+            if metodo_pago == 'CREDITO' and cliente_id and self.cuentas_service:
+                facturas_pendientes = self._obtener_facturas_pendientes_cliente(cliente_id)
+                
+                if facturas_pendientes:
+                    # Preguntar si desea agregar a factura existente
+                    usar_existente = self._preguntar_agregar_a_factura(facturas_pendientes)
+                    
+                    if usar_existente:
+                        # Agregar a factura existente
+                        id_venta_existente = usar_existente
+                        self._agregar_a_factura_existente(id_venta_existente)
+                        return
+
+            try:
+                descuento = float(self.descuento_var.get() or 0)
+            except:
+                descuento = 0
+
+            items = []
+            mezclas_info = []  # Para registrar en observaciones
+            for item in self.carrito:
+                if item.get('es_mezcla'):
+                    # Descomponer mezcla en sus componentes como items individuales
+                    componentes = item.get('mezcla_componentes', [])
+                    precio_mezcla = item['precio_unitario'] * item['cantidad']
+                    costo_total_comps = sum(c.get('costo', 0) for c in componentes)
+
+                    for comp in componentes:
+                        # Distribuir precio proporcionalmente entre componentes
+                        if costo_total_comps > 0:
+                            proporcion = comp.get('costo', 0) / costo_total_comps
+                        else:
+                            proporcion = 1.0 / len(componentes) if componentes else 1.0
+
+                        precio_proporcional = precio_mezcla * proporcion / comp['cantidad'] if comp['cantidad'] > 0 else 0
+
+                        items.append({
+                            'producto_id': comp['producto_id'],
+                            'cantidad': comp['cantidad'],
+                            'precio_unitario': precio_proporcional,
+                            'descuento': 0
+                        })
+
+                    # Guardar info de mezcla para observaciones (litros para display)
+                    nombre = item['producto']['nombre']
+                    comps_desc = ', '.join(
+                        f"{c['producto_nombre']} ({c.get('cantidad_litros', c['cantidad']):.3f}L)"
+                        for c in componentes
+                    )
+                    mezclas_info.append(f"MEZCLA: {nombre} = [{comps_desc}]")
+                else:
+                    items.append({
+                        'producto_id': item['producto']['id'],
+                        'cantidad': item['cantidad'],
+                        'precio_unitario': item['precio_unitario'],
+                        'descuento': item.get('descuento', 0)
+                    })
+
+            # Agregar observaciones de mezcla
+            obs_mezcla = ' | '.join(mezclas_info) if mezclas_info else None
+
+            exito, mensaje, venta = self.ventas_service.registrar_venta(
+                items=items,
+                cliente_id=cliente_id,
+                metodo_pago=metodo_pago,
+                descuento_general=descuento,
+                observaciones=obs_mezcla
+            )
+
+            if exito:
+                # Guardar datos para impresion antes de limpiar carrito
+                detalles_impresion = []
+                for item in self.carrito:
+                    det = {
+                        'producto_nombre': item['producto'].get('nombre', 'Producto'),
+                        'cantidad': item['cantidad'],
+                        'precio_unitario': item['precio_unitario'],
+                        'subtotal': item['cantidad'] * item['precio_unitario']
+                    }
+                    if item.get('es_mezcla'):
+                        det['es_mezcla'] = True
+                        comps = item.get('mezcla_componentes', [])
+                        det['mezcla_componentes'] = [
+                            f"{c['producto_nombre']} ({c.get('cantidad_litros', c['cantidad']):.3f}L)"
+                            for c in comps
+                        ]
+                        det['mezcla_volumen'] = sum(c.get('cantidad_litros', c['cantidad']) for c in comps)
+                    detalles_impresion.append(det)
+
+                venta_data_impresion = {
+                    'numero_factura': venta.numero_factura,
+                    'fecha': str(venta.fecha) if venta.fecha else '',
+                    'total': venta.total,
+                    'subtotal': venta.subtotal,
+                    'descuento': venta.descuento,
+                    'metodo_pago': metodo_pago,
+                    'cliente_nombre': self.cliente_seleccionado.nombre if self.cliente_seleccionado else 'Cliente General',
+                }
+
+                # Mostrar diálogo con opción de imprimir
+                self._mostrar_dialogo_venta_exitosa(venta_data_impresion, detalles_impresion)
+
+                self.nueva_venta()
+                self.cargar_productos()
+            else:
+                messagebox.showerror("Error", mensaje)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Error al procesar venta: {str(e)}")
+
+    def _mostrar_dialogo_venta_exitosa(self, venta_data, detalles):
+        """Muestra diálogo de venta exitosa con opción de imprimir"""
+        dialogo = tk.Toplevel(self.parent)
+        dialogo.title("Venta Exitosa")
+        dialogo.geometry("420x310")
+        dialogo.configure(bg='white')
+        dialogo.resizable(False, False)
+        dialogo.transient(self.parent)
+        dialogo.grab_set()
+
+        # Centrar
+        dialogo.update_idletasks()
+        x = (dialogo.winfo_screenwidth() // 2) - 210
+        y = (dialogo.winfo_screenheight() // 2) - 155
+        dialogo.geometry(f"420x310+{x}+{y}")
+
+        # Título
+        tk.Label(dialogo, text="\u2705 VENTA EXITOSA",
+                font=('Segoe UI', 16, 'bold'),
+                bg='white', fg='#10b981').pack(pady=(20, 10))
+
+        # Info de la venta
+        info = tk.Frame(dialogo, bg='white')
+        info.pack(fill='x', padx=30, pady=5)
+
+        numero = venta_data.get('numero_factura', '')
+        total = venta_data.get('total', 0)
+        metodo = venta_data.get('metodo_pago', 'EFECTIVO').replace('_', ' ')
+
+        tk.Label(info, text=f"Factura: {numero}",
+                font=('Segoe UI', 11), bg='white', anchor='w').pack(fill='x', pady=2)
+        tk.Label(info, text=f"Total: ${total:,.0f}",
+                font=('Segoe UI', 11, 'bold'), bg='white', anchor='w').pack(fill='x', pady=2)
+        tk.Label(info, text=f"M\u00e9todo: {metodo}",
+                font=('Segoe UI', 11), bg='white', anchor='w').pack(fill='x', pady=2)
+
+        tk.Label(info, text="La venta ha sido registrada en Movimientos.",
+                font=('Segoe UI', 9), bg='white', fg='#64748b',
+                anchor='w').pack(fill='x', pady=(10, 0))
+
+        # Botones
+        btn_frame = tk.Frame(dialogo, bg='white')
+        btn_frame.pack(fill='x', padx=30, pady=(15, 20))
+
+        tk.Button(btn_frame, text="\U0001f5a8\ufe0f Imprimir Factura",
+                 font=('Segoe UI', 10, 'bold'),
+                 bg='#2563eb', fg='white',
+                 cursor='hand2', relief='flat',
+                 padx=15, pady=6,
+                 command=lambda: self._imprimir_factura_venta(dialogo, venta_data, detalles)
+                 ).pack(side='left')
+
+        tk.Button(btn_frame, text="Aceptar",
+                 font=('Segoe UI', 10),
+                 bg='#64748b', fg='white',
+                 cursor='hand2', relief='flat',
+                 padx=25, pady=6,
+                 command=dialogo.destroy
+                 ).pack(side='right')
+
+    def _imprimir_factura_venta(self, dialogo, venta_data, detalles):
+        """Abre la ventana de impresi\u00f3n de factura"""
+        from ui.imprimir_factura import imprimir_factura
+        imprimir_factura(dialogo, venta_data, detalles)
+
+    def cancelar_venta(self):
+        """Cancela la venta"""
+        if self.carrito:
+            if messagebox.askyesno("Confirmar", "\u00bfCancelar la venta actual?"):
+                self.nueva_venta()
+
+    def nueva_venta(self):
+        """Nueva venta"""
+        self.carrito = []
+        self.cliente_seleccionado = None
+        self.cliente_label.config(text="Cliente General")
+        self.descuento_var.set("0")
+        self.metodo_pago_var.set("EFECTIVO")
+        self.actualizar_carrito_ui()
+        self.search_var.set("")
+
+    def abrir_mezcla_pintura(self):
+        """Abre el modal de mezcla de pintura"""
+        from ui.mezcla_ui import VentanaMezclaPintura
+
+        dialogo = VentanaMezclaPintura(
+            self.parent,
+            self.mezclas_service,
+            self.productos_repo,
+            self.db_manager
+        )
+        self.parent.wait_window(dialogo)
+
+        if dialogo.resultado:
+            self._agregar_mezcla_al_carrito(dialogo.resultado)
+
+    def _agregar_mezcla_al_carrito(self, mezcla):
+        """Agrega una mezcla de pintura al carrito como item especial"""
+        self.carrito.append({
+            'producto': {
+                'id': None,  # No es un producto real
+                'nombre': mezcla['nombre'],
+                'precio_venta': mezcla['precio_venta'],
+                'stock': 999,
+                'marca': '',
+            },
+            'cantidad': 1,
+            'precio_unitario': mezcla['precio_venta'],
+            'descuento': 0,
+            'es_mezcla': True,
+            'mezcla_componentes': mezcla['componentes'],
+            'mezcla_formula_id': mezcla.get('formula_id'),
+        })
+        self.actualizar_carrito_ui()
+    
+    def ver_ventas_credito(self):
+        """Muestra modal con todas las ventas a crédito pendientes"""
+        if not self.cuentas_service:
+            messagebox.showwarning("Advertencia", "Servicio de cuentas por cobrar no disponible")
+            return
+        
+        # Obtener ventas a crédito pendientes
+        ventas = self.cuentas_service.obtener_ventas_credito_pendientes()
+        
+        if not ventas:
+            messagebox.showinfo("Información", "No hay ventas a crédito pendientes")
+            return
+        
+        # Crear ventana modal
+        ventana = tk.Toplevel(self.parent)
+        ventana.title("Ventas a Crédito Pendientes")
+        ventana.geometry("1000x600")
+        ventana.resizable(False, False)
+        
+        # Header
+        header_frame = tk.Frame(ventana, bg=COLORS['primary'], height=60)
+        header_frame.pack(fill='x')
+        header_frame.pack_propagate(False)
+        
+        tk.Label(header_frame, text="💳 Ventas a Crédito Pendientes",
+                font=FONTS['large'], bg=COLORS['primary'], fg='white').pack(side='left', padx=20, pady=15)
+        
+        # Totales
+        totales_frame = tk.Frame(ventana, bg='white', padx=20, pady=15)
+        totales_frame.pack(fill='x')
+        
+        total_deuda = sum(v['saldo_pendiente'] for v in ventas)
+        total_pagado = sum(v['monto_pagado'] for v in ventas)
+        
+        tk.Label(totales_frame, text=f"Total por Cobrar: ${total_deuda:,.0f}",
+                font=('Segoe UI', 14, 'bold'), fg='#DC2626').pack(side='left', padx=10)
+        tk.Label(totales_frame, text=f"Total Abonado: ${total_pagado:,.0f}",
+                font=FONTS['body'], fg='#059669').pack(side='left', padx=10)
+        tk.Label(totales_frame, text=f"Facturas: {len(ventas)}",
+                font=FONTS['body']).pack(side='left', padx=10)
+        
+        # Tabla
+        tabla_frame = tk.Frame(ventana, bg='white', padx=20, pady=10)
+        tabla_frame.pack(fill='both', expand=True)
+        
+        # Scrollbar
+        scroll_y = ttk.Scrollbar(tabla_frame, orient='vertical')
+        scroll_y.pack(side='right', fill='y')
+        
+        # Treeview
+        columnas = ('Factura', 'Fecha', 'Cliente', 'Total', 'Pagado', 'Saldo', 'Estado', 'Días')
+        tree = ttk.Treeview(tabla_frame, columns=columnas, show='headings',
+                           yscrollcommand=scroll_y.set, height=15)
+        
+        # Configurar columnas
+        anchos = [100, 100, 150, 90, 90, 90, 90, 60]
+        for col, ancho in zip(columnas, anchos):
+            tree.heading(col, text=col)
+            tree.column(col, width=ancho, anchor='center')
+        
+        tree.pack(fill='both', expand=True)
+        scroll_y.config(command=tree.yview)
+        
+        # Llenar tabla
+        for venta in ventas:
+            estado_emoji = {
+                'PENDIENTE': '⏳',
+                'PARCIAL': '🟡',
+                'PAGADO': '✅'
+            }.get(venta['estado_pago'], '')
+            
+            valores = (
+                venta['numero_factura'],
+                venta['fecha'][:10] if venta['fecha'] else '',
+                venta['cliente_nombre'],
+                f"${venta['total']:,.0f}",
+                f"${venta['monto_pagado']:,.0f}",
+                f"${venta['saldo_pendiente']:,.0f}",
+                f"{estado_emoji} {venta['estado_pago']}",
+                f"{venta['dias_transcurridos']} días"
+            )
+            
+            # Color según días
+            if venta['dias_transcurridos'] > 60:
+                tag = 'vencida'
+            elif venta['dias_transcurridos'] > 30:
+                tag = 'alerta'
+            else:
+                tag = 'reciente'
+            
+            iid = tree.insert('', 'end', values=valores, tags=(tag,))
+            # Guardar id en el item
+            tree.set(iid, '#0', venta['id'])
+        
+        # Configurar colores
+        tree.tag_configure('vencida', background='#fee2e2', foreground='#991b1b')
+        tree.tag_configure('alerta', background='#fef3c7', foreground='#92400e')
+        tree.tag_configure('reciente', background='white')
+        
+        # Botones
+        btn_frame = tk.Frame(ventana, bg='white', padx=20, pady=15)
+        btn_frame.pack(fill='x')
+        
+        def registrar_cobro():
+            seleccion = tree.selection()
+            if not seleccion:
+                messagebox.showwarning("Advertencia", "Seleccione una factura")
+                return
+            
+            # Obtener datos
+            valores = tree.item(seleccion[0])['values']
+            id_venta = int(tree.set(seleccion[0], '#0'))
+            numero_factura = valores[0]
+            total = float(valores[3].replace('$', '').replace(',', ''))
+            saldo = float(valores[5].replace('$', '').replace(',', ''))
+            
+            self._abrir_modal_abono_venta(id_venta, numero_factura, total, saldo, ventana)
+        
+        tk.Button(btn_frame, text="💰 Registrar Cobro",
+                 font=FONTS['body'], bg='#059669', fg='white',
+                 cursor='hand2', relief='flat', padx=20, pady=10,
+                 command=registrar_cobro).pack(side='left', padx=5)
+        
+        tk.Button(btn_frame, text="Cerrar",
+                 font=FONTS['body'], bg='#6B7280', fg='white',
+                 cursor='hand2', relief='flat', padx=20, pady=10,
+                 command=ventana.destroy).pack(side='right', padx=5)
+    
+    def _abrir_modal_abono_venta(self, id_venta, numero_factura, total, saldo, parent_window):
+        """Abre modal para registrar abono/cobro a una venta"""
+        from models import AbonoVenta
+        from datetime import datetime
+        
+        if not self.abonos_repo:
+            messagebox.showwarning("Advertencia", "Repositorio de abonos no disponible")
+            return
+        
+        try:
+            # Crear modal
+            ventana_abono = tk.Toplevel(parent_window)
+            ventana_abono.geometry("550x450")
+            ventana_abono.title("Registrar Cobro a Factura")
+            ventana_abono.resizable(False, False)
+            
+            # Info de factura
+            info_frame = tk.LabelFrame(ventana_abono, text="Información de Factura",
+                                      font=FONTS['body_bold'], padx=15, pady=10)
+            info_frame.pack(fill='x', padx=15, pady=10)
+            
+            tk.Label(info_frame, text=f"Factura: {numero_factura}",
+                    font=FONTS['body']).pack(anchor='w', pady=2)
+            tk.Label(info_frame, text=f"Total: ${total:,.0f}",
+                    font=FONTS['body']).pack(anchor='w', pady=2)
+            
+            # Variable para saldo
+            saldo_actual = [saldo]
+            
+            saldo_label = tk.Label(info_frame, text=f"Saldo Pendiente: ${saldo_actual[0]:,.0f}",
+                                  font=('Segoe UI', 12, 'bold'), fg='#DC2626')
+            saldo_label.pack(anchor='w', pady=2)
+            
+            # Formulario
+            form_frame = tk.LabelFrame(ventana_abono, text="Datos del Cobro",
+                                      font=FONTS['body_bold'], padx=15, pady=10)
+            form_frame.pack(fill='both', expand=True, padx=15, pady=10)
+            
+            # Monto
+            tk.Label(form_frame, text="Monto Cobrado:", font=FONTS['body']).grid(row=0, column=0, sticky='w', pady=5)
+            monto_var = tk.StringVar()
+            monto_entry = tk.Entry(form_frame, textvariable=monto_var, font=FONTS['body'], width=20)
+            monto_entry.grid(row=0, column=1, pady=5, padx=5)
+            monto_entry.focus()
+            
+            def pagar_todo():
+                monto_var.set(str(int(saldo_actual[0])))
+            
+            tk.Button(form_frame, text="Pagar Todo", font=FONTS['small'], bg='#10B981', fg='white',
+                     command=pagar_todo).grid(row=0, column=2, pady=5, padx=5)
+            
+            # Tipo de pago
+            tk.Label(form_frame, text="Tipo de Pago:", font=FONTS['body']).grid(row=1, column=0, sticky='w', pady=5)
+            tipo_var = tk.StringVar(value="Efectivo")
+            tipos = ["Efectivo", "Transferencia", "Cheque", "Tarjeta Débito", "Tarjeta Crédito", "Otro"]
+            tipo_combo = ttk.Combobox(form_frame, textvariable=tipo_var, values=tipos,
+                                     font=FONTS['body'], width=18, state='readonly')
+            tipo_combo.grid(row=1, column=1, pady=5, padx=5)
+            
+            # Comprobante
+            tk.Label(form_frame, text="Nº Comprobante:", font=FONTS['body']).grid(row=2, column=0, sticky='w', pady=5)
+            comprobante_var = tk.StringVar()
+            comprobante_entry = tk.Entry(form_frame, textvariable=comprobante_var, font=FONTS['body'], width=20)
+            comprobante_entry.grid(row=2, column=1, pady=5, padx=5)
+            
+            def guardar_abono():
+                try:
+                    monto = float(monto_var.get().strip())
+                    
+                    if monto <= 0:
+                        messagebox.showwarning("Advertencia", "El monto debe ser mayor a cero")
+                        return
+                    
+                    if monto > saldo_actual[0]:
+                        messagebox.showwarning("Advertencia", 
+                                             f"El monto no puede exceder el saldo pendiente (${saldo_actual[0]:,.0f})")
+                        return
+                    
+                    # Crear abono
+                    abono = AbonoVenta(
+                        id_venta=id_venta,
+                        monto_abono=monto,
+                        fecha_abono=datetime.now().strftime('%Y-%m-%d'),
+                        tipo_pago=tipo_var.get(),
+                        numero_comprobante=comprobante_var.get() or None,
+                        usuario=self.auth.usuario_actual.username if self.auth.usuario_actual else "Sistema",
+                        observaciones=None
+                    )
+                    
+                    # Guardar
+                    self.abonos_repo.crear_abono(abono)
+                    
+                    # Actualizar saldo
+                    saldo_actual[0] -= monto
+                    
+                    messagebox.showinfo("Éxito", 
+                                      f"Cobro de ${monto:,.0f} registrado correctamente\n"
+                                      f"Nuevo saldo pendiente: ${saldo_actual[0]:,.0f}")
+                    
+                    # Si pagó todo, cerrar ventanas
+                    if saldo_actual[0] <= 0:
+                        ventana_abono.destroy()
+                        parent_window.destroy()
+                    else:
+                        # Actualizar label y limpiar campos
+                        saldo_label.config(text=f"Saldo Pendiente: ${saldo_actual[0]:,.0f}")
+                        monto_var.set('')
+                        comprobante_var.set('')
+                        monto_entry.focus()
+                        
+                except ValueError:
+                    messagebox.showerror("Error", "Ingrese un monto válido")
+            
+            # Botones
+            btn_frame = tk.Frame(ventana_abono)
+            btn_frame.pack(fill='x', padx=15, pady=10)
+            
+            tk.Button(btn_frame, text="💾 Guardar Cobro", font=FONTS['body'],
+                     bg='#059669', fg='white', cursor='hand2', relief='flat',
+                     padx=20, pady=10, command=guardar_abono).pack(side='left', padx=5)
+            
+            tk.Button(btn_frame, text="Cancelar", font=FONTS['body'],
+                     bg='#DC2626', fg='white', cursor='hand2', relief='flat',
+                     padx=20, pady=10, command=ventana_abono.destroy).pack(side='right', padx=5)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al abrir modal de cobro: {e}")
+    
+    def _solicitar_datos_cliente_credito(self):
+        """
+        Solicita datos del cliente para venta a crédito
+        Retorna el cliente_id o None si se cancela
+        """
+        from models import Cliente
+        
+        # Crear modal
+        ventana = tk.Toplevel(self.parent)
+        ventana.title("Venta a Crédito - Datos del Cliente")
+        ventana.geometry("550x450")
+        ventana.resizable(False, False)
+        ventana.transient(self.parent)
+        ventana.grab_set()
+        
+        # Variable para almacenar resultado
+        resultado = {'cliente_id': None}
+        
+        # Header
+        header = tk.Frame(ventana, bg=COLORS['warning'], height=60)
+        header.pack(fill='x')
+        header.pack_propagate(False)
+        
+        tk.Label(header, text="💳 Venta a Crédito",
+                font=FONTS['large'], bg=COLORS['warning'], fg='white').pack(pady=15)
+        
+        # Mensaje informativo
+        info_frame = tk.Frame(ventana, bg='white', padx=20, pady=15)
+        info_frame.pack(fill='x')
+        
+        tk.Label(info_frame, 
+                text="Para ventas a crédito es necesario registrar los datos del cliente",
+                font=FONTS['body'], bg='white', fg=COLORS['text_secondary'],
+                wraplength=400, justify='left').pack()
+        
+        # Formulario
+        form_frame = tk.LabelFrame(ventana, text="Datos del Cliente", 
+                                  font=FONTS['body_bold'], padx=20, pady=15)
+        form_frame.pack(fill='both', expand=True, padx=20, pady=10)
+        
+        # Nombre completo
+        tk.Label(form_frame, text="Nombre Completo *:", 
+                font=FONTS['body']).grid(row=0, column=0, sticky='w', pady=8)
+        nombre_var = tk.StringVar()
+        nombre_entry = tk.Entry(form_frame, textvariable=nombre_var, 
+                               font=FONTS['body'], width=30)
+        nombre_entry.grid(row=0, column=1, pady=8, padx=10)
+        nombre_entry.focus()
+        
+        # Teléfono
+        tk.Label(form_frame, text="Teléfono *:", 
+                font=FONTS['body']).grid(row=1, column=0, sticky='w', pady=8)
+        telefono_var = tk.StringVar()
+        telefono_entry = tk.Entry(form_frame, textvariable=telefono_var, 
+                                 font=FONTS['body'], width=30)
+        telefono_entry.grid(row=1, column=1, pady=8, padx=10)
+        
+        # Documento (opcional)
+        tk.Label(form_frame, text="Documento:", 
+                font=FONTS['body']).grid(row=2, column=0, sticky='w', pady=8)
+        documento_var = tk.StringVar()
+        documento_entry = tk.Entry(form_frame, textvariable=documento_var, 
+                                   font=FONTS['body'], width=30)
+        documento_entry.grid(row=2, column=1, pady=8, padx=10)
+        
+        def guardar_y_continuar():
+            """Guarda el cliente y continúa con la venta"""
+            nombre = nombre_var.get().strip()
+            telefono = telefono_var.get().strip()
+            documento = documento_var.get().strip()
+            
+            # Validar campos obligatorios
+            if not nombre:
+                messagebox.showwarning("Campo requerido", "Ingrese el nombre del cliente")
+                nombre_entry.focus()
+                return
+            
+            if not telefono:
+                messagebox.showwarning("Campo requerido", "Ingrese el teléfono del cliente")
+                telefono_entry.focus()
+                return
+            
+            try:
+                # Crear cliente nuevo
+                nuevo_cliente = Cliente(
+                    tipo_documento='CC',
+                    numero_documento=documento if documento else f'CLI-{telefono[-4:]}',
+                    nombre=nombre,
+                    telefono=telefono,
+                    email=None,
+                    direccion=None,
+                    ciudad=None,
+                    limite_credito=0,  # Sin límite por defecto
+                    clasificacion='NORMAL',
+                    descuento_default=0,
+                    activo=True
+                )
+                
+                # Guardar en BD
+                exito, mensaje, cliente_id = self.clientes_repo.crear_cliente(nuevo_cliente)
+                
+                if exito:
+                    resultado['cliente_id'] = cliente_id
+                    ventana.destroy()
+                else:
+                    messagebox.showerror("Error", f"No se pudo crear el cliente: {mensaje}")
+            
+            except Exception as e:
+                messagebox.showerror("Error", f"Error al guardar cliente: {e}")
+        
+        def cancelar():
+            """Cancela y cierra sin guardar"""
+            resultado['cliente_id'] = None
+            ventana.destroy()
+        
+        # Botones
+        btn_frame = tk.Frame(ventana, bg='white')
+        btn_frame.pack(fill='x', padx=20, pady=20)
+        
+        tk.Button(btn_frame, text="✓ Guardar y Continuar",
+                 font=FONTS['body_bold'], bg=COLORS['success'], fg='white',
+                 cursor='hand2', relief='flat', padx=30, pady=12,
+                 command=guardar_y_continuar).pack(side='left', padx=5)
+        
+        tk.Button(btn_frame, text="✕ Cancelar Venta",
+                 font=FONTS['body'], bg=COLORS['danger'], fg='white',
+                 cursor='hand2', relief='flat', padx=30, pady=12,
+                 command=cancelar).pack(side='right', padx=5)
+        
+        # Esperar a que se cierre la ventana
+        ventana.wait_window()
+        
+        return resultado['cliente_id']    
+    def _obtener_facturas_pendientes_cliente(self, cliente_id):
+        """Obtiene las facturas pendientes o parciales de un cliente"""
+        try:
+            conn = self.ventas_service.db.conectar()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, numero_factura, fecha, total, monto_pagado, saldo_pendiente, estado_pago
+                FROM ventas
+                WHERE cliente_id = ?
+                AND metodo_pago = 'CREDITO'
+                AND estado_pago IN ('PENDIENTE', 'PARCIAL')
+                ORDER BY fecha DESC
+            ''', (cliente_id,))
+            
+            facturas = cursor.fetchall()
+            conn.close()
+            
+            return [dict(f) for f in facturas]
+        except Exception as e:
+            print(f"Error al obtener facturas: {e}")
+            return []
+    
+    def _preguntar_agregar_a_factura(self, facturas_pendientes):
+        """
+        Pregunta al usuario si desea agregar a una factura existente
+        Retorna el ID de la factura seleccionada o None para crear nueva
+        """
+        # Crear ventana de selección
+        ventana = tk.Toplevel(self.parent)
+        ventana.title("Facturas Pendientes")
+        ventana.geometry("700x500")
+        ventana.resizable(False, False)
+        ventana.transient(self.parent)
+        ventana.grab_set()
+        
+        # Centrar
+        ventana.update_idletasks()
+        x = (ventana.winfo_screenwidth() // 2) - 350
+        y = (ventana.winfo_screenheight() // 2) - 250
+        ventana.geometry(f"700x500+{x}+{y}")
+        
+        resultado = {'factura_id': None}
+        
+        # Header
+        header = tk.Frame(ventana, bg=COLORS['warning'], padx=20, pady=15)
+        header.pack(fill='x')
+        
+        tk.Label(header, text="⚠️ Cliente con Facturas Pendientes",
+                font=('Segoe UI', 16, 'bold'), bg=COLORS['warning'], fg='white').pack(anchor='w')
+        
+        tk.Label(header, text="El cliente tiene facturas de crédito sin pagar completamente",
+                font=FONTS['body'], bg=COLORS['warning'], fg='white').pack(anchor='w', pady=(5,0))
+        
+        # Contenido
+        content = tk.Frame(ventana, bg='white', padx=20, pady=15)
+        content.pack(fill='both', expand=True)
+        
+        tk.Label(content, text="¿Desea agregar los productos a una factura existente o crear una nueva?",
+                font=FONTS['body_bold'], bg='white').pack(anchor='w', pady=(0,15))
+        
+        # Tabla de facturas
+        tabla_frame = tk.LabelFrame(content, text="Facturas Pendientes", 
+                                    font=FONTS['body_bold'], bg='white', padx=10, pady=10)
+        tabla_frame.pack(fill='both', expand=True, pady=(0,15))
+        
+        scroll = ttk.Scrollbar(tabla_frame, orient='vertical')
+        scroll.pack(side='right', fill='y')
+        
+        columnas = ('Factura', 'Fecha', 'Total', 'Pagado', 'Saldo', 'Estado')
+        tree = ttk.Treeview(tabla_frame, columns=columnas, show='headings',
+                           yscrollcommand=scroll.set, height=8)
+        
+        anchos = [120, 100, 90, 90, 90, 110]
+        for col, ancho in zip(columnas, anchos):
+            tree.heading(col, text=col)
+            tree.column(col, width=ancho, anchor='center')
+        
+        tree.pack(fill='both', expand=True)
+        scroll.config(command=tree.yview)
+        
+        # Llenar tabla
+        for factura in facturas_pendientes:
+            valores = (
+                factura['numero_factura'],
+                factura['fecha'][:10],
+                f"${factura['total']:,.0f}",
+                f"${factura.get('monto_pagado', 0):,.0f}",
+                f"${factura.get('saldo_pendiente', factura['total']):,.0f}",
+                factura['estado_pago']
+            )
+            
+            tag = 'pendiente' if factura['estado_pago'] == 'PENDIENTE' else 'parcial'
+            iid = tree.insert('', 'end', values=valores, tags=(tag,))
+            tree.set(iid, '#0', factura['id'])
+        
+        tree.tag_configure('pendiente', background='#fee2e2')
+        tree.tag_configure('parcial', background='#fef3c7')
+        
+        # Información adicional
+        info_label = tk.Label(content, 
+                             text="💡 Seleccione una factura y haga clic en 'Agregar a Factura', o cree una nueva factura",
+                             font=FONTS['small'], bg='white', fg=COLORS['text_secondary'],
+                             wraplength=650, justify='left')
+        info_label.pack(pady=(10,0))
+        
+        def agregar_a_seleccionada():
+            """Agrega a la factura seleccionada"""
+            seleccion = tree.selection()
+            if not seleccion:
+                messagebox.showwarning("Advertencia", "Seleccione una factura", parent=ventana)
+                return
+            
+            factura_id = int(tree.set(seleccion[0], '#0'))
+            resultado['factura_id'] = factura_id
+            ventana.destroy()
+        
+        def crear_nueva():
+            """Crea una nueva factura"""
+            resultado['factura_id'] = None
+            ventana.destroy()
+        
+        # Botones
+        btn_frame = tk.Frame(ventana, bg='white', padx=20, pady=15)
+        btn_frame.pack(fill='x')
+        
+        tk.Button(btn_frame, text="➕ Agregar a Factura Seleccionada",
+                 font=FONTS['body_bold'], bg='#059669', fg='white',
+                 cursor='hand2', relief='flat', padx=20, pady=12,
+                 command=agregar_a_seleccionada).pack(side='left', padx=5)
+        
+        tk.Button(btn_frame, text="📄 Crear Nueva Factura",
+                 font=FONTS['body'], bg=COLORS['primary'], fg='white',
+                 cursor='hand2', relief='flat', padx=20, pady=12,
+                 command=crear_nueva).pack(side='right', padx=5)
+        
+        ventana.wait_window()
+        
+        return resultado['factura_id']
+    
+    def _agregar_a_factura_existente(self, id_venta_existente):
+        """Agrega los productos del carrito a una factura existente"""
+        try:
+            # Preparar items del carrito
+            items = []
+            for item in self.carrito:
+                items.append({
+                    'producto_id': item['producto']['id'],
+                    'cantidad': item['cantidad'],
+                    'precio_unitario': item['precio_unitario'],
+                    'descuento': item.get('descuento', 0)
+                })
+            
+            # Llamar al servicio para agregar productos
+            exito, mensaje = self.ventas_service.agregar_productos_a_factura(
+                id_venta_existente, items
+            )
+            
+            if exito:
+                messagebox.showinfo("Éxito", 
+                                  f"Productos agregados exitosamente a la factura\n\n{mensaje}")
+                self.nueva_venta()
+                self.cargar_productos()
+            else:
+                messagebox.showerror("Error", f"No se pudieron agregar los productos:\n{mensaje}")
+                
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Error al agregar productos a factura: {e}")

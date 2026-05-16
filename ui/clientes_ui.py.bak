@@ -1,0 +1,784 @@
+# -*- coding: utf-8 -*-
+"""
+Interfaz de Usuario para Gestión de Clientes
+"""
+import tkinter as tk
+from tkinter import ttk, messagebox
+from ui_config import COLORS, FONTS, ICONS
+from models import Cliente, AbonoVenta
+from datetime import datetime
+
+
+class ClientesUI:
+    """Interfaz para gestión de clientes"""
+    
+    def __init__(self, parent_frame, clientes_repo, auth_manager, 
+                 cuentas_por_cobrar_service=None, abonos_ventas_repo=None):
+        self.parent = parent_frame
+        self.clientes_repo = clientes_repo
+        self.auth = auth_manager
+        self.cuentas_service = cuentas_por_cobrar_service
+        self.abonos_repo = abonos_ventas_repo
+        self.cliente_seleccionado = None
+        
+        self.crear_interfaz()
+        self.cargar_clientes()
+    
+    def crear_interfaz(self):
+        """Crea la interfaz principal"""
+        # Frame principal
+        main_frame = tk.Frame(self.parent, bg=COLORS['bg_secondary'])
+        main_frame.pack(fill='both', expand=True)
+        
+        # Header
+        header = tk.Frame(main_frame, bg=COLORS['bg_secondary'])
+        header.pack(fill='x', padx=20, pady=10)
+        
+        tk.Label(header, text=f"{ICONS['clientes']} Gestión de Clientes",
+                font=FONTS['large'], bg=COLORS['bg_secondary'],
+                fg=COLORS['text_primary']).pack(side='left')
+        
+        # Botones de acción
+        btn_frame = tk.Frame(header, bg=COLORS['bg_secondary'])
+        btn_frame.pack(side='right')
+        
+        tk.Button(btn_frame, text=f"{ICONS['agregar']} Nuevo Cliente",
+                 font=FONTS['body'], bg=COLORS['success'], fg='white',
+                 cursor='hand2', relief='flat', padx=15, pady=8,
+                 command=self.nuevo_cliente).pack(side='left', padx=5)
+        
+        # Botón para ver cuentas por cobrar (solo si el servicio está disponible)
+        if self.cuentas_service:
+            tk.Button(btn_frame, text="💰 Cuentas por Cobrar",
+                     font=FONTS['body'], bg='#F59E0B', fg='white',
+                     cursor='hand2', relief='flat', padx=15, pady=8,
+                     command=self.ver_cuentas_por_cobrar_cliente).pack(side='left', padx=5)
+        
+        tk.Button(btn_frame, text=f"{ICONS['actualizar']} Actualizar",
+                 font=FONTS['body'], bg=COLORS['info'], fg='white',
+                 cursor='hand2', relief='flat', padx=15, pady=8,
+                 command=self.cargar_clientes).pack(side='left', padx=5)
+        
+        # Barra de búsqueda
+        search_frame = tk.Frame(main_frame, bg=COLORS['bg_secondary'])
+        search_frame.pack(fill='x', padx=20, pady=10)
+        
+        tk.Label(search_frame, text=f"{ICONS['buscar']} Buscar:",
+                font=FONTS['body'], bg=COLORS['bg_secondary']).pack(side='left', padx=5)
+        
+        self.search_var = tk.StringVar()
+        self.search_var.trace('w', lambda *args: self.buscar_clientes())
+        
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var,
+                                font=FONTS['body'], width=40)
+        search_entry.pack(side='left', padx=5)
+        
+        # Tabla de clientes
+        table_frame = tk.Frame(main_frame, bg='white')
+        table_frame.pack(fill='both', expand=True, padx=20, pady=10)
+        
+        # Scrollbars
+        scroll_y = ttk.Scrollbar(table_frame, orient='vertical')
+        scroll_y.pack(side='right', fill='y')
+        
+        scroll_x = ttk.Scrollbar(table_frame, orient='horizontal')
+        scroll_x.pack(side='bottom', fill='x')
+        
+        # Treeview
+        columnas = ('ID', 'Documento', 'Nombre', 'Teléfono', 'Ciudad', 
+                   'Límite Crédito', 'Saldo', 'Estado')
+        
+        self.tree = ttk.Treeview(table_frame, columns=columnas, show='headings',
+                                yscrollcommand=scroll_y.set,
+                                xscrollcommand=scroll_x.set)
+        
+        # Configurar columnas
+        anchos = [50, 120, 200, 100, 100, 100, 100, 80]
+        for col, ancho in zip(columnas, anchos):
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=ancho)
+        
+        self.tree.pack(fill='both', expand=True)
+        
+        scroll_y.config(command=self.tree.yview)
+        scroll_x.config(command=self.tree.xview)
+        
+        # Bindings
+        self.tree.bind('<Double-Button-1>', lambda e: self.editar_cliente())
+        self.tree.bind('<Button-3>', self.mostrar_menu_contextual)
+        
+        # Botones inferiores
+        bottom_frame = tk.Frame(main_frame, bg=COLORS['bg_secondary'])
+        bottom_frame.pack(fill='x', padx=20, pady=10)
+        
+        tk.Button(bottom_frame, text=f"{ICONS['editar']} Editar",
+                 font=FONTS['body'], bg=COLORS['primary'], fg='white',
+                 cursor='hand2', relief='flat', padx=15, pady=8,
+                 command=self.editar_cliente).pack(side='left', padx=5)
+        
+        tk.Button(bottom_frame, text=f"{ICONS['eliminar']} Eliminar",
+                 font=FONTS['body'], bg=COLORS['danger'], fg='white',
+                 cursor='hand2', relief='flat', padx=15, pady=8,
+                 command=self.eliminar_cliente).pack(side='left', padx=5)
+        
+        # Label de estadísticas
+        self.stats_label = tk.Label(bottom_frame, text="",
+                                    font=FONTS['small'], bg=COLORS['bg_secondary'],
+                                    fg=COLORS['text_secondary'])
+        self.stats_label.pack(side='right', padx=5)
+    
+    def cargar_clientes(self):
+        """Carga todos los clientes en la tabla"""
+        # Limpiar tabla
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Obtener clientes
+        clientes = self.clientes_repo.listar_clientes(solo_activos=False)
+        
+        # Llenar tabla
+        for cliente in clientes:
+            estado = "Activo" if cliente.activo else "Inactivo"
+            valores = (
+                cliente.id,
+                f"{cliente.tipo_documento} {cliente.numero_documento}",
+                cliente.nombre,
+                cliente.telefono or '-',
+                cliente.ciudad or '-',
+                f"${cliente.limite_credito:,.0f}",
+                f"${cliente.saldo_pendiente:,.0f}",
+                estado
+            )
+            
+            # Color según estado
+            tag = 'activo' if cliente.activo else 'inactivo'
+            self.tree.insert('', 'end', values=valores, tags=(tag,))
+        
+        # Configurar colores
+        self.tree.tag_configure('activo', background='white')
+        self.tree.tag_configure('inactivo', background='#fee2e2', foreground='#991b1b')
+        
+        # Actualizar estadísticas
+        self.stats_label.config(text=f"Total: {len(clientes)} clientes")
+    
+    def buscar_clientes(self):
+        """Busca clientes según el criterio"""
+        criterio = self.search_var.get().strip()
+        
+        # Limpiar tabla
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Buscar
+        if criterio:
+            clientes = self.clientes_repo.buscar_clientes(criterio, solo_activos=False)
+        else:
+            clientes = self.clientes_repo.listar_clientes(solo_activos=False)
+        
+        # Llenar tabla
+        for cliente in clientes:
+            estado = "Activo" if cliente.activo else "Inactivo"
+            valores = (
+                cliente.id,
+                f"{cliente.tipo_documento} {cliente.numero_documento}",
+                cliente.nombre,
+                cliente.telefono or '-',
+                cliente.ciudad or '-',
+                f"${cliente.limite_credito:,.0f}",
+                f"${cliente.saldo_pendiente:,.0f}",
+                estado
+            )
+            tag = 'activo' if cliente.activo else 'inactivo'
+            self.tree.insert('', 'end', values=valores, tags=(tag,))
+        
+        self.stats_label.config(text=f"Encontrados: {len(clientes)} clientes")
+    
+    def nuevo_cliente(self):
+        """Abre ventana para crear nuevo cliente"""
+        FormularioCliente(self.parent, self.clientes_repo, self.auth, 
+                         callback=self.cargar_clientes)
+    
+    def editar_cliente(self):
+        """Edita el cliente seleccionado"""
+        seleccion = self.tree.selection()
+        if not seleccion:
+            messagebox.showwarning("Advertencia", "Seleccione un cliente")
+            return
+        
+        # Obtener ID del cliente
+        valores = self.tree.item(seleccion[0])['values']
+        cliente_id = valores[0]
+        
+        # Obtener cliente completo
+        cliente = self.clientes_repo.obtener_cliente(cliente_id)
+        if cliente:
+            FormularioCliente(self.parent, self.clientes_repo, self.auth,
+                            cliente=cliente, callback=self.cargar_clientes)
+    
+    def eliminar_cliente(self):
+        """Elimina el cliente seleccionado"""
+        seleccion = self.tree.selection()
+        if not seleccion:
+            messagebox.showwarning("Advertencia", "Seleccione un cliente")
+            return
+        
+        valores = self.tree.item(seleccion[0])['values']
+        cliente_id = valores[0]
+        nombre = valores[2]
+        
+        respuesta = messagebox.askyesno(
+            "Confirmar eliminación",
+            f"¿Está seguro de eliminar el cliente '{nombre}'?\n\n"
+            "Esta acción no se puede deshacer."
+        )
+        
+        if respuesta:
+            exito, mensaje = self.clientes_repo.eliminar_cliente(cliente_id)
+            if exito:
+                messagebox.showinfo("Éxito", mensaje)
+                self.cargar_clientes()
+            else:
+                messagebox.showerror("Error", mensaje)
+    
+    def mostrar_menu_contextual(self, event):
+        """Muestra menú contextual"""
+        # Seleccionar item bajo el cursor
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            
+            # Crear menú
+            menu = tk.Menu(self.parent, tearoff=0)
+            menu.add_command(label="Editar", command=self.editar_cliente)
+            menu.add_command(label="Ver historial", command=self.ver_historial)
+            menu.add_separator()
+            menu.add_command(label="Eliminar", command=self.eliminar_cliente)
+            
+            menu.post(event.x_root, event.y_root)
+    
+    def ver_historial(self):
+        """Muestra el historial del cliente"""
+        seleccion = self.tree.selection()
+        if not seleccion:
+            return
+        
+        valores = self.tree.item(seleccion[0])['values']
+        cliente_id = valores[0]
+        
+        messagebox.showinfo("Información", 
+                          f"Historial del cliente ID {cliente_id}\n"
+                          "(Funcionalidad en desarrollo)")
+
+
+class FormularioCliente:
+    """Formulario para crear/editar clientes"""
+    
+    def __init__(self, parent, clientes_repo, auth_manager, cliente=None, callback=None):
+        self.clientes_repo = clientes_repo
+        self.auth = auth_manager
+        self.cliente = cliente
+        self.callback = callback
+        
+        # Crear ventana
+        self.window = tk.Toplevel(parent)
+        self.window.title("Nuevo Cliente" if not cliente else "Editar Cliente")
+        self.window.geometry("600x700")
+        self.window.transient(parent)
+        self.window.grab_set()
+        
+        self.crear_formulario()
+        
+        if cliente:
+            self.cargar_datos()
+    
+    def crear_formulario(self):
+        """Crea el formulario"""
+        # Frame principal con scroll
+        main_frame = tk.Frame(self.window, bg=COLORS['bg_primary'])
+        main_frame.pack(fill='both', expand=True, padx=20, pady=20)
+        
+        # Título
+        titulo = "Editar Cliente" if self.cliente else "Nuevo Cliente"
+        tk.Label(main_frame, text=titulo, font=FONTS['heading'],
+                bg=COLORS['bg_primary']).pack(pady=(0, 20))
+        
+        # Campos del formulario
+        campos_frame = tk.Frame(main_frame, bg=COLORS['bg_primary'])
+        campos_frame.pack(fill='both', expand=True)
+        
+        # Tipo de documento
+        self.crear_campo(campos_frame, "Tipo de Documento:", 0)
+        self.tipo_doc_var = tk.StringVar(value='CC')
+        tipo_combo = ttk.Combobox(campos_frame, textvariable=self.tipo_doc_var,
+                                 values=['CC', 'NIT', 'CE', 'PAS'], state='readonly',
+                                 font=FONTS['body'])
+        tipo_combo.grid(row=0, column=1, sticky='ew', pady=5)
+        
+        # Número de documento
+        self.crear_campo(campos_frame, "Número de Documento:*", 1)
+        self.documento_var = tk.StringVar()
+        ttk.Entry(campos_frame, textvariable=self.documento_var,
+                 font=FONTS['body']).grid(row=1, column=1, sticky='ew', pady=5)
+        
+        # Nombre
+        self.crear_campo(campos_frame, "Nombre Completo:*", 2)
+        self.nombre_var = tk.StringVar()
+        ttk.Entry(campos_frame, textvariable=self.nombre_var,
+                 font=FONTS['body']).grid(row=2, column=1, sticky='ew', pady=5)
+        
+        # Teléfono
+        self.crear_campo(campos_frame, "Teléfono:", 3)
+        self.telefono_var = tk.StringVar()
+        ttk.Entry(campos_frame, textvariable=self.telefono_var,
+                 font=FONTS['body']).grid(row=3, column=1, sticky='ew', pady=5)
+        
+        # Email
+        self.crear_campo(campos_frame, "Email:", 4)
+        self.email_var = tk.StringVar()
+        ttk.Entry(campos_frame, textvariable=self.email_var,
+                 font=FONTS['body']).grid(row=4, column=1, sticky='ew', pady=5)
+        
+        # Dirección
+        self.crear_campo(campos_frame, "Dirección:", 5)
+        self.direccion_var = tk.StringVar()
+        ttk.Entry(campos_frame, textvariable=self.direccion_var,
+                 font=FONTS['body']).grid(row=5, column=1, sticky='ew', pady=5)
+        
+        # Ciudad
+        self.crear_campo(campos_frame, "Ciudad:", 6)
+        self.ciudad_var = tk.StringVar()
+        ttk.Entry(campos_frame, textvariable=self.ciudad_var,
+                 font=FONTS['body']).grid(row=6, column=1, sticky='ew', pady=5)
+        
+        # Límite de crédito
+        self.crear_campo(campos_frame, "Límite de Crédito:", 7)
+        self.limite_var = tk.StringVar(value='0')
+        ttk.Entry(campos_frame, textvariable=self.limite_var,
+                 font=FONTS['body']).grid(row=7, column=1, sticky='ew', pady=5)
+        
+        # Clasificación
+        self.crear_campo(campos_frame, "Clasificación:", 8)
+        self.clasificacion_var = tk.StringVar(value='C')
+        ttk.Combobox(campos_frame, textvariable=self.clasificacion_var,
+                    values=['A', 'B', 'C'], state='readonly',
+                    font=FONTS['body']).grid(row=8, column=1, sticky='ew', pady=5)
+        
+        # Descuento por defecto
+        self.crear_campo(campos_frame, "Descuento (%):", 9)
+        self.descuento_var = tk.StringVar(value='0')
+        ttk.Entry(campos_frame, textvariable=self.descuento_var,
+                 font=FONTS['body']).grid(row=9, column=1, sticky='ew', pady=5)
+        
+        # Activo
+        self.activo_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(campos_frame, text="Cliente Activo",
+                      variable=self.activo_var, bg=COLORS['bg_primary'],
+                      font=FONTS['body']).grid(row=10, column=1, sticky='w', pady=10)
+        
+        campos_frame.columnconfigure(1, weight=1)
+        
+        # Botones
+        btn_frame = tk.Frame(main_frame, bg=COLORS['bg_primary'])
+        btn_frame.pack(fill='x', pady=20)
+        
+        tk.Button(btn_frame, text=f"{ICONS['guardar']} Guardar",
+                 font=FONTS['body_bold'], bg=COLORS['success'], fg='white',
+                 cursor='hand2', relief='flat', padx=20, pady=10,
+                 command=self.guardar).pack(side='left', padx=5)
+        
+        tk.Button(btn_frame, text=f"{ICONS['cancelar']} Cancelar",
+                 font=FONTS['body'], bg=COLORS['secondary'], fg='white',
+                 cursor='hand2', relief='flat', padx=20, pady=10,
+                 command=self.window.destroy).pack(side='left', padx=5)
+    
+    def crear_campo(self, parent, texto, fila):
+        """Crea una etiqueta para un campo"""
+        tk.Label(parent, text=texto, font=FONTS['body'],
+                bg=COLORS['bg_primary'], anchor='w').grid(
+                    row=fila, column=0, sticky='w', pady=5, padx=(0, 10))
+    
+    def cargar_datos(self):
+        """Carga los datos del cliente en el formulario"""
+        if self.cliente:
+            self.tipo_doc_var.set(self.cliente.tipo_documento)
+            self.documento_var.set(self.cliente.numero_documento)
+            self.nombre_var.set(self.cliente.nombre)
+            self.telefono_var.set(self.cliente.telefono or '')
+            self.email_var.set(self.cliente.email or '')
+            self.direccion_var.set(self.cliente.direccion or '')
+            self.ciudad_var.set(self.cliente.ciudad or '')
+            self.limite_var.set(str(self.cliente.limite_credito))
+            self.clasificacion_var.set(self.cliente.clasificacion)
+            self.descuento_var.set(str(self.cliente.descuento_default))
+            self.activo_var.set(self.cliente.activo)
+    
+    def guardar(self):
+        """Guarda el cliente"""
+        # Validar campos obligatorios
+        if not self.documento_var.get().strip():
+            messagebox.showwarning("Advertencia", "El número de documento es obligatorio")
+            return
+        
+        if not self.nombre_var.get().strip():
+            messagebox.showwarning("Advertencia", "El nombre es obligatorio")
+            return
+        
+        try:
+            limite = float(self.limite_var.get() or 0)
+            descuento = float(self.descuento_var.get() or 0)
+        except ValueError:
+            messagebox.showerror("Error", "Verifique los valores numéricos")
+            return
+        
+        # Crear/actualizar cliente
+        if self.cliente:
+            # Actualizar
+            self.cliente.tipo_documento = self.tipo_doc_var.get()
+            self.cliente.numero_documento = self.documento_var.get().strip()
+            self.cliente.nombre = self.nombre_var.get().strip()
+            self.cliente.telefono = self.telefono_var.get().strip() or None
+            self.cliente.email = self.email_var.get().strip() or None
+            self.cliente.direccion = self.direccion_var.get().strip() or None
+            self.cliente.ciudad = self.ciudad_var.get().strip() or None
+            self.cliente.limite_credito = limite
+            self.cliente.clasificacion = self.clasificacion_var.get()
+            self.cliente.descuento_default = descuento
+            self.cliente.activo = self.activo_var.get()
+            
+            exito, mensaje = self.clientes_repo.actualizar_cliente(self.cliente)
+        else:
+            # Crear nuevo
+            nuevo_cliente = Cliente(
+                tipo_documento=self.tipo_doc_var.get(),
+                numero_documento=self.documento_var.get().strip(),
+                nombre=self.nombre_var.get().strip(),
+                telefono=self.telefono_var.get().strip() or None,
+                email=self.email_var.get().strip() or None,
+                direccion=self.direccion_var.get().strip() or None,
+                ciudad=self.ciudad_var.get().strip() or None,
+                limite_credito=limite,
+                clasificacion=self.clasificacion_var.get(),
+                descuento_default=descuento,
+                activo=self.activo_var.get()
+            )
+            
+            exito, mensaje, _ = self.clientes_repo.crear_cliente(nuevo_cliente)
+        
+        if exito:
+            messagebox.showinfo("Éxito", mensaje)
+            if self.callback:
+                self.callback()
+            self.window.destroy()
+        else:
+            messagebox.showerror("Error", mensaje)
+    
+    def ver_cuentas_por_cobrar_cliente(self):
+        """Abre modal con cuentas por cobrar del cliente seleccionado"""
+        if not self.cuentas_service:
+            messagebox.showwarning("Advertencia", "Servicio de cuentas por cobrar no disponible")
+            return
+        
+        seleccion = self.tree.selection()
+        if not seleccion:
+            messagebox.showwarning("Advertencia", "Seleccione un cliente")
+            return
+        
+        # Obtener ID del cliente
+        valores = self.tree.item(seleccion[0])['values']
+        cliente_id = valores[0]
+        
+        # Obtener datos
+        datos = self.cuentas_service.obtener_cuentas_cliente(cliente_id)
+        
+        if not datos:
+            messagebox.showinfo("Información", "Cliente no encontrado")
+            return
+        
+        if not datos['facturas']:
+            messagebox.showinfo("Información", 
+                              f"El cliente {datos['cliente']['nombre']} no tiene facturas pendientes")
+            return
+        
+        # Crear ventana modal
+        self._mostrar_modal_cuentas(datos)
+    
+    def _mostrar_modal_cuentas(self, datos):
+        """Muestra modal con detalles de cuentas por cobrar"""
+        ventana = tk.Toplevel(self.parent)
+        ventana.title("Cuentas por Cobrar - Cliente")
+        ventana.geometry("900x600")
+        ventana.resizable(False, False)
+        
+        # Info del cliente
+        info_frame = tk.LabelFrame(ventana, text="Información del Cliente",
+                                  font=FONTS['body_bold'], padx=15, pady=10)
+        info_frame.pack(fill='x', padx=15, pady=10)
+        
+        cliente = datos['cliente']
+        tk.Label(info_frame, text=f"Cliente: {cliente['nombre']}",
+                font=FONTS['body']).pack(anchor='w', pady=2)
+        tk.Label(info_frame, text=f"Documento: {cliente['documento']}",
+                font=FONTS['body']).pack(anchor='w', pady=2)
+        tk.Label(info_frame, text=f"Límite de Crédito: ${cliente['limite_credito']:,.0f}",
+                font=FONTS['body']).pack(anchor='w', pady=2)
+        
+        # Totales
+        totales_frame = tk.LabelFrame(ventana, text="Resumen",
+                                     font=FONTS['body_bold'], padx=15, pady=10)
+        totales_frame.pack(fill='x', padx=15, pady=10)
+        
+        tk.Label(totales_frame, 
+                text=f"Total Deuda: ${datos['total_deuda']:,.0f}",
+                font=('Segoe UI', 14, 'bold'), fg='#DC2626').pack(anchor='w', pady=2)
+        tk.Label(totales_frame, 
+                text=f"Total Pagado: ${datos['total_pagado']:,.0f}",
+                font=FONTS['body'], fg='#059669').pack(anchor='w', pady=2)
+        tk.Label(totales_frame, 
+                text=f"Facturas Pendientes: {datos['cantidad_facturas']}",
+                font=FONTS['body']).pack(anchor='w', pady=2)
+        
+        # Tabla de facturas
+        tabla_frame = tk.LabelFrame(ventana, text="Facturas Pendientes",
+                                   font=FONTS['body_bold'], padx=10, pady=10)
+        tabla_frame.pack(fill='both', expand=True, padx=15, pady=10)
+        
+        # Scrollbar
+        scroll_y = ttk.Scrollbar(tabla_frame, orient='vertical')
+        scroll_y.pack(side='right', fill='y')
+        
+        # Treeview
+        columnas = ('Factura', 'Fecha', 'Total', 'Pagado', 'Saldo', 'Estado', 'Días')
+        tree = ttk.Treeview(tabla_frame, columns=columnas, show='headings',
+                           yscrollcommand=scroll_y.set, height=10)
+        
+        # Configurar columnas
+        anchos = [100, 100, 100, 100, 100, 80, 60]
+        for col, ancho in zip(columnas, anchos):
+            tree.heading(col, text=col)
+            tree.column(col, width=ancho, anchor='center')
+        
+        tree.pack(fill='both', expand=True)
+        scroll_y.config(command=tree.yview)
+        
+        # Llenar tabla
+        for factura in datos['facturas']:
+            estado_emoji = {
+                'PENDIENTE': '⏳',
+                'PARCIAL': '🟡',
+                'PAGADO': '✅'
+            }.get(factura['estado_pago'], '')
+            
+            valores = (
+                factura['numero_factura'],
+                factura['fecha'][:10] if factura['fecha'] else '',
+                f"${factura['total']:,.0f}",
+                f"${factura['monto_pagado']:,.0f}",
+                f"${factura['saldo_pendiente']:,.0f}",
+                f"{estado_emoji} {factura['estado_pago']}",
+                f"{factura['dias_vencido']} días"
+            )
+            
+            # Color según días vencidos
+            if factura['dias_vencido'] > 60:
+                tag = 'vencida'
+            elif factura['dias_vencido'] > 30:
+                tag = 'alerta'
+            else:
+                tag = 'reciente'
+            
+            iid = tree.insert('', 'end', values=valores, tags=(tag,))
+            # Guardar id_venta en el item
+            tree.set(iid, '#0', factura['id'])
+        
+        # Configurar colores
+        tree.tag_configure('vencida', background='#fee2e2', foreground='#991b1b')
+        tree.tag_configure('alerta', background='#fef3c7', foreground='#92400e')
+        tree.tag_configure('reciente', background='white')
+        
+        # Botones
+        btn_frame = tk.Frame(ventana, bg='white')
+        btn_frame.pack(fill='x', padx=15, pady=10)
+        
+        def registrar_abono():
+            seleccion = tree.selection()
+            if not seleccion:
+                messagebox.showwarning("Advertencia", "Seleccione una factura")
+                return
+            
+            # Obtener datos de la factura
+            valores = tree.item(seleccion[0])['values']
+            id_venta = int(tree.set(seleccion[0], '#0'))
+            numero_factura = valores[0]
+            total = float(valores[2].replace('$', '').replace(',', ''))
+            saldo = float(valores[4].replace('$', '').replace(',', ''))
+            
+            self._abrir_modal_abono(id_venta, numero_factura, total, saldo, ventana)
+        
+        tk.Button(btn_frame, text="💰 Registrar Cobro",
+                 font=FONTS['body'], bg='#059669', fg='white',
+                 cursor='hand2', relief='flat', padx=15, pady=8,
+                 command=registrar_abono).pack(side='left', padx=5)
+        
+        tk.Button(btn_frame, text="Cerrar",
+                 font=FONTS['body'], bg='#6B7280', fg='white',
+                 cursor='hand2', relief='flat', padx=15, pady=8,
+                 command=ventana.destroy).pack(side='right', padx=5)
+    
+    def _abrir_modal_abono(self, id_venta, numero_factura, total, saldo, parent_window):
+        """Abre modal para registrar abono/cobro"""
+        if not self.abonos_repo:
+            messagebox.showwarning("Advertencia", "Repositorio de abonos no disponible")
+            return
+        
+        try:
+            # Crear modal
+            ventana_abono = tk.Toplevel(parent_window)
+            ventana_abono.geometry("600x500")
+            ventana_abono.title("Registrar Cobro a Factura")
+            ventana_abono.resizable(False, False)
+            
+            # Info de factura
+            info_frame = tk.LabelFrame(ventana_abono, text="Información de Factura",
+                                      font=FONTS['body_bold'], padx=15, pady=10)
+            info_frame.pack(fill='x', padx=15, pady=10)
+            
+            tk.Label(info_frame, text=f"Factura: {numero_factura}",
+                    font=FONTS['body']).pack(anchor='w', pady=2)
+            tk.Label(info_frame, text=f"Total: ${total:,.0f}",
+                    font=FONTS['body']).pack(anchor='w', pady=2)
+            
+            # Variable para mantener saldo actualizado
+            saldo_actual = [saldo]  # Lista para poder modificarla en closure
+            
+            saldo_label = tk.Label(info_frame, text=f"Saldo Pendiente: ${saldo_actual[0]:,.0f}",
+                                  font=('Segoe UI', 12, 'bold'), fg='#DC2626')
+            saldo_label.pack(anchor='w', pady=2)
+            
+            # Frame de formulario
+            form_frame = tk.LabelFrame(ventana_abono, text="Datos del Cobro",
+                                      font=FONTS['body_bold'], padx=15, pady=10)
+            form_frame.pack(fill='both', expand=True, padx=15, pady=10)
+            
+            # Monto
+            tk.Label(form_frame, text="Monto Cobrado:", font=FONTS['body']).grid(row=0, column=0, sticky='w', pady=5)
+            monto_var = tk.StringVar()
+            monto_entry = tk.Entry(form_frame, textvariable=monto_var, font=FONTS['body'], width=20)
+            monto_entry.grid(row=0, column=1, pady=5, padx=5)
+            monto_entry.focus()
+            
+            # Botón para pagar saldo completo
+            def pagar_todo():
+                monto_var.set(str(int(saldo_actual[0])))
+            
+            tk.Button(form_frame, text="Pagar Todo", font=FONTS['small'], bg='#10B981', fg='white',
+                     command=pagar_todo).grid(row=0, column=2, pady=5, padx=5)
+            
+            # Tipo de pago
+            tk.Label(form_frame, text="Tipo de Pago:", font=FONTS['body']).grid(row=1, column=0, sticky='w', pady=5)
+            tipo_var = tk.StringVar(value="Efectivo")
+            tipos = ["Efectivo", "Transferencia", "Cheque", "Tarjeta Débito", "Tarjeta Crédito", "Otro"]
+            tipo_combo = ttk.Combobox(form_frame, textvariable=tipo_var, values=tipos,
+                                     font=FONTS['body'], width=18, state='readonly')
+            tipo_combo.grid(row=1, column=1, pady=5, padx=5)
+            
+            # Número de comprobante
+            tk.Label(form_frame, text="Nº Comprobante:", font=FONTS['body']).grid(row=2, column=0, sticky='w', pady=5)
+            comprobante_var = tk.StringVar()
+            comprobante_entry = tk.Entry(form_frame, textvariable=comprobante_var, font=FONTS['body'], width=20)
+            comprobante_entry.grid(row=2, column=1, pady=5, padx=5)
+            
+            # Historial de abonos
+            historial_frame = tk.LabelFrame(form_frame, text="Historial de Cobros",
+                                           font=FONTS['small'], padx=10, pady=5)
+            historial_frame.grid(row=3, column=0, columnspan=3, sticky='ew', pady=10)
+            
+            # Obtener abonos previos
+            abonos_previos = self.abonos_repo.obtener_abonos_factura(id_venta)
+            
+            if abonos_previos:
+                for abono in abonos_previos[:3]:  # Mostrar últimos 3
+                    texto = f"• ${abono['monto_abono']:,.0f} - {abono['tipo_pago']} ({abono['fecha_abono'][:10]})"
+                    tk.Label(historial_frame, text=texto, font=FONTS['small'], fg='#6B7280').pack(anchor='w')
+            else:
+                tk.Label(historial_frame, text="No hay cobros registrados aún",
+                        font=FONTS['small'], fg='#9CA3AF').pack(anchor='w')
+            
+            def limpiar_campos():
+                """Limpia los campos del formulario"""
+                monto_var.set('')
+                comprobante_var.set('')
+                monto_entry.focus()
+            
+            def guardar_abono():
+                """Guarda el abono validando el monto"""
+                try:
+                    monto = float(monto_var.get().strip())
+                    
+                    if monto <= 0:
+                        messagebox.showwarning("Advertencia", "El monto debe ser mayor a cero")
+                        return
+                    
+                    if monto > saldo_actual[0]:
+                        messagebox.showwarning("Advertencia", 
+                                             f"El monto no puede exceder el saldo pendiente (${saldo_actual[0]:,.0f})")
+                        return
+                    
+                    # Crear abono
+                    abono = AbonoVenta(
+                        id_venta=id_venta,
+                        monto_abono=monto,
+                        fecha_abono=datetime.now().strftime('%Y-%m-%d'),
+                        tipo_pago=tipo_var.get(),
+                        numero_comprobante=comprobante_var.get() or None,
+                        usuario=self.auth.usuario_actual.username if self.auth.usuario_actual else "Sistema",
+                        observaciones=None
+                    )
+                    
+                    # Guardar abono en repositorio
+                    if self.abonos_repo:
+                        self.abonos_repo.crear_abono(abono)
+                        
+                        # Actualizar saldo pendiente
+                        saldo_actual[0] -= monto
+                        
+                        messagebox.showinfo("Éxito", 
+                                          f"Cobro de ${monto:,.0f} registrado correctamente\n"
+                                          f"Nuevo saldo pendiente: ${saldo_actual[0]:,.0f}")
+                        
+                        # Limpiar campos
+                        limpiar_campos()
+                        
+                        # Actualizar tabla de clientes
+                        self.cargar_clientes()
+                        
+                        # Si el saldo es 0, cerrar las ventanas
+                        if saldo_actual[0] <= 0:
+                            ventana_abono.destroy()
+                            parent_window.destroy()
+                        else:
+                            # Actualizar label de saldo
+                            saldo_label.config(text=f"Saldo Pendiente: ${saldo_actual[0]:,.0f}")
+                    else:
+                        messagebox.showerror("Error", "Repositorio de abonos no disponible")
+                        
+                except ValueError:
+                    messagebox.showerror("Error", "Ingrese un monto válido")
+            
+            # Botones
+            btn_frame = tk.Frame(ventana_abono)
+            btn_frame.pack(fill='x', padx=15, pady=10)
+            
+            tk.Button(btn_frame, text="💾 Guardar Cobro", font=FONTS['body'],
+                     bg='#059669', fg='white', cursor='hand2', relief='flat',
+                     padx=20, pady=10, command=guardar_abono).pack(side='left', padx=5)
+            
+            tk.Button(btn_frame, text="🗑️ Limpiar", font=FONTS['body'],
+                     bg='#6B7280', fg='white', cursor='hand2', relief='flat',
+                     padx=20, pady=10, command=limpiar_campos).pack(side='left', padx=5)
+            
+            tk.Button(btn_frame, text="Cancelar", font=FONTS['body'],
+                     bg='#DC2626', fg='white', cursor='hand2', relief='flat',
+                     padx=20, pady=10, command=ventana_abono.destroy).pack(side='right', padx=5)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al abrir modal de abono: {e}")

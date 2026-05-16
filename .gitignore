@@ -1,0 +1,30 @@
+# Credenciales - NUNCA subir
+.env
+
+# Entorno virtual
+.venv/
+venv/
+env/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Base de datos local
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs y archivos temporales
+error_log.txt
+stock_critico_*.txt
+main_output.txt
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
