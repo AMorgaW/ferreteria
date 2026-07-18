@@ -39,38 +39,24 @@ class AbonosVentasRepository:
             ))
             
             abono_id = cursor.lastrowid
-            
-            # Obtener información de la venta para el movimiento
-            cursor.execute('''
-                SELECT numero_factura, cliente_id 
-                FROM ventas 
-                WHERE id = ?
-            ''', (abono.id_venta,))
-            venta_info = cursor.fetchone()
-            numero_factura = venta_info[0] if venta_info else 'N/A'
-            
-            # Registrar movimiento de cobro
-            from datetime import datetime
-            cursor.execute('''
-                INSERT INTO movimientos (
-                    tipo, producto_id, cantidad,
-                    precio_unitario, costo_total, motivo, num_factura, fecha
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                'COBRO_CREDITO',
-                -1,  # Valor especial para indicar que no es movimiento de producto
-                1,   # Cantidad 1 para que no sea NULL
-                abono.monto_abono,  # El monto del cobro
-                abono.monto_abono,  # El monto del cobro va en costo_total
-                f'Cobro de factura {numero_factura} - {abono.tipo_pago}',
-                numero_factura,
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            ))
-            
+
+            # NOTA: antes se insertaba un movimiento 'COBRO_CREDITO' con
+            # producto_id=-1 como marcador. Eso violaba la FK movimientos→productos
+            # (con foreign_keys=ON rompía el registro del abono) y la UI de
+            # movimientos lo filtraba en todos lados, por lo que no aportaba nada.
+            # El abono queda registrado en abonos_ventas (fuente de verdad) y el
+            # estado de la venta se actualiza abajo; no es un movimiento de
+            # inventario, así que ya no se inserta en 'movimientos'.
+
             # Actualizar estado de la venta automáticamente
             self._actualizar_estado_venta(cursor, abono.id_venta)
-            
+
+            # Local-first: encolar el abono y la venta (estado/saldo) a Supabase.
+            # (El movimiento COBRO_CREDITO usa producto_id=-1 y no se sincroniza.)
+            from repositories._outbox import encolar
+            encolar(conn, "sale_payment", abono_id, "create", "abonos_ventas")
+            encolar(conn, "sale", abono.id_venta, "update", "ventas")
+
             conn.commit()
             return abono_id
             
@@ -141,13 +127,18 @@ class AbonosVentasRepository:
                 return False
             
             id_venta = resultado[0]
-            
+
+            # Local-first: encolar borrado del abono ANTES de eliminarlo.
+            from repositories._outbox import encolar, encolar_borrado
+            encolar_borrado(conn, "sale_payment", id_abono, "abonos_ventas")
+
             # Eliminar abono
             cursor.execute('DELETE FROM abonos_ventas WHERE id = ?', (id_abono,))
-            
+
             # Actualizar estado de la venta
             self._actualizar_estado_venta(cursor, id_venta)
-            
+            encolar(conn, "sale", id_venta, "update", "ventas")
+
             conn.commit()
             return True
             

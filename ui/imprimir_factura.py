@@ -6,7 +6,7 @@ PySide6 version.
 """
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                 QPushButton, QTextEdit, QComboBox, QMessageBox,
-                                QApplication)
+                                QApplication, QFileDialog)
 from PySide6.QtCore import Qt, QMarginsF, QSizeF
 from PySide6.QtGui import QFont, QPainter, QPageSize, QPageLayout, QPen, QColor
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
@@ -61,6 +61,16 @@ def imprimir_factura(parent, venta_data, detalles, nombre_negocio="FERRETERÍA E
     btn_print.clicked.connect(lambda: _enviar_a_imprimir(contenido,
                               venta_data.get('numero_factura', 'factura'), dlg))
     btn_row.addWidget(btn_print)
+
+    btn_pdf = QPushButton("📄 Guardar PDF")
+    btn_pdf.setStyleSheet("""
+        QPushButton { background: #0f766e; color: white; border: none;
+                     border-radius: 6px; padding: 10px 24px; font-size: 11pt; font-weight: bold; }
+        QPushButton:hover { background: #115e59; }
+    """)
+    btn_pdf.setCursor(Qt.PointingHandCursor)
+    btn_pdf.clicked.connect(lambda: _guardar_pdf_dialogo(dlg, venta_data, detalles, nombre_negocio))
+    btn_row.addWidget(btn_pdf)
     btn_row.addStretch()
 
     btn_close = QPushButton("Cerrar")
@@ -93,6 +103,7 @@ def _generar_contenido_factura(venta_data, detalles, nombre_negocio):
     total = venta_data.get('total', 0)
     subtotal = venta_data.get('subtotal', total)
     descuento = venta_data.get('descuento', 0)
+    iva = venta_data.get('iva', 0) or 0
 
     L = []
     L.append(SEP.strip())
@@ -115,7 +126,8 @@ def _generar_contenido_factura(venta_data, detalles, nombre_negocio):
             nombre_completo = nombre_completo[W:]
         L.append(nombre_completo)
 
-        izq = f"{cantidad} x ${precio_unit:,.0f}"
+        from formato import formatear_stock
+        izq = f"{formatear_stock(cantidad)} x ${precio_unit:,.0f}"
         der = f"${item_sub:,.0f}"
         L.append(_alinear_item_ticket(izq, der, W))
 
@@ -135,6 +147,11 @@ def _generar_contenido_factura(venta_data, detalles, nombre_negocio):
     if descuento > 0:
         L.append(_alinear32("Subtotal:", f"${subtotal:,.0f}", W).strip())
         L.append(_alinear32("Descuento:", f"${descuento:,.0f}", W).strip())
+
+    if iva and iva > 0:
+        base = total - iva
+        L.append(_alinear32("Base gravable:", f"${base:,.0f}", W).strip())
+        L.append(_alinear32("IVA incluido:", f"${iva:,.0f}", W).strip())
 
     L.append(_alinear32("TOTAL:", f"${total:,.0f}", W).strip())
     L.append(SEP.strip())
@@ -294,3 +311,59 @@ def _imprimir_directo(contenido, nombre_impresora, parent_dlg=None):
     except Exception as e:
         QMessageBox.critical(parent_dlg, "Error",
                              f"Error al imprimir:\n{str(e)}")
+
+
+def factura_a_pdf(venta_data, detalles, path, nombre_negocio="FERRETERÍA EL ADOBE"):
+    """Genera un PDF imprimible del recibo, con el MISMO layout que la impresión
+    térmica (58mm). Devuelve la ruta del PDF generado."""
+    contenido = _generar_contenido_factura(venta_data, detalles, nombre_negocio)
+    lineas = contenido.strip().split('\n')
+
+    printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+    printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+    printer.setOutputFileName(path)
+    printer.setFullPage(True)
+
+    fuente = QFont('Courier New', 8)
+    fuente.setBold(True)
+    fuente.setStyleHint(QFont.StyleHint.TypeWriter)
+    fuente.setStyleStrategy(QFont.StyleStrategy.PreferMatch)
+    alto_mm = max(len(lineas) * 3.9 + 12, 50.0)
+    printer.setPageSize(QPageSize(QSizeF(58.0, alto_mm), QPageSize.Unit.Millimeter))
+    printer.setPageMargins(QMarginsF(5, 2, 5, 2), QPageLayout.Unit.Millimeter)
+    printer.setPageOrientation(QPageLayout.Orientation.Portrait)
+    printer.setResolution(300)
+
+    painter = QPainter()
+    if not painter.begin(printer):
+        raise RuntimeError("No se pudo iniciar la generación del PDF")
+    try:
+        painter.setPen(QPen(QColor(0, 0, 0), 0.8))
+        painter.setFont(fuente)
+        fm = painter.fontMetrics()
+        line_h = fm.height()
+        x = 0
+        y = fm.ascent()
+        for linea in lineas:
+            painter.drawText(x, y, linea)
+            y += line_h
+    finally:
+        painter.end()
+    return path
+
+
+def _guardar_pdf_dialogo(parent, venta_data, detalles, nombre_negocio):
+    """Pide ruta y guarda el recibo como PDF."""
+    numero = str(venta_data.get('numero_factura', 'factura')).replace('/', '-')
+    sugerido = f"factura_{numero}.pdf"
+    path, _ = QFileDialog.getSaveFileName(parent, "Guardar recibo en PDF",
+                                          sugerido, "PDF (*.pdf)")
+    if not path:
+        return
+    if not path.lower().endswith(".pdf"):
+        path += ".pdf"
+    try:
+        factura_a_pdf(venta_data, detalles, path, nombre_negocio)
+        QMessageBox.information(parent, "PDF generado", f"Recibo guardado en:\n{path}")
+    except Exception as exc:
+        QMessageBox.critical(parent, "Error al generar PDF", str(exc))

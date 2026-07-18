@@ -7,6 +7,112 @@ from typing import Tuple, List, Optional
 from datetime import datetime
 
 
+def _reconciliar_pagos_proveedor():
+    try:
+        from repositories.abonos_compras_repo import reconciliar_pagos_proveedor_huerfanos
+        reconciliar_pagos_proveedor_huerfanos()
+    except Exception as e:
+        print(f"[MOVIMIENTOS] No se pudieron reconciliar pagos a proveedor: {e}")
+
+
+def _reconciliar_movimientos_inventario_huerfanos(db):
+    conn = db.conectar()
+    cursor = conn.cursor()
+    creados = 0
+
+    try:
+        from repositories._outbox import encolar
+
+        cursor.execute('''
+            SELECT c.id AS compra_id, c.numero_factura, c.proveedor_id,
+                   c.usuario_id, c.fecha, dc.producto_id, dc.cantidad,
+                   dc.precio_unitario, dc.subtotal
+            FROM compras c
+            JOIN detalle_compras dc ON dc.compra_id = c.id
+            WHERE c.estado = 'COMPLETADA'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM movimientos m
+                  WHERE m.tipo = 'ENTRADA_COMPRA'
+                    AND (
+                        m.observaciones = ('Compra #' || CAST(c.id AS TEXT))
+                        OR (
+                            c.numero_factura IS NOT NULL
+                            AND m.num_factura = c.numero_factura
+                        )
+                    )
+              )
+        ''')
+        compras = cursor.fetchall()
+
+        for row in compras:
+            cursor.execute('''
+                INSERT INTO movimientos (
+                    tipo, producto_id, proveedor_id, usuario_id,
+                    cantidad, precio_unitario, costo_total,
+                    num_factura, observaciones, fecha
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                'ENTRADA_COMPRA',
+                row['producto_id'],
+                row['proveedor_id'],
+                row['usuario_id'],
+                row['cantidad'],
+                row['precio_unitario'],
+                row['subtotal'],
+                row['numero_factura'],
+                f"Compra #{row['compra_id']}",
+                str(row['fecha'])[:19]
+            ))
+            encolar(conn, "inventory_movement", cursor.lastrowid, "create", "movimientos")
+            creados += 1
+
+        cursor.execute('''
+            SELECT v.id AS venta_id, v.numero_factura, v.usuario_id, v.fecha,
+                   dv.producto_id, dv.cantidad, dv.precio_unitario, dv.subtotal
+            FROM ventas v
+            JOIN detalle_ventas dv ON dv.venta_id = v.id
+            WHERE v.estado = 'COMPLETADA'
+              AND v.numero_factura IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM movimientos m
+                  WHERE m.tipo = 'SALIDA_VENTA'
+                    AND m.num_factura = v.numero_factura
+              )
+        ''')
+        ventas = cursor.fetchall()
+
+        for row in ventas:
+            cursor.execute('''
+                INSERT INTO movimientos (
+                    tipo, producto_id, usuario_id, cantidad,
+                    precio_unitario, costo_total, motivo, num_factura, fecha
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                'SALIDA_VENTA',
+                row['producto_id'],
+                row['usuario_id'],
+                row['cantidad'],
+                row['precio_unitario'],
+                row['subtotal'],
+                f"Venta {row['numero_factura']}",
+                row['numero_factura'],
+                str(row['fecha'])[:19]
+            ))
+            encolar(conn, "inventory_movement", cursor.lastrowid, "create", "movimientos")
+            creados += 1
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[MOVIMIENTOS] No se pudieron reconciliar movimientos huérfanos: {e}")
+    finally:
+        conn.close()
+
+    return creados
+
+
 class MovimientosService:
     """Servicio para gestión de movimientos de inventario"""
     
@@ -40,8 +146,8 @@ class MovimientosService:
         
         # Para salidas, verificar que haya stock suficiente
         if tipo.startswith('SALIDA'):
-            if producto.stock < cantidad:
-                return False, f"Stock insuficiente. Disponible: {producto.stock}"
+            if producto['stock'] < cantidad:
+                return False, f"Stock insuficiente. Disponible: {producto['stock']}"
         
         conn = self.db.conectar()
         cursor = conn.cursor()
@@ -77,9 +183,9 @@ class MovimientosService:
             
             # Actualizar stock
             if tipo.startswith('ENTRADA'):
-                nuevo_stock = producto.stock + cantidad
+                nuevo_stock = producto['stock'] + cantidad
             else:  # SALIDA
-                nuevo_stock = producto.stock - cantidad
+                nuevo_stock = producto['stock'] - cantidad
             
             cursor.execute('''
                 UPDATE productos 
@@ -90,11 +196,16 @@ class MovimientosService:
             # Si es entrada por compra, actualizar precio de compra del producto
             if tipo == 'ENTRADA_COMPRA' and precio_unitario > 0:
                 cursor.execute('''
-                    UPDATE productos 
+                    UPDATE productos
                     SET precio_compra = ?, proveedor_id = ?
                     WHERE id = ?
                 ''', (precio_unitario, proveedor_id, producto_id))
-            
+
+            # Local-first: encolar el movimiento y el producto (stock/precio).
+            from repositories._outbox import encolar
+            encolar(conn, "inventory_movement", movimiento_id, "create", "movimientos")
+            encolar(conn, "product", producto_id, "update", "productos")
+
             conn.commit()
             
             # Registrar en auditoría
@@ -102,7 +213,7 @@ class MovimientosService:
                 self.auth.usuario_actual.id if self.auth.usuario_actual else None,
                 "MOVIMIENTO_INVENTARIO",
                 "Movimientos",
-                f"{tipo}: {producto.nombre} - Cantidad: {cantidad} - Nuevo stock: {nuevo_stock}"
+                f"{tipo}: {producto['nombre']} - Cantidad: {cantidad} - Nuevo stock: {nuevo_stock}"
             )
             
             conn.close()
@@ -124,6 +235,8 @@ class MovimientosService:
         """
         Obtiene el historial de movimientos con filtros opcionales
         """
+        _reconciliar_movimientos_inventario_huerfanos(self.db)
+
         conn = self.db.conectar()
         cursor = conn.cursor()
         
@@ -169,10 +282,48 @@ class MovimientosService:
         
         cursor.execute(query, params)
         movimientos = [dict(row) for row in cursor.fetchall()]
-        
+
         conn.close()
         return movimientos
-    
+
+    def obtener_egresos(self, fecha_inicio: Optional[str] = None,
+                        fecha_fin: Optional[str] = None,
+                        limite: int = 500) -> List[dict]:
+        """
+        Obtiene los egresos de caja (gastos operativos) para mostrarlos en la
+        vista de Movimientos. Son salidas de dinero, no de inventario, por eso
+        viven en su propia tabla; aquí se leen para unificar la vista.
+        """
+        _reconciliar_pagos_proveedor()
+
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+
+        query = '''
+            SELECT id, monto, categoria, descripcion, metodo_pago,
+                   fecha_egreso, usuario
+            FROM egresos_caja
+            WHERE 1=1
+        '''
+        params = []
+        if fecha_inicio:
+            query += " AND DATE(fecha_egreso) >= DATE(?)"
+            params.append(fecha_inicio)
+        if fecha_fin:
+            query += " AND DATE(fecha_egreso) <= DATE(?)"
+            params.append(fecha_fin)
+        query += " ORDER BY fecha_egreso DESC LIMIT ?"
+        params.append(limite)
+
+        try:
+            cursor.execute(query, params)
+            egresos = [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"[MOVIMIENTOS] No se pudieron leer egresos_caja: {e}")
+            egresos = []
+        conn.close()
+        return egresos
+
     def obtener_movimiento_por_id(self, movimiento_id: int) -> Optional[dict]:
         """Obtiene un movimiento específico por ID"""
         conn = self.db.conectar()
@@ -307,9 +458,9 @@ class MovimientosService:
         try:
             # Revertir el stock
             if movimiento['tipo'].startswith('ENTRADA'):
-                nuevo_stock = producto.stock - movimiento['cantidad']
+                nuevo_stock = producto['stock'] - movimiento['cantidad']
             else:  # SALIDA
-                nuevo_stock = producto.stock + movimiento['cantidad']
+                nuevo_stock = producto['stock'] + movimiento['cantidad']
             
             # Verificar que el nuevo stock no sea negativo
             if nuevo_stock < 0:
@@ -332,7 +483,11 @@ class MovimientosService:
                 SET observaciones = ?
                 WHERE id = ?
             ''', (observacion_anulacion, movimiento_id))
-            
+
+            from repositories._outbox import encolar
+            encolar(conn, "product", movimiento['producto_id'], "update", "productos")
+            encolar(conn, "inventory_movement", movimiento_id, "update", "movimientos")
+
             conn.commit()
             
             # Registrar en auditoría
@@ -383,7 +538,7 @@ class MovimientosService:
         
         # Obtener stock actual
         producto = self.productos_repo.obtener_por_id(producto_id)
-        stock_actual = producto.stock if producto else 0
+        stock_actual = producto['stock'] if producto else 0
         
         # Calcular stock en cada punto (yendo hacia atrás desde el actual)
         for i, mov in enumerate(movimientos):

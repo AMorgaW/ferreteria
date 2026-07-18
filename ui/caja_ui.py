@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Interfaz de Usuario para Gestión de Caja (PySide6)
 """
@@ -99,7 +99,7 @@ class CajaUI(QWidget):
         self.btn_cerrar.setCursor(Qt.PointingHandCursor)
         self.btn_cerrar.setStyleSheet(
             f"QPushButton {{ background: {COLORS['danger']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 15px 30px; }}"
+            f"border-radius: 9px; padding: 14px 28px; font-weight: 500; }}"
             f"QPushButton:hover {{ background: {COLORS['danger_dark']}; }}"
         )
         self.btn_cerrar.clicked.connect(self.cerrar_caja)
@@ -108,9 +108,9 @@ class CajaUI(QWidget):
         self.btn_egreso.setFont(make_font(FONTS['body_bold']))
         self.btn_egreso.setCursor(Qt.PointingHandCursor)
         self.btn_egreso.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['warning']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 15px 30px; }}"
-            f"QPushButton:hover {{ background: {COLORS['warning_dark']}; }}"
+            f"QPushButton {{ background: {COLORS['accent']}; color: {COLORS['on_accent']}; border: none; "
+            f"border-radius: 9px; padding: 14px 28px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['accent_hover']}; }}"
         )
         self.btn_egreso.clicked.connect(self.registrar_egreso)
 
@@ -125,9 +125,9 @@ class CajaUI(QWidget):
             btn_historial.setFont(make_font(FONTS['body_bold']))
             btn_historial.setCursor(Qt.PointingHandCursor)
             btn_historial.setStyleSheet(
-                f"QPushButton {{ background: {COLORS['info']}; color: white; border: none; "
-                f"border-radius: 6px; padding: 10px 20px; }}"
-                f"QPushButton:hover {{ background: #0891b2; }}"
+                f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
+                f"border-radius: 9px; padding: 12px 22px; font-weight: 500; }}"
+                f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
             )
             btn_historial.clicked.connect(self.ver_historial_pagos)
             self.botones_layout.addWidget(btn_historial)
@@ -276,8 +276,8 @@ class CajaUI(QWidget):
         es_admin = (self.auth.usuario_actual and
                     self.auth.usuario_actual.rol in ('ADMIN', 'GERENTE'))
 
-        self.estado_label.setText("[OK] Caja Abierta")
-        self.estado_label.setStyleSheet(f"color: {COLORS['success']}; background: transparent; border: none;")
+        self.estado_label.setText("✓  Caja Abierta")
+        self.estado_label.setStyleSheet(f"color: {COLORS['success_dark']}; background: transparent; border: none;")
 
         fecha_apertura = datetime.fromisoformat(caja['fecha_apertura']).strftime('%d/%m/%Y %H:%M')
         self.info_label.setText(
@@ -349,9 +349,20 @@ class CajaUI(QWidget):
                                callback=self.verificar_estado_caja)
 
     def cerrar_caja(self):
-        """Cierra la caja actual"""
+        """Cierra la caja actual (manual). Tras cerrarla, la reabre con $200.000
+        para el siguiente turno."""
         FormularioCierreCaja(self, self.caja_service,
-                             callback=self.verificar_estado_caja)
+                             callback=self._despues_de_cierre_manual)
+
+    def _despues_de_cierre_manual(self):
+        """Si el cierre manual se completó (ya no hay caja abierta), reabrir con
+        el fondo estándar de $200.000. Si el usuario canceló, no hace nada."""
+        try:
+            if not self.caja_service.obtener_caja_abierta():
+                self.caja_service.abrir_caja(self.MONTO_INICIAL_DEFAULT)
+        except Exception as e:
+            print(f"[CIERRE-MANUAL] No se pudo reabrir la caja: {e}")
+        self.verificar_estado_caja()
 
     def registrar_egreso(self):
         """Abre el formulario para registrar un egreso"""
@@ -363,20 +374,45 @@ class CajaUI(QWidget):
         FormularioEgreso(self, self.auth,
                          callback=self.verificar_estado_caja)
 
+    MONTO_INICIAL_DEFAULT = 200_000
+
     def _verificar_cierre_automatico(self):
-        """Si son las 23:00 y la caja está abierta, la cierra y reabre con $200,000"""
-        hora = QTime.currentTime()
-        if hora.hour() != 23 or hora.minute() != 0:
-            return
+        """Corte de caja automático por si SE OLVIDARON de cerrarla:
+        - Se dispara pasadas las 11:59 p.m. (o si la caja quedó abierta de un
+          día anterior, p. ej. porque el programa estuvo cerrado a esa hora).
+        - Cierra la caja del día GUARDANDO el resumen (ventas por método y
+          egresos, vía cerrar_caja) y la REABRE con $200.000 para el día
+          siguiente. El cierre manual lo sigue haciendo el usuario cuando quiera.
+        """
+        from datetime import datetime
         caja = self.caja_service.obtener_caja_abierta()
         if not caja:
             return
+
+        ahora = datetime.now()
+        fecha_apertura = None
+        try:
+            fecha_apertura = datetime.strptime(
+                str(caja.get('fecha_apertura'))[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+
+        # Cerrar si la caja se abrió un día anterior a hoy (quedó sin cerrar),
+        # o si ya son (o pasaron) las 23:59 de hoy.
+        de_dia_anterior = fecha_apertura and fecha_apertura.date() < ahora.date()
+        paso_1159 = ahora.hour == 23 and ahora.minute >= 59
+        if not (de_dia_anterior or paso_1159):
+            return
+
         try:
             resumen = self.caja_service.obtener_resumen_cierre()
             monto_esperado = resumen.get('esperado', 0)
-            exito, _ = self.caja_service.cerrar_caja(monto_esperado, "Cierre automático a las 11 PM")
+            exito, _ = self.caja_service.cerrar_caja(
+                monto_esperado,
+                "Cierre automático (olvido de cierre - corte 11:59 PM)")
             if exito:
-                self.caja_service.abrir_caja(200_000)
+                # Reabrir con el fondo estándar para el día siguiente.
+                self.caja_service.abrir_caja(self.MONTO_INICIAL_DEFAULT)
                 self.verificar_estado_caja()
         except Exception as e:
             print(f"[AUTO-CIERRE] Error: {e}")
@@ -520,6 +556,8 @@ class FormularioCierreCaja(QDialog):
         self._refresh_timer.timeout.connect(self.cargar_datos)
         self._refresh_timer.start(5000)
 
+        from ui.widgets import hacer_dialogo_responsivo
+        hacer_dialogo_responsivo(self, 520, 620)
         self.exec()
 
     def _fila_resumen(self, lay, label, valor, negrita=False, color=None):
@@ -960,12 +998,15 @@ class VentanaHistorialPagos(QDialog):
         self.tree.setAlternatingRowColors(True)
         self.tree.verticalHeader().setVisible(False)
         self.tree.setStyleSheet(
-            "QTableWidget { background: white; gridline-color: #e2e8f0; border: none; }"
-            "QTableWidget::item { padding: 4px; }"
-            "QTableWidget::item:selected { background: #dbeafe; color: #0f172a; }"
+            f"QTableWidget {{ background: white; gridline-color: transparent;"
+            f" border: 1px solid {COLORS['border']}; border-radius: 12px;"
+            f" alternate-background-color: {COLORS['table_row_alt']}; }}"
+            "QTableWidget::item { padding: 7px 6px; }"
+            f"QTableWidget::item:selected {{ background: {COLORS['table_selection']};"
+            f" color: {COLORS['text_primary']}; }}"
             "QHeaderView::section {"
-            "    background: #1a2332; color: white; font-weight: bold;"
-            "    padding: 6px; border: none;"
+            f"    background: {COLORS['table_header']}; color: {COLORS['table_header_fg']};"
+            "    font-weight: 500; padding: 10px 8px; border: none;"
             "}"
         )
 
@@ -1058,9 +1099,9 @@ class VentanaHistorialPagos(QDialog):
             facturas_unicas = {}  # {id_compra: estado_pago}
 
             color_map = {
-                'pagado': (QColor('#d1fae5'), QColor('#065f46')),
-                'parcial': (QColor('#fef3c7'), QColor('#92400e')),
-                'pendiente': (QColor('#fee2e2'), QColor('#991b1b')),
+                'pagado': (QColor('#eaf3de'), QColor('#3b6d11')),
+                'parcial': (QColor('#faeeda'), QColor('#854f0b')),
+                'pendiente': (QColor('#fcebeb'), QColor('#a32d2d')),
             }
 
             for compra in compras:

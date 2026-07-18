@@ -7,60 +7,79 @@ Fuente ÚNICA de verdad para toda la paleta visual del sistema.
 # ─── Paleta de colores semántica ─────────────────────────────
 # Cambiar un valor aquí se propaga a TODA la aplicación.
 COLORS = {
-    # ── Marca / Acción principal (navy profundo — ref. ProcureFlow) ──
-    'primary': '#0C3547',
-    'primary_dark': '#091F32',
-    'primary_light': '#E3EFF5',
-    'primary_border': '#B0CFE0',
-    'primary_hover_light': '#CCDEE8',
+    # ── Marca / superficies oscuras ──
+    'primary': '#122033',
+    'primary_dark': '#0B1626',
+    'primary_light': '#E9EEF5',
+    'primary_border': '#BBC7D6',
+    'primary_hover_light': '#DDE5EF',
     'secondary': '#64748B',
     'secondary_dark': '#475569',
 
+    # ── Acento de marca (naranja cálido El Adobe) ──
+    'accent': '#E4572E',
+    'accent_dark': '#C84420',
+    'accent_light': '#FBE8E1',
+    'accent_hover': '#EE6A40',
+    'on_accent': '#FFFFFF',
+
+    # ── Sidebar oscuro (navy) ──
+    'sidebar_bg': '#122033',
+    'sidebar_bg_alt': '#0B1626',
+    'sidebar_fg': '#D2DAE6',
+    'sidebar_brand': '#FFFFFF',
+    'sidebar_active_bg': '#E4572E',
+    'sidebar_active_fg': '#FFFFFF',
+    'sidebar_hover_bg': '#1E3048',
+    'sidebar_hover_fg': '#FFFFFF',
+    'sidebar_border': '#2A3C54',
+
     # ── Semáforo de estados ──
-    'success': '#10B981',
-    'success_dark': '#059669',
-    'danger': '#EF4444',
-    'danger_dark': '#DC2626',
-    'danger_light': '#FEE2E2',
+    'success': '#1D9E75',
+    'success_dark': '#0F6E56',
+    'danger': '#E24B4A',
+    'danger_dark': '#A32D2D',
+    'danger_light': '#FCEBEB',
     'warning': '#F59E0B',
-    'warning_dark': '#D97706',
-    'warning_light': '#FEF3C7',
-    'warning_border': '#FCD34D',
-    'warning_hover_light': '#FDE68A',
-    'info': '#3B82F6',
-    'credito': '#D97706',
+    'warning_dark': '#854F0B',
+    'warning_light': '#FAEEDA',
+    'warning_border': '#F0D49A',
+    'warning_hover_light': '#F5E2C0',
+    'info': '#378ADD',
+    'credito': '#854F0B',
 
     # ── Fondos ──
-    'bg_primary': '#ffffff',
-    'bg_secondary': '#F7F8FA',
-    'bg_hover': '#F1F5F9',
+    'bg_primary': '#FFFFFF',
+    'bg_secondary': '#F6F8FB',
+    'bg_hover': '#EEF2F7',
     'bg_pressed': '#E2E8F0',
-    'bg_sidebar': '#ffffff',
-    'bg_dark': '#0C3547',
+    'bg_sidebar': '#122033',
+    'bg_dark': '#122033',
 
     # ── Texto ──
-    'text_primary': '#0F172A',
+    'text_primary': '#172033',
     'text_secondary': '#64748B',
     'text_light': '#94A3B8',
     'text_on_dark': '#ffffff',
     'text_body': '#334155',
-    'text_value': '#0F172A',
+    'text_value': '#172033',
 
     # ── Bordes y líneas ──
-    'border': '#E2E8F0',
-    'border_input': '#CBD5E1',
-    'border_light': '#F1F5F9',
+    'border': '#E4E9F0',
+    'border_input': '#CED6E1',
+    'border_light': '#EEF1F6',
     'disabled': '#CBD5E1',
 
     # ── Tabla ──
-    'table_header': '#0C3547',
-    'table_header_border': '#164E63',
-    'table_row_alt': '#F8FAFC',
-    'table_row_border': '#F1F5F9',
-    'table_selection': '#E3EFF5',
+    'table_header': '#122033',
+    'table_header_fg': '#CDD7E6',
+    'table_header_border': '#22324C',
+    'table_row_alt': '#FAFBFC',
+    'table_row_border': '#EEF1F6',
+    'table_selection': '#FBE8E1',
 
     # ── Sombras (usadas en QGraphicsDropShadowEffect) ──
-    'shadow_card': '#CBD5E1',
+    'shadow_card': '#C9D1DC',
 
     # ── Banner de deudas ──
     'debt_bg': '#78350F',
@@ -71,7 +90,7 @@ COLORS = {
     # ── Tarjeta KPI ──
     'kpi_title': '#94A3B8',
     'kpi_subtitle': '#94A3B8',
-    'kpi_value': '#0F172A',
+    'kpi_value': '#172033',
 }
 
 FONTS = {
@@ -84,9 +103,9 @@ FONTS = {
 }
 
 DIMENSIONS = {
-    'sidebar_width': 250,
-    'header_height': 70,
-    'statusbar_height': 30,
+    'sidebar_width': 236,
+    'header_height': 50,
+    'statusbar_height': 32,
     'button_height': 40,
     'input_height': 35,
 }
@@ -120,14 +139,19 @@ ICONS = {
 
 
 def make_font(font_tuple):
-    """Convierte tupla de fuente a QFont."""
+    """Convierte tupla de fuente a QFont.
+
+    Por lineamiento de diseño FERREPRO solo se usan pesos 400 (Normal) y
+    500 (Medium); nunca 600/700. Las tuplas marcadas como 'bold' se mapean
+    a peso Medium para mantener jerarquía sin engrosar el texto.
+    """
     from PySide6.QtGui import QFont
     family = font_tuple[0]
     size = font_tuple[1]
     bold = len(font_tuple) > 2 and font_tuple[2] == 'bold'
     f = QFont(family, size)
     if bold:
-        f.setBold(True)
+        f.setWeight(QFont.Medium)
     return f
 
 
@@ -145,34 +169,72 @@ QPushButton {{
     border: 1px solid {C['border_input']}; border-radius: 8px;
     padding: 8px 18px; background: {C['bg_primary']}; color: {C['text_primary']};
 }}
-QPushButton:hover {{ background: {C['bg_hover']}; border-color: #c6c6c6; }}
+QPushButton:hover {{ background: {C['bg_hover']}; border-color: {C['primary_border']}; }}
 QPushButton:pressed {{ background: {C['bg_pressed']}; }}
-QPushButton#primaryBtn {{
-    background: {C['primary']}; color: {C['text_on_dark']}; border: none;
-    font-weight: 600; border-radius: 8px;
+QPushButton:disabled {{ background: {C['bg_pressed']}; color: {C['text_light']}; border-color: {C['border']}; }}
+QPushButton:focus {{
+    border: 2px solid {C['accent']}; padding: 7px 17px;
 }}
-QPushButton#primaryBtn:hover {{ background: {C['primary_dark']}; }}
+QPushButton#primaryBtn {{
+    background: {C['accent']}; color: {C['on_accent']}; border: none;
+    font-weight: 500; border-radius: 8px;
+}}
+QPushButton#primaryBtn:hover {{
+    background: {C['accent_hover']}; color: {C['on_accent']}; border: none;
+}}
+QPushButton#primaryBtn:focus {{
+    background: {C['accent']}; color: {C['on_accent']};
+    border: 2px solid {C['accent_dark']}; padding: 7px 17px;
+}}
+QPushButton#primaryBtn:pressed {{
+    background: {C['accent_dark']}; color: {C['on_accent']}; border: none;
+}}
+QPushButton#successBtn {{
+    background: {C['success']}; color: {C['text_on_dark']}; border: none;
+    font-weight: 500; border-radius: 8px;
+}}
+QPushButton#successBtn:hover {{ background: {C['success_dark']}; }}
+QPushButton#darkBtn {{
+    background: {C['primary']}; color: {C['text_on_dark']}; border: none;
+    font-weight: 500; border-radius: 8px;
+}}
+QPushButton#darkBtn:hover {{ background: {C['primary_dark']}; }}
 QPushButton#dangerBtn {{
     background: {C['danger']}; color: {C['text_on_dark']}; border: none; border-radius: 8px;
 }}
 QPushButton#dangerBtn:hover {{ background: {C['danger_dark']}; }}
+QPushButton#ghostBtn {{
+    background: {C['bg_primary']}; color: {C['text_body']};
+    border: 1px solid {C['border_input']}; border-radius: 8px; font-weight: 500;
+}}
+QPushButton#ghostBtn:hover {{ background: {C['bg_hover']}; border-color: {C['primary_border']}; }}
+QPushButton#ghostDangerBtn {{
+    background: {C['bg_primary']}; color: {C['danger']};
+    border: 1px solid {C['danger']}; border-radius: 8px; font-weight: 500;
+}}
+QPushButton#ghostDangerBtn:hover {{ background: {C['danger']}; color: white; }}
 QPushButton#warningBtn {{
     background: {C['warning']}; color: {C['text_on_dark']}; border: none;
-    font-weight: 600; border-radius: 8px;
+    font-weight: 500; border-radius: 8px;
 }}
 QPushButton#warningBtn:hover {{ background: {C['warning_dark']}; }}
 
 QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     border: 1px solid {C['border_input']}; border-radius: 8px;
     padding: 8px 12px; background: {C['bg_primary']}; color: {C['text_primary']};
+    selection-background-color: {C['accent_light']}; selection-color: {C['text_primary']};
 }}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
-    border-color: {C['primary']};
+QLineEdit:focus, QTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+    border: 2px solid {C['accent']}; padding: 7px 11px;
+}}
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
+    border-color: {C['primary_border']};
 }}
 QComboBox::drop-down {{ border: none; padding-right: 8px; }}
 QComboBox QAbstractItemView {{
-    border: 1px solid {C['border_input']}; background: {C['bg_primary']};
-    selection-background-color: {C['primary_light']}; selection-color: {C['text_primary']};
+    border: 1px solid {C['border_input']}; border-radius: 8px; background: {C['bg_primary']};
+    selection-background-color: {C['accent_light']}; selection-color: {C['text_primary']};
+    outline: none; padding: 4px;
 }}
 
 QTableWidget, QTableView {{
@@ -181,9 +243,14 @@ QTableWidget, QTableView {{
     selection-background-color: {C['table_selection']}; selection-color: {C['text_primary']};
     font-size: 9pt;
 }}
+QTableWidget::item, QTableView::item {{ padding: 6px 4px; }}
+QTableWidget::item:hover, QTableView::item:hover {{ background: {C['bg_hover']}; }}
+QTableWidget::item:selected, QTableView::item:selected {{
+    background: {C['table_selection']}; color: {C['text_primary']};
+}}
 QHeaderView::section {{
-    background: {C['table_header']}; color: {C['text_on_dark']}; font-weight: 600;
-    font-size: 8pt; padding: 10px 8px; border: none;
+    background: {C['table_header']}; color: {C['table_header_fg']}; font-weight: 500;
+    font-size: 8pt; padding: 11px 8px; border: none;
     border-right: 1px solid {C['table_header_border']};
 }}
 QHeaderView::section:first {{ border-top-left-radius: 12px; }}
@@ -209,7 +276,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 
 QGroupBox {{
     border: 1px solid {C['border']}; border-radius: 12px;
-    margin-top: 12px; padding-top: 18px; font-weight: 600; color: {C['text_primary']};
+    margin-top: 12px; padding-top: 18px; font-weight: 500; color: {C['text_primary']};
 }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; }}
 
@@ -228,12 +295,35 @@ QMenu::item {{ padding: 8px 24px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {C['bg_hover']}; color: {C['text_primary']}; }}
 
 QCheckBox, QRadioButton {{ spacing: 8px; color: {C['text_primary']}; }}
+QCheckBox::indicator, QRadioButton::indicator {{
+    width: 16px; height: 16px; border: 1px solid {C['border_input']}; background: {C['bg_primary']};
+}}
+QCheckBox::indicator {{ border-radius: 4px; }}
+QRadioButton::indicator {{ border-radius: 8px; }}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+    border-color: {C['accent']}; background: {C['accent']};
+}}
+
+QProgressBar {{
+    min-height: 8px; border: none; border-radius: 4px; background: {C['bg_hover']};
+    text-align: center; color: transparent;
+}}
+QProgressBar::chunk {{ background: {C['success']}; border-radius: 4px; }}
 
 QDateEdit {{
-    border: 1px solid {C['border_input']}; border-radius: 6px;
+    border: 1px solid {C['border_input']}; border-radius: 9px;
     padding: 8px 12px; background: {C['bg_primary']}; color: {C['text_primary']};
 }}
-QDateEdit:focus {{ border-color: {C['primary']}; }}
+QDateEdit:focus {{ border: 2px solid {C['accent']}; padding: 7px 11px; }}
+
+QTabBar::tab {{
+    background: transparent; color: {C['text_secondary']};
+    padding: 9px 18px; border: none; font-weight: 500;
+    border-top-left-radius: 9px; border-top-right-radius: 9px;
+}}
+QTabBar::tab:selected {{ background: {C['bg_primary']}; color: {C['text_primary']}; }}
+QTabBar::tab:hover:!selected {{ color: {C['text_primary']}; }}
+QTabWidget::pane {{ border: 1px solid {C['border']}; border-radius: 12px; top: -1px; }}
 """
 
 

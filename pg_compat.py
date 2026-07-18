@@ -14,8 +14,21 @@ Conversiones automaticas:
   - lastrowid -> via RETURNING id
 """
 import re
+import sqlite3
 import psycopg2
 import psycopg2.extras
+import psycopg2.extensions
+import psycopg2.pool
+import threading
+
+# ── Compatibilidad de tipos SQLite ↔ PostgreSQL ──────────────────────────
+# SQLite devuelve las fechas como TEXTO; Postgres las parsea a datetime. Gran
+# parte de la UI/servicios asume texto (p. ej. fecha[:10], fromisoformat(fecha)).
+# Registramos un typecaster para que date/time/timestamp/timestamptz vuelvan
+# como el STRING crudo de Postgres, igual que SQLite → cero cambios en el resto.
+_TS_OIDS = (1082, 1083, 1114, 1184)  # date, time, timestamp, timestamptz
+_TS_AS_TEXT = psycopg2.extensions.new_type(_TS_OIDS, "TS_AS_TEXT", lambda v, c: v)
+psycopg2.extensions.register_type(_TS_AS_TEXT)
 
 # ─────────────────────────────────────────────────────────────
 #  URI de Supabase leída desde .env
@@ -34,7 +47,37 @@ def _load_env():
 
 _load_env()
 DATABASE_URL = _os.environ.get("SUPABASE_URI", "")
+DB_MODE = _os.environ.get("DB_MODE", "local").strip().lower()
+LOCAL_DB_PATH = _os.environ.get(
+    "LOCAL_DB_PATH",
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "ferreteria.db"),
+)
+POOL_MINCONN = int(_os.environ.get("DB_POOL_MINCONN", "1"))
+POOL_MAXCONN = int(_os.environ.get("DB_POOL_MAXCONN", "16"))
+CONNECT_TIMEOUT = int(_os.environ.get("DB_CONNECT_TIMEOUT", "8"))
+STATEMENT_TIMEOUT_MS = int(_os.environ.get("DB_STATEMENT_TIMEOUT_MS", "20000"))
+
+_POOL = None
+_POOL_LOCK = threading.Lock()
 # ─────────────────────────────────────────────────────────────
+
+
+_STRFTIME_TOKENS = [
+    ("%Y", "YYYY"), ("%m", "MM"), ("%d", "DD"),
+    ("%H", "HH24"), ("%M", "MI"), ("%S", "SS"),
+]
+
+
+def _strftime_to_char(match) -> str:
+    """strftime('%Y-%m', expr) -> to_char(expr, 'YYYY-MM')."""
+    fmt, expr = match.group(1), match.group(2)
+    for sqlite_tok, pg_tok in _STRFTIME_TOKENS:
+        fmt = fmt.replace(sqlite_tok, pg_tok)
+    # 'now' como literal es de tipo desconocido para to_char (ambiguo) ->
+    # usar el timestamp actual.
+    if expr.strip().lower() == "'now'":
+        expr = "CURRENT_TIMESTAMP"
+    return f"to_char({expr}, '{fmt}')"
 
 
 def _fix_query(query: str) -> str:
@@ -52,8 +95,18 @@ def _fix_query(query: str) -> str:
     # ? -> %s  (solo fuera de strings literales — aproximacion simple)
     q = q.replace("?", "%s")
 
+    # DATE('now', 'localtime' | 'utc' | ...) -> CURRENT_DATE
+    # (SQLite acepta modificadores; Postgres no tiene date(text, text)).
+    q = re.sub(r"DATE\s*\(\s*'now'\s*,\s*'[^']*'\s*\)", "CURRENT_DATE",
+               q, flags=re.IGNORECASE)
+
     # DATE('now') -> CURRENT_DATE
     q = re.sub(r"DATE\s*\(\s*'now'\s*\)", "CURRENT_DATE", q, flags=re.IGNORECASE)
+
+    # datetime('now'[, 'localtime']) -> CURRENT_TIMESTAMP (antes que la regla
+    # genérica de datetime, que asume el 1er argumento es una columna).
+    q = re.sub(r"datetime\s*\(\s*'now'\s*(,\s*'[^']*'\s*)*\)", "CURRENT_TIMESTAMP",
+               q, flags=re.IGNORECASE)
 
     # datetime(x, 'localtime') -> x AT TIME ZONE 'America/Bogota'
     q = re.sub(
@@ -61,6 +114,19 @@ def _fix_query(query: str) -> str:
         r"\1 AT TIME ZONE 'America/Bogota'",
         q,
         flags=re.IGNORECASE,
+    )
+
+    # TIME(expr) -> CAST(expr AS TIME)  (SQLite: función; Postgres: cast).
+    # Solo cuando el contenido no tiene paréntesis anidados.
+    q = re.sub(r"\bTIME\s*\(([^()]+)\)", r"CAST(\1 AS TIME)",
+               q, flags=re.IGNORECASE)
+
+    # strftime('<fmt>', expr[, 'modificador']) -> to_char(expr, '<fmt_pg>')
+    # El valor de tiempo no lleva comas (los datetime(x,'localtime') ya se
+    # tradujeron antes); los modificadores tipo 'localtime' se descartan.
+    q = re.sub(
+        r"strftime\s*\(\s*'([^']*)'\s*,\s*([^,()]+?)\s*(?:,\s*'[^']*'\s*)*\)",
+        _strftime_to_char, q, flags=re.IGNORECASE,
     )
 
     # julianday('now') - julianday(x) -> (CURRENT_DATE - DATE(x))
@@ -101,6 +167,11 @@ class PgCursor:
     @property
     def rowcount(self):
         return self._c.rowcount
+
+    @property
+    def connection(self):
+        # Compat sqlite3: algunos módulos acceden a cursor.connection.
+        return self._c.connection
 
     def execute(self, query: str, params=None):
         q = _fix_query(query)
@@ -176,27 +247,81 @@ class PgCursor:
         pass
 
 
+def _connection_options():
+    options = [f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"]
+    return " ".join(options)
+
+
+def _get_pool():
+    global _POOL
+
+    if not DATABASE_URL:
+        raise RuntimeError("SUPABASE_URI no esta configurado en .env")
+
+    if _POOL is None:
+        with _POOL_LOCK:
+            if _POOL is None:
+                _POOL = psycopg2.pool.ThreadedConnectionPool(
+                    POOL_MINCONN,
+                    POOL_MAXCONN,
+                    DATABASE_URL,
+                    connect_timeout=CONNECT_TIMEOUT,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=5,
+                    application_name="ferreteria_desktop",
+                    options=_connection_options(),
+                )
+    return _POOL
+
+
 class PgConnection:
     """Connection wrapper compatible con la API de sqlite3."""
 
-    def __init__(self, real_conn):
+    def __init__(self, real_conn, pool=None):
         self._conn = real_conn
+        self._pool = pool
+        self._closed = False
         # row_factory: ignorado; DictCursor ya devuelve dicts
         self.row_factory = None
 
     def cursor(self):
+        if self._closed:
+            raise RuntimeError("La conexion ya fue cerrada")
         return PgCursor(
             self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         )
 
     def commit(self):
+        if self._closed:
+            return
         self._conn.commit()
 
     def rollback(self):
+        if self._closed:
+            return
         self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        if self._closed:
+            return
+
+        discard = False
+        try:
+            if self._conn.closed:
+                discard = True
+            else:
+                self._conn.rollback()
+        except Exception:
+            discard = True
+
+        if self._pool is not None:
+            self._pool.putconn(self._conn, close=discard)
+        else:
+            self._conn.close()
+
+        self._closed = True
 
     # Contexto
     def __enter__(self):
@@ -220,7 +345,31 @@ class IntegrityError(Exception):
 
 
 def connect() -> PgConnection:
-    """Abre una conexion a PostgreSQL. Retorna PgConnection."""
-    raw = psycopg2.connect(DATABASE_URL, connect_timeout=15)
+    """Obtiene una conexion PostgreSQL reutilizable desde el pool."""
+    if DB_MODE in ("local", "sqlite", "server"):
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    pool = _get_pool()
+    raw = pool.getconn()
+
+    if raw.closed:
+        pool.putconn(raw, close=True)
+        raw = pool.getconn()
+
+    # Limpiar cualquier transacción abortada/pendiente que un uso previo haya
+    # dejado en esta conexión del pool. Sin esto, si un statement falló antes
+    # (p. ej. DDL SQLite contra Postgres), el siguiente que la reciba hereda el
+    # estado "InFailedSqlTransaction: current transaction is aborted".
+    try:
+        raw.rollback()
+    except Exception:
+        pool.putconn(raw, close=True)
+        raw = pool.getconn()
+
     raw.autocommit = False
-    return PgConnection(raw)
+    return PgConnection(raw, pool)

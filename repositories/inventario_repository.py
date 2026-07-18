@@ -74,21 +74,25 @@ class InventarioRepository:
             cursor.execute('''
                 UPDATE productos 
                 SET stock = ?,
-                    fecha_actualizacion = CURRENT_TIMESTAMP
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             ''', (nuevo_stock, movimiento.producto_id))
             
             # Si es una entrada de compra, actualizar precio de compra
             if movimiento.tipo_movimiento == 'ENTRADA_COMPRA' and movimiento.precio_unitario > 0:
                 cursor.execute('''
-                    UPDATE productos 
+                    UPDATE productos
                     SET precio_compra = ?
                     WHERE id = ?
                 ''', (movimiento.precio_unitario, movimiento.producto_id))
-            
+
+            from repositories._outbox import encolar
+            encolar(conn, "inventory_movement2", movimiento_id, "create", "movimientos_inventario")
+            encolar(conn, "product", movimiento.producto_id, "update", "productos")
+
             conn.commit()
             conn.close()
-            
+
             return True, f"Movimiento registrado. Nuevo stock: {nuevo_stock}"
             
         except Exception as e:
@@ -447,18 +451,23 @@ class InventarioRepository:
                     observaciones, usuario_id, fecha
                 ) VALUES (?, ?, ?, 0, ?, ?, CURRENT_TIMESTAMP)
             ''', (tipo_movimiento, producto_id, cantidad, motivo, usuario_id))
-            
+            _mov_aj_id = cursor.lastrowid
+
             # Actualizar stock
             cursor.execute('''
-                UPDATE productos 
+                UPDATE productos
                 SET stock = ?,
-                    fecha_actualizacion = CURRENT_TIMESTAMP
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             ''', (nuevo_stock, producto_id))
-            
+
+            from repositories._outbox import encolar
+            encolar(conn, "inventory_movement2", _mov_aj_id, "create", "movimientos_inventario")
+            encolar(conn, "product", producto_id, "update", "productos")
+
             conn.commit()
             conn.close()
-            
+
             return True, f"Stock ajustado de {stock_actual} a {nuevo_stock}"
             
         except Exception as e:
@@ -507,14 +516,18 @@ class InventarioRepository:
                 cursor.execute('''
                     UPDATE productos 
                     SET stock = ?,
-                        fecha_actualizacion = CURRENT_TIMESTAMP
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                 ''', (nuevo_stock, movimiento['producto_id']))
             
             # Eliminar el movimiento
-            cursor.execute('DELETE FROM movimientos_inventario WHERE id = ?', 
+            from repositories._outbox import encolar, encolar_borrado
+            if revertir_stock:
+                encolar(conn, "product", movimiento['producto_id'], "update", "productos")
+            encolar_borrado(conn, "inventory_movement2", movimiento_id, "movimientos_inventario")
+            cursor.execute('DELETE FROM movimientos_inventario WHERE id = ?',
                          (movimiento_id,))
-            
+
             conn.commit()
             conn.close()
             

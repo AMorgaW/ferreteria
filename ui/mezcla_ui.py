@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Ventana Modal de Mezcla de Pinturas (PySide6)
 Permite crear mezclas personalizadas seleccionando pinturas base y proporciones
@@ -37,6 +37,9 @@ class VentanaMezclaPintura(QDialog):
 
         self.crear_ui()
         self.cargar_pinturas()
+
+        from ui.widgets import hacer_dialogo_responsivo
+        hacer_dialogo_responsivo(self, 950, 700)
 
     def crear_ui(self):
         """Crea la interfaz completa del modal"""
@@ -188,9 +191,9 @@ class VentanaMezclaPintura(QDialog):
         btn_formulas.setFont(make_font(FONTS['small']))
         btn_formulas.setCursor(Qt.PointingHandCursor)
         btn_formulas.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['info']}; color: white; border: none; "
-            f"border-radius: 4px; padding: 6px; margin: 0 15px 10px 15px; }}"
-            f"QPushButton:hover {{ background: #0891b2; }}"
+            f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
+            f"border-radius: 8px; padding: 7px; margin: 0 15px 10px 15px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
         )
         btn_formulas.clicked.connect(self._abrir_formulas_guardadas)
         layout.addWidget(btn_formulas)
@@ -323,7 +326,7 @@ class VentanaMezclaPintura(QDialog):
         btn_confirmar.setCursor(Qt.PointingHandCursor)
         btn_confirmar.setStyleSheet(
             f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 25px; }}"
+            f"border-radius: 9px; padding: 9px 26px; font-weight: 500; }}"
             f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
         )
         btn_confirmar.clicked.connect(self._confirmar_mezcla)
@@ -333,9 +336,9 @@ class VentanaMezclaPintura(QDialog):
         btn_cancelar.setFont(make_font(FONTS['body_bold']))
         btn_cancelar.setCursor(Qt.PointingHandCursor)
         btn_cancelar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['secondary']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 25px; }}"
-            f"QPushButton:hover {{ background: #4b5563; }}"
+            f"QPushButton {{ background: {COLORS['bg_primary']}; color: {COLORS['text_body']}; "
+            f"border: 1px solid {COLORS['border_input']}; border-radius: 9px; padding: 9px 26px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['bg_hover']}; border-color: {COLORS['primary_border']}; }}"
         )
         btn_cancelar.clicked.connect(self.reject)
         layout.addWidget(btn_cancelar)

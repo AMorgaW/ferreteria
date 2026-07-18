@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from typing import Optional
 from models import Usuario, RolUsuario
 from ui_config import COLORS, FONTS, make_font
+from ui.widgets import button_qss
 
 
 class UsuariosUI(QWidget):
@@ -49,44 +50,32 @@ class UsuariosUI(QWidget):
         btn_nuevo = QPushButton("➕ Nuevo Usuario")
         btn_nuevo.setFont(make_font(FONTS['body']))
         btn_nuevo.setCursor(Qt.PointingHandCursor)
-        btn_nuevo.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
-        )
+        btn_nuevo.setStyleSheet(button_qss('primary'))
+        btn_nuevo.setMinimumHeight(38)
         btn_nuevo.clicked.connect(self.nuevo_usuario)
         header.addWidget(btn_nuevo)
 
         btn_editar = QPushButton("✏️ Editar")
         btn_editar.setFont(make_font(FONTS['body']))
         btn_editar.setCursor(Qt.PointingHandCursor)
-        btn_editar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
-        )
+        btn_editar.setStyleSheet(button_qss('ghost'))
+        btn_editar.setMinimumHeight(38)
         btn_editar.clicked.connect(self.editar_usuario)
         header.addWidget(btn_editar)
 
         btn_password = QPushButton("🔑 Cambiar Contraseña")
         btn_password.setFont(make_font(FONTS['body']))
         btn_password.setCursor(Qt.PointingHandCursor)
-        btn_password.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['warning']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: {COLORS['warning_dark']}; }}"
-        )
+        btn_password.setStyleSheet(button_qss('dark'))
+        btn_password.setMinimumHeight(38)
         btn_password.clicked.connect(self.cambiar_password)
         header.addWidget(btn_password)
 
         btn_actualizar = QPushButton("🔄 Actualizar")
         btn_actualizar.setFont(make_font(FONTS['body']))
         btn_actualizar.setCursor(Qt.PointingHandCursor)
-        btn_actualizar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['info']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: #0891b2; }}"
-        )
+        btn_actualizar.setStyleSheet(button_qss('ghost'))
+        btn_actualizar.setMinimumHeight(38)
         btn_actualizar.clicked.connect(self.cargar_usuarios)
         header.addWidget(btn_actualizar)
 
@@ -200,6 +189,9 @@ class VentanaUsuarioForm(QDialog):
         if usuario:
             self.cargar_datos()
 
+        from ui.widgets import hacer_dialogo_responsivo
+        hacer_dialogo_responsivo(self, 500, 600)
+
     def crear_formulario(self):
         """Crea el formulario"""
         main_layout = QVBoxLayout(self)
@@ -272,25 +264,19 @@ class VentanaUsuarioForm(QDialog):
         btn_layout = QHBoxLayout(btn_frame)
         btn_layout.setContentsMargins(30, 0, 30, 20)
 
-        btn_guardar = QPushButton("[GUARDAR] Guardar")
+        btn_guardar = QPushButton("💾  Guardar")
         btn_guardar.setFont(make_font(FONTS['body_bold']))
         btn_guardar.setCursor(Qt.PointingHandCursor)
-        btn_guardar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 10px 20px; }}"
-            f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
-        )
+        btn_guardar.setStyleSheet(button_qss('success'))
+        btn_guardar.setMinimumHeight(42)
         btn_guardar.clicked.connect(self.guardar)
         btn_layout.addWidget(btn_guardar)
 
-        btn_cancelar = QPushButton("[ERROR] Cancelar")
+        btn_cancelar = QPushButton("Cancelar")
         btn_cancelar.setFont(make_font(FONTS['body']))
         btn_cancelar.setCursor(Qt.PointingHandCursor)
-        btn_cancelar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['danger']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 10px 20px; }}"
-            f"QPushButton:hover {{ background: {COLORS['danger_dark']}; }}"
-        )
+        btn_cancelar.setStyleSheet(button_qss('ghost'))
+        btn_cancelar.setMinimumHeight(42)
         btn_cancelar.clicked.connect(self.reject)
         btn_layout.addWidget(btn_cancelar)
 
@@ -470,25 +456,19 @@ class VentanaCambiarPassword(QDialog):
         btn_layout = QHBoxLayout(btn_frame)
         btn_layout.setContentsMargins(30, 0, 30, 20)
 
-        btn_cambiar = QPushButton("[GUARDAR] Cambiar")
+        btn_cambiar = QPushButton("💾  Cambiar")
         btn_cambiar.setFont(make_font(FONTS['body_bold']))
         btn_cambiar.setCursor(Qt.PointingHandCursor)
-        btn_cambiar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 10px 20px; }}"
-            f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
-        )
+        btn_cambiar.setStyleSheet(button_qss('success'))
+        btn_cambiar.setMinimumHeight(42)
         btn_cambiar.clicked.connect(self.cambiar)
         btn_layout.addWidget(btn_cambiar)
 
-        btn_cancelar = QPushButton("[ERROR] Cancelar")
+        btn_cancelar = QPushButton("Cancelar")
         btn_cancelar.setFont(make_font(FONTS['body']))
         btn_cancelar.setCursor(Qt.PointingHandCursor)
-        btn_cancelar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['danger']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 10px 20px; }}"
-            f"QPushButton:hover {{ background: {COLORS['danger_dark']}; }}"
-        )
+        btn_cancelar.setStyleSheet(button_qss('ghost'))
+        btn_cancelar.setMinimumHeight(42)
         btn_cancelar.clicked.connect(self.reject)
         btn_layout.addWidget(btn_cancelar)
 

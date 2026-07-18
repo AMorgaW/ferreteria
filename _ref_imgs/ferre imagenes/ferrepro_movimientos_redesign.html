@@ -1,0 +1,127 @@
+<h2 class="sr-only">Rediseño de Movimientos de Inventario de FerrePro con filtros y tabla de movimientos con totales por fecha.</h2>
+<div style="font-family: var(--font-sans); border-radius: var(--border-radius-lg); overflow: hidden; border: 0.5px solid var(--color-border-secondary); background: #f5f7fa;">
+
+  <div style="display: flex; align-items: center; justify-content: space-between; background: #0f1b30; padding: 8px 14px;">
+    <span style="font-size: 11px; color: #9fb0c8;"><i class="ti ti-building-warehouse" style="font-size:14px; vertical-align:-2px; margin-right:6px;" aria-hidden="true"></i>Sistema de Inventario — Ferretería Profesional</span>
+    <div style="display:flex; align-items:center; gap:14px;">
+      <span style="font-size:11px; color:#9fb0c8; background:#1b2a44; padding:4px 10px; border-radius:6px;"><i class="ti ti-calendar" style="font-size:13px; vertical-align:-2px; margin-right:5px;" aria-hidden="true"></i>19 Jun 2026</span>
+      <span style="position:relative; color:#cdd7e6; font-size:15px;"><i class="ti ti-bell" aria-hidden="true"></i><span style="position:absolute; top:-6px; right:-8px; background:#e24b4a; color:#fff; font-size:9px; min-width:14px; height:14px; line-height:14px; text-align:center; border-radius:7px; padding:0 3px;">4</span></span>
+      <i class="ti ti-settings" style="color:#cdd7e6; font-size:15px;" aria-hidden="true"></i>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <div style="text-align:right; line-height:1.2;"><div style="font-size:11px; color:#fff;">Administrador</div><div style="font-size:9px; color:#f5a623;">Admin</div></div>
+        <div style="width:26px; height:26px; border-radius:50%; background:#f5a623; color:#633806; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:500;">A</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="display: flex; min-height: 560px;">
+
+    <div style="flex: 0 0 152px; background:#0f1b30; padding: 14px 10px; display:flex; flex-direction:column;">
+      <div style="display:flex; align-items:center; gap:8px; padding: 0 4px 14px; border-bottom:0.5px solid #22324c; margin-bottom:12px;">
+        <i class="ti ti-hexagon" style="color:#f5a623; font-size:20px;" aria-hidden="true"></i>
+        <div style="line-height:1.1;"><div style="color:#fff; font-size:14px; font-weight:500; letter-spacing:.5px;">FERRE<span style="color:#f5a623;">PRO</span></div><div style="color:#6b7d96; font-size:7px; letter-spacing:1px;">SISTEMA DE INVENTARIO</div></div>
+      </div>
+      <nav style="display:flex; flex-direction:column; gap:1px; font-size:11px;">
+        <a style="display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:7px; color:#b9c4d4; text-decoration:none;"><i class="ti ti-layout-dashboard" style="font-size:15px;" aria-hidden="true"></i>Dashboard</a>
+        <a style="display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:7px; color:#b9c4d4; text-decoration:none;"><i class="ti ti-box" style="font-size:15px;" aria-hidden="true"></i>Productos</a>
+        <a style="display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:7px; color:#b9c4d4; text-decoration:none;"><i class="ti ti-truck" style="font-size:15px;" aria-hidden="true"></i>Proveedores</a>
+        <a style="display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:7px; color:#b9c4d4; text-decoration:none;"><i class="ti ti-shopping-cart" style="font-size:15px;" aria-hidden="true"></i>Compras</a>
+        <a style="display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:7px; color:#b9c4d4; text-decoration:none;"><i class="ti ti-tag" style="font-size:15px;" aria-hidden="true"></i>Ventas</a>
+        <a style="display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:7px; background:#f5a623; color:#3a2a07; font-weight:500; text-decoration:none;"><i class="ti ti-arrows-exchange" style="font-size:15px;" aria-hidden="true"></i>Movimientos</a>
+        <a style="display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:7px; color:#b9c4d4; text-decoration:none;"><i class="ti ti-cash" style="font-size:15px;" aria-hidden="true"></i>Caja</a>
+        <a style="display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:7px; color:#b9c4d4; text-decoration:none;"><i class="ti ti-chart-bar" style="font-size:15px;" aria-hidden="true"></i>Reportes</a>
+        <a style="display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:7px; color:#b9c4d4; text-decoration:none;"><i class="ti ti-users" style="font-size:15px;" aria-hidden="true"></i>Usuarios</a>
+        <a style="display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:7px; color:#b9c4d4; text-decoration:none;"><i class="ti ti-settings" style="font-size:15px;" aria-hidden="true"></i>Configuración</a>
+      </nav>
+      <div style="margin-top:auto; padding-top:14px;">
+        <a style="display:flex; align-items:center; justify-content:center; gap:6px; padding:9px; border-radius:8px; background:#f5a623; color:#3a2a07; font-size:11px; font-weight:500; text-decoration:none;"><i class="ti ti-plus" style="font-size:14px;" aria-hidden="true"></i>Nueva Requisición</a>
+        <div style="border-top:0.5px solid #22324c; margin:12px 0 8px;"></div>
+        <a style="display:flex; align-items:center; gap:9px; padding:6px 10px; color:#9fb0c8; font-size:11px; text-decoration:none;"><i class="ti ti-headset" style="font-size:14px;" aria-hidden="true"></i>Soporte</a>
+        <a style="display:flex; align-items:center; gap:9px; padding:6px 10px; color:#9fb0c8; font-size:11px; text-decoration:none;"><i class="ti ti-logout" style="font-size:14px;" aria-hidden="true"></i>Cerrar Sesión</a>
+      </div>
+    </div>
+
+    <div style="flex:1; padding: 16px 18px; min-width:0;">
+      <div style="display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:14px;">
+        <div style="display:flex; gap:10px; align-items:center;">
+          <div style="width:32px; height:32px; border-radius:8px; background:#e6f1fb; color:#185fa5; display:flex; align-items:center; justify-content:center;"><i class="ti ti-arrows-exchange" style="font-size:18px;" aria-hidden="true"></i></div>
+          <div style="font-size:16px; font-weight:500; color:#1a2332;">Movimientos de Inventario</div>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button style="display:flex; align-items:center; gap:6px; background:#1d9e75; color:#fff; border:none; padding:8px 13px; border-radius:8px; font-size:12px; font-weight:500; cursor:pointer;"><i class="ti ti-package-import" style="font-size:14px;" aria-hidden="true"></i>Nueva Entrada</button>
+          <button style="display:flex; align-items:center; gap:6px; background:#e24b4a; color:#fff; border:none; padding:8px 13px; border-radius:8px; font-size:12px; font-weight:500; cursor:pointer;"><i class="ti ti-package-export" style="font-size:14px;" aria-hidden="true"></i>Nueva Salida</button>
+          <button style="display:flex; align-items:center; gap:6px; background:#1b3a6b; color:#fff; border:none; padding:8px 13px; border-radius:8px; font-size:12px; font-weight:500; cursor:pointer;"><i class="ti ti-refresh" style="font-size:14px;" aria-hidden="true"></i>Actualizar</button>
+        </div>
+      </div>
+
+      <div style="display:flex; align-items:center; gap:14px; margin-bottom:12px;">
+        <span style="font-size:11px; color:#64748b;">Filtrar por tipo:</span>
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; background:#fff; border:0.5px solid #d4dae3; border-radius:8px; padding:7px 12px; min-width:170px; font-size:11px; color:#1a2332;">TODOS <i class="ti ti-chevron-down" style="font-size:14px; color:#94a3b8;" aria-hidden="true"></i></div>
+        <label style="display:flex; align-items:center; gap:7px; font-size:11px; color:#1a2332; cursor:pointer;"><span style="width:16px; height:16px; border-radius:4px; background:#1b3a6b; color:#fff; display:inline-flex; align-items:center; justify-content:center;"><i class="ti ti-check" style="font-size:11px;" aria-hidden="true"></i></span><i class="ti ti-file-invoice" style="font-size:14px; color:#64748b;" aria-hidden="true"></i>Agrupar por Factura</label>
+      </div>
+
+      <div style="border-radius:12px; border:0.5px solid #e6eaf0; background:#fff; overflow-x:auto;">
+        <table style="border-collapse:collapse; width:100%; min-width:840px; font-size:11px; table-layout:fixed;">
+          <thead>
+            <tr style="background:#0f1b30; color:#cdd7e6;">
+              <th style="text-align:left; padding:9px 8px; width:54px;">ID</th>
+              <th style="text-align:left; padding:9px 8px; width:104px;">Fecha</th>
+              <th style="text-align:left; padding:9px 8px; width:80px;">Tipo</th>
+              <th style="text-align:left; padding:9px 8px; width:84px;">Producto</th>
+              <th style="text-align:left; padding:9px 8px; width:84px;">Proveedor</th>
+              <th style="text-align:left; padding:9px 8px; width:64px;">Cantidad</th>
+              <th style="text-align:left; padding:9px 8px; width:72px;">Precio Unit.</th>
+              <th style="text-align:right; padding:9px 8px; width:80px;">Total</th>
+              <th style="text-align:left; padding:9px 8px; width:90px;">Usuario</th>
+            </tr>
+          </thead>
+          <tbody id="movBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:flex; align-items:center; justify-content:space-between; background:#eef1f6; padding:6px 14px; border-top:0.5px solid #e0e5ec;">
+    <span style="font-size:10px; color:#1d9e75;"><i class="ti ti-circle-check" style="font-size:12px; vertical-align:-2px; margin-right:4px;" aria-hidden="true"></i>Servidor local y sincronización con Supabase activos</span>
+    <span style="font-size:10px; color:#94a3b8;">19/06/2026 17:33:16</span>
+  </div>
+</div>
+<script>
+const mov = [
+  ["2025-12-19 12:56","2 producto(s)","$17,000","Administrador",true],
+  ["2026-06-16 13:51","1 producto(s)","$350","Administrador",false],
+  ["2026-06-16 13:43","1 producto(s)","$350","Administrador",false],
+  ["2026-06-16 13:36","1 producto(s)","$350","Administrador",false],
+  ["2026-05-01 13:15","4 producto(s)","$107,250","Administrador",false],
+  ["2026-05-01 13:13","2 producto(s)","$27,500","Empleado",false],
+  ["2026-05-01 12:57","1 producto(s)","$120,000","Administrador",false],
+  ["2026-05-01 12:52","1 producto(s)","$17,500","Administrador",false],
+  ["2026-04-30 14:32","1 producto(s)","$20,000","Administrador",false],
+  ["2026-04-30 13:56","1 producto(s)","$60,000","Administrador",false],
+  ["2026-04-30 01:05","2 producto(s)","$34,500","Administrador",false],
+  ["2026-04-23 20:04","1 producto(s)","$12,000","Administrador",false],
+  ["2026-04-23 20:04","1 producto(s)","$17,000","Administrador",false],
+  ["2026-04-23 20:02","1 producto(s)","$17,000","Administrador",false],
+  ["2026-04-23 19:57","1 producto(s)","$20,000","Administrador",false],
+  ["2026-04-23 19:56","1 producto(s)","$17,000","Administrador",false],
+  ["2026-04-23 19:51","1 producto(s)","$7,000","Administrador",false],
+  ["2026-04-23 19:45","1 producto(s)","$20,000","Administrador",false],
+  ["2026-04-23 19:30","3 producto(s)","$49,000","Administrador",false],
+  ["2026-04-20 14:44","1 producto(s)","$20,000","Administrador",false]
+];
+const dash = '<span style="color:#cbd5e1;">---</span>';
+document.getElementById('movBody').innerHTML = mov.map((m,i)=>{
+  const bg = m[4] ? '#eafaf2' : (i%2 ? '#fafbfc' : '#ffffff');
+  return `<tr style="background:${bg}; border-top:0.5px solid #eef1f6; color:#334155;">
+    <td style="padding:8px;"><span style="color:#94a3b8;"><i class="ti ti-chevron-right" style="font-size:13px; vertical-align:-2px;" aria-hidden="true"></i> ...</span></td>
+    <td style="padding:8px;">${m[0]}</td>
+    <td style="padding:8px; color:#64748b;">${m[1]}</td>
+    <td style="padding:8px;">${dash}</td>
+    <td style="padding:8px;">${dash}</td>
+    <td style="padding:8px;">${dash}</td>
+    <td style="padding:8px;">${dash}</td>
+    <td style="padding:8px; text-align:right; font-weight:500; color:#1a2332; font-variant-numeric:tabular-nums;">${m[2]}</td>
+    <td style="padding:8px;">${m[3]}</td>
+  </tr>`;
+}).join('');
+</script>

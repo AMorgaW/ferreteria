@@ -1,4 +1,4 @@
-"""
+﻿"""
 PUNTO DE VENTA MODERNO - PySide6
 Interfaz rediseñada completamente con estilo e-commerce
 """
@@ -9,12 +9,13 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QGroupBox, QSplitter,
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool
 from PySide6.QtGui import QFont, QColor, QCursor
 from datetime import datetime
 from ui_config import COLORS, FONTS, ICONS, make_font
 from unidades_venta_manager import UnidadesVentaManager
 from ui.widgets import ShadowCard, ActionButton
+from ui.async_worker import FunctionWorker
 
 
 # ---------------------------------------------------------------------------
@@ -43,20 +44,20 @@ class ProductCard(QFrame):
         self.producto = producto
         self._on_click = on_click
 
-        self.setFixedSize(175, 230)
+        self.setFixedSize(178, 182)
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self._normal_style = f"""
             ProductCard {{
                 background: {COLORS.get('bg_primary', '#ffffff')};
-                border: 1px solid #e2e8f0;
-                border-radius: 10px;
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
             }}
         """
         self._hover_style = f"""
             ProductCard {{
-                background: #f0fdfa;
-                border: 2px solid {COLORS['primary']};
-                border-radius: 10px;
+                background: {COLORS['bg_primary']};
+                border: 1px solid {COLORS['accent']};
+                border-radius: 12px;
             }}
         """
         self.setStyleSheet(self._normal_style)
@@ -68,65 +69,81 @@ class ProductCard(QFrame):
 
     # -- UI ------------------------------------------------------------------
 
+    @staticmethod
+    def _iniciales(nombre):
+        tokens = [t for t in (nombre or '').split() if t]
+        if not tokens:
+            return '–'
+        if len(tokens) == 1:
+            return tokens[0][:2].upper()
+        return (tokens[0][0] + tokens[1][0]).upper()
+
     def _crear_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(2)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(3)
 
         transparent = "background: transparent; border: none;"
 
-        # Icono del producto
-        icon_label = QLabel(ICONS.get('productos', '📦'))
-        icon_label.setAlignment(Qt.AlignCenter)
-        icon_label.setStyleSheet(f"font-size: 24pt; {transparent}")
-        layout.addWidget(icon_label)
+        # Cabecera flat: badge tipográfico (iniciales) + stock
+        from formato import formatear_stock
+        stock = self.producto.get('stock', 0)
+        _stock_fmt = formatear_stock(stock, self.producto.get('permite_decimales'))
+        if stock > 10:
+            stock_color = COLORS['success']
+            stock_text = f"Stock: {_stock_fmt}"
+        elif stock > 0:
+            stock_color = COLORS['warning']
+            stock_text = f"Stock: {_stock_fmt}"
+        else:
+            stock_color = COLORS['danger']
+            stock_text = "Sin stock"
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(0)
+        badge = QLabel(self._iniciales(self.producto.get('nombre')))
+        badge.setFixedSize(38, 38)
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setStyleSheet(
+            f"background: {COLORS['primary']}; color: white; border-radius: 10px;"
+            f" font-size: 11pt; font-weight: 500;"
+        )
+        top.addWidget(badge)
+        top.addStretch()
+        stock_label = QLabel(stock_text)
+        stock_label.setStyleSheet(f"font-size: 8pt; font-weight: 500; color: {stock_color}; {transparent}")
+        top.addWidget(stock_label, 0, Qt.AlignVCenter)
+        layout.addLayout(top)
 
         # Nombre
-        nombre = (self.producto.get('nombre') or 'Sin nombre')[:25]
+        nombre = (self.producto.get('nombre') or 'Sin nombre')[:30]
         nombre_label = QLabel(nombre)
-        nombre_label.setAlignment(Qt.AlignCenter)
         nombre_label.setWordWrap(True)
         nombre_label.setStyleSheet(
-            f"font-size: 9pt; color: {COLORS['text_primary']}; {transparent}"
+            f"font-size: 10pt; font-weight: 500; color: {COLORS['text_primary']}; {transparent}"
         )
-        nombre_label.setMaximumHeight(36)
+        nombre_label.setMaximumHeight(34)
         layout.addWidget(nombre_label)
 
         # Marca
         marca = (self.producto.get('marca') or '').strip()
         if marca:
             marca_label = QLabel(marca[:25])
-            marca_label.setAlignment(Qt.AlignCenter)
             marca_label.setStyleSheet(
                 f"font-size: 8pt; color: {COLORS['text_secondary']}; {transparent}"
             )
             layout.addWidget(marca_label)
 
+        layout.addStretch()
+
         # Precio
         precio = self.producto.get('precio_venta', 0)
         precio_label = QLabel(f"${precio:,.0f}")
-        precio_label.setAlignment(Qt.AlignCenter)
         precio_label.setStyleSheet(
-            f"font-size: 11pt; font-weight: bold; color: {COLORS['primary']}; {transparent}"
+            f"font-size: 13pt; font-weight: 500; color: {COLORS['text_primary']}; {transparent}"
         )
         layout.addWidget(precio_label)
-
-        # Stock
-        stock = self.producto.get('stock', 0)
-        if stock > 10:
-            stock_color = COLORS['success']
-            stock_text = f"Stock: {stock}"
-        elif stock > 0:
-            stock_color = COLORS['warning']
-            stock_text = f"Stock: {stock}"
-        else:
-            stock_color = COLORS['danger']
-            stock_text = "Sin stock"
-
-        stock_label = QLabel(stock_text)
-        stock_label.setAlignment(Qt.AlignCenter)
-        stock_label.setStyleSheet(f"font-size: 8pt; color: {stock_color}; {transparent}")
-        layout.addWidget(stock_label)
 
         # Botón agregar
         if stock > 0:
@@ -135,15 +152,21 @@ class ProductCard(QFrame):
             btn.setStyleSheet(f"""
                 QPushButton {{
                     background: {COLORS['primary']}; color: white;
-                    border: none; border-radius: 5px;
-                    padding: 5px 0; font-size: 9pt; font-weight: bold;
+                    border: none; border-radius: 8px;
+                    padding: 7px 0; font-size: 9pt; font-weight: 500;
                 }}
-                QPushButton:hover {{ background: {COLORS['primary_dark']}; }}
+                QPushButton:hover {{ background: {COLORS['accent']}; color: {COLORS['on_accent']}; }}
             """)
             btn.clicked.connect(self._handle_click)
             layout.addWidget(btn)
-
-        layout.addStretch()
+        else:
+            sold = QLabel("Agotado")
+            sold.setAlignment(Qt.AlignCenter)
+            sold.setStyleSheet(
+                f"background: {COLORS['bg_pressed']}; color: {COLORS['text_light']};"
+                f" border-radius: 8px; padding: 7px 0; font-size: 9pt; font-weight: 500;"
+            )
+            layout.addWidget(sold)
 
     # -- Events --------------------------------------------------------------
 
@@ -221,7 +244,7 @@ class DialogoCantidadModern(QDialog):
         name_lbl.setAlignment(Qt.AlignCenter)
         name_lbl.setWordWrap(True)
         name_lbl.setStyleSheet(
-            "font-size: 11pt; font-weight: bold; color: white; background: transparent; border: none;"
+            "font-size: 11pt; font-weight: 500; color: white; background: transparent; border: none;"
         )
         header_layout.addWidget(name_lbl)
         outer.addWidget(header)
@@ -250,7 +273,7 @@ class DialogoCantidadModern(QDialog):
         check_lbl = QLabel("✓ Stock Disponible")
         check_lbl.setAlignment(Qt.AlignCenter)
         check_lbl.setStyleSheet(
-            f"font-size: 9pt; font-weight: bold; color: {COLORS['success']}; background: transparent; border: none;"
+            f"font-size: 9pt; font-weight: 500; color: {COLORS['success']}; background: transparent; border: none;"
         )
         sf_layout.addWidget(check_lbl)
 
@@ -258,7 +281,7 @@ class DialogoCantidadModern(QDialog):
         stock_val = QLabel(stock_formateado)
         stock_val.setAlignment(Qt.AlignCenter)
         stock_val.setStyleSheet(
-            f"font-size: 14pt; font-weight: bold; color: {COLORS['text_primary']}; background: transparent; border: none;"
+            f"font-size: 14pt; font-weight: 500; color: {COLORS['text_primary']}; background: transparent; border: none;"
         )
         sf_layout.addWidget(stock_val)
         content_layout.addWidget(stock_frame)
@@ -270,7 +293,7 @@ class DialogoCantidadModern(QDialog):
         if len(self.unidades_disponibles) > 1:
             unit_title = QLabel("Tipo de Venta")
             unit_title.setStyleSheet(
-                f"font-size: 10pt; font-weight: bold; color: {COLORS['text_primary']}; background: transparent; border: none;"
+                f"font-size: 10pt; font-weight: 500; color: {COLORS['text_primary']}; background: transparent; border: none;"
             )
             content_layout.addWidget(unit_title)
 
@@ -291,7 +314,7 @@ class DialogoCantidadModern(QDialog):
                 radio = QRadioButton(nombre_unidad)
                 radio.setStyleSheet("""
                     QRadioButton {
-                        font-size: 11pt; font-weight: bold;
+                        font-size: 11pt; font-weight: 500;
                         background: #E8E8E8; color: #2C3E50;
                         border: 2px solid #ccc; border-radius: 6px;
                         padding: 8px; min-height: 28px;
@@ -364,7 +387,7 @@ class DialogoCantidadModern(QDialog):
             QPushButton {{
                 background: {COLORS['success']}; color: white;
                 border: none; border-radius: 6px;
-                padding: 10px; font-size: 10pt; font-weight: bold;
+                padding: 10px; font-size: 10pt; font-weight: 500;
             }}
             QPushButton:hover {{ background: #0D9F6E; }}
         """)
@@ -403,7 +426,7 @@ class DialogoCantidadModern(QDialog):
 
         lbl = QLabel(etiqueta)
         lbl.setStyleSheet(
-            f"font-size: 10pt; font-weight: bold; color: {COLORS['text_primary']}; background: transparent; border: none;"
+            f"font-size: 10pt; font-weight: 500; color: {COLORS['text_primary']}; background: transparent; border: none;"
         )
         self.cantidad_container_layout.addWidget(lbl)
 
@@ -411,7 +434,7 @@ class DialogoCantidadModern(QDialog):
         self.entry_cantidad.setAlignment(Qt.AlignCenter)
         self.entry_cantidad.setStyleSheet(f"""
             QLineEdit {{
-                font-size: 28pt; font-weight: bold;
+                font-size: 28pt; font-weight: 500;
                 color: {COLORS['primary']}; background: #FAFAFA;
                 border: 3px solid {COLORS['primary']};
                 border-radius: 8px; padding: 10px;
@@ -490,6 +513,10 @@ class DialogoSeleccionCliente(QDialog):
         self.setModal(True)
         self.clientes_repo = clientes_repo
         self.cliente_seleccionado = None
+        self._buscar_clientes_timer = QTimer(self)
+        self._buscar_clientes_timer.setSingleShot(True)
+        self._buscar_clientes_timer.setInterval(300)
+        self._buscar_clientes_timer.timeout.connect(self._filtrar_clientes)
         self._crear_ui()
         self._cargar_clientes()
         self.search_input.setFocus()
@@ -506,7 +533,7 @@ class DialogoSeleccionCliente(QDialog):
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 0, 20, 0)
         title = QLabel("👥 Seleccionar Cliente")
-        title.setStyleSheet("font-size: 14pt; font-weight: bold; color: white; background: transparent; border: none;")
+        title.setStyleSheet("font-size: 14pt; font-weight: 500; color: white; background: transparent; border: none;")
         hl.addWidget(title)
         outer.addWidget(header)
 
@@ -527,7 +554,7 @@ class DialogoSeleccionCliente(QDialog):
             }}
             QLineEdit:focus {{ border-color: {COLORS['primary']}; }}
         """)
-        self.search_input.textChanged.connect(self._filtrar_clientes)
+        self.search_input.textChanged.connect(lambda: self._buscar_clientes_timer.start())
         bl.addWidget(self.search_input)
 
         # Table
@@ -550,7 +577,7 @@ class DialogoSeleccionCliente(QDialog):
             }}
             QHeaderView::section {{
                 background: {COLORS['table_header']}; color: white;
-                font-weight: bold; font-size: 9pt;
+                font-weight: 500; font-size: 9pt;
                 padding: 6px; border: none;
             }}
         """)
@@ -600,7 +627,7 @@ class DialogoSeleccionCliente(QDialog):
             QPushButton {{
                 background: {COLORS['primary']}; color: white;
                 border: none; border-radius: 6px;
-                padding: 10px 22px; font-size: 10pt; font-weight: bold;
+                padding: 10px 22px; font-size: 10pt; font-weight: 500;
             }}
             QPushButton:hover {{ background: {COLORS['primary_dark']}; }}
         """)
@@ -612,9 +639,12 @@ class DialogoSeleccionCliente(QDialog):
 
     def _cargar_clientes(self, criterio=None):
         try:
-            clientes = self.clientes_repo.buscar_clientes(criterio=criterio, solo_activos=True)
+            if self.clientes_repo.cache_disponible():
+                clientes = self.clientes_repo.buscar_clientes_cache(criterio=criterio, solo_activos=True, limite=120)
+            else:
+                clientes = self.clientes_repo.buscar_clientes(criterio=criterio, solo_activos=True, limite=120)
         except Exception:
-            clientes = self.clientes_repo.listar_clientes(solo_activos=True)
+            clientes = self.clientes_repo.listar_clientes(solo_activos=True, limite=120)
 
         self._clientes_list = clientes
         self.tabla.setRowCount(len(clientes))
@@ -677,6 +707,12 @@ class VentasUIModern(QWidget):
 
         self.metodo_pago = "EFECTIVO"
         self.descuento_valor = 0.0
+        self._buscar_productos_timer = QTimer(self)
+        self._buscar_productos_timer.setSingleShot(True)
+        self._buscar_productos_timer.setInterval(300)
+        self._buscar_productos_timer.timeout.connect(self._ejecutar_busqueda_productos)
+        self._thread_pool = QThreadPool.globalInstance()
+        self._productos_loading = False
 
         self._crear_ui()
         self.cargar_productos()
@@ -740,7 +776,7 @@ class VentasUIModern(QWidget):
 
         title = QLabel(f"{ICONS.get('ventas', '💰')} Punto de Venta")
         title.setStyleSheet(
-            "font-size: 18pt; font-weight: bold; color: white; background: transparent; border: none;"
+            "font-size: 18pt; font-weight: 500; color: white; background: transparent; border: none;"
         )
         left_col.addWidget(title)
 
@@ -751,7 +787,7 @@ class VentasUIModern(QWidget):
                 QPushButton {
                     background: #F59E0B; color: white; border: none;
                     border-radius: 4px; padding: 5px 15px;
-                    font-size: 9pt; font-weight: bold;
+                    font-size: 9pt; font-weight: 500;
                 }
                 QPushButton:hover { background: #D97706; }
             """)
@@ -797,7 +833,7 @@ class VentasUIModern(QWidget):
 
         search_title = QLabel(f"{ICONS.get('buscar', '🔍')} Buscar Producto")
         search_title.setStyleSheet(
-            f"font-size: 13pt; font-weight: bold; color: {COLORS['text_primary']}; background: transparent; border: none;"
+            f"font-size: 13pt; font-weight: 500; color: {COLORS['text_primary']}; background: transparent; border: none;"
         )
         sc_layout.addWidget(search_title)
 
@@ -811,7 +847,7 @@ class VentasUIModern(QWidget):
             }}
             QLineEdit:focus {{ border-color: {COLORS['primary']}; }}
         """)
-        self.search_entry.textChanged.connect(self.buscar_productos)
+        self.search_entry.textChanged.connect(lambda: self.buscar_productos())
         self.search_entry.returnPressed.connect(self.agregar_por_codigo_rapido)
         sc_layout.addWidget(self.search_entry)
 
@@ -821,7 +857,7 @@ class VentasUIModern(QWidget):
 
         cat_label = QLabel("Categoría:")
         cat_label.setStyleSheet(
-            f"font-size: 10pt; font-weight: bold; color: {COLORS['text_primary']}; background: transparent; border: none;"
+            f"font-size: 10pt; font-weight: 500; color: {COLORS['text_primary']}; background: transparent; border: none;"
         )
         filter_row.addWidget(cat_label)
 
@@ -839,8 +875,8 @@ class VentasUIModern(QWidget):
             btn_mezcla.setStyleSheet("""
                 QPushButton {
                     background: #7C3AED; color: white; border: none;
-                    border-radius: 5px; padding: 6px 14px;
-                    font-size: 10pt; font-weight: bold;
+                    border-radius: 9px; padding: 8px 16px;
+                    font-size: 10pt; font-weight: 500;
                 }
                 QPushButton:hover { background: #6D28D9; }
             """)
@@ -858,7 +894,7 @@ class VentasUIModern(QWidget):
 
         prod_title = QLabel(f"{ICONS.get('productos', '📦')} Productos Disponibles")
         prod_title.setStyleSheet(
-            f"font-size: 13pt; font-weight: bold; color: {COLORS['text_primary']}; background: transparent; border: none;"
+            f"font-size: 13pt; font-weight: 500; color: {COLORS['text_primary']}; background: transparent; border: none;"
         )
         pc_layout.addWidget(prod_title)
 
@@ -889,12 +925,12 @@ class VentasUIModern(QWidget):
         btn_autorizar.setCursor(QCursor(Qt.PointingHandCursor))
         btn_autorizar.setStyleSheet(f"""
             QPushButton {{
-                background: {COLORS['secondary']}; color: white;
-                border: none; padding: 10px;
-                font-size: 11pt; font-weight: bold;
-                border-top-left-radius: 10px; border-top-right-radius: 10px;
+                background: {COLORS['success']}; color: white;
+                border: none; padding: 12px;
+                font-size: 11pt; font-weight: 500;
+                border-top-left-radius: 12px; border-top-right-radius: 12px;
             }}
-            QPushButton:hover {{ background: {COLORS['secondary_dark']}; }}
+            QPushButton:hover {{ background: {COLORS['success_dark']}; }}
         """)
         btn_autorizar.clicked.connect(self.procesar_venta)
         parent_layout.addWidget(btn_autorizar)
@@ -1095,14 +1131,14 @@ class VentasUIModern(QWidget):
 
         lbl_total = QLabel("TOTAL:")
         lbl_total.setStyleSheet(
-            f"font-size: 11pt; font-weight: bold; color: {COLORS['primary_dark']}; background: transparent; border: none;"
+            f"font-size: 11pt; font-weight: 500; color: {COLORS['primary_dark']}; background: transparent; border: none;"
         )
         r4f_layout.addWidget(lbl_total)
         r4f_layout.addStretch()
 
         self.total_label = QLabel("$0")
         self.total_label.setStyleSheet(
-            f"font-size: 11pt; font-weight: bold; color: {COLORS['primary_dark']}; background: transparent; border: none;"
+            f"font-size: 11pt; font-weight: 500; color: {COLORS['primary_dark']}; background: transparent; border: none;"
         )
         r4f_layout.addWidget(self.total_label)
         tl.addWidget(r4_frame)
@@ -1120,7 +1156,10 @@ class VentasUIModern(QWidget):
 
     def cargar_productos(self):
         try:
-            productos = self.productos_repo.listar_productos(solo_activos=True)
+            if self.productos_repo.cache_disponible():
+                productos = self.productos_repo.buscar_productos_cache(limite=120)
+            else:
+                productos = self.productos_repo.listar_productos(solo_activos=True, limite=120)
             self.productos_data = productos
 
             print(f"[DEBUG MODERN] Productos cargados: {len(productos)}")
@@ -1170,10 +1209,27 @@ class VentasUIModern(QWidget):
                 self.productos_grid.addWidget(spacer, len(productos) // cols, c)
 
     def buscar_productos(self):
+        self._buscar_productos_timer.start()
+
+    def _ejecutar_busqueda_productos(self):
         busqueda = self.search_entry.text().lower()
         categoria = self.combo_categoria.currentText()
 
-        if not hasattr(self, 'productos_data'):
+        try:
+            if self.productos_repo.cache_disponible():
+                self.productos_data = self.productos_repo.buscar_productos_cache(
+                    busqueda.strip(),
+                    categoria=categoria,
+                    limite=120,
+                )
+            elif busqueda.strip():
+                self.productos_data = self.productos_repo.buscar_productos(busqueda.strip(), limite=120)
+            elif categoria == "Todas":
+                self.productos_data = self.productos_repo.listar_productos(solo_activos=True, limite=120)
+            else:
+                self.productos_data = self.productos_repo.buscar_productos(categoria, limite=120)
+        except Exception as e:
+            print(f"[ERROR] Error buscando productos: {e}")
             return
 
         productos_filtrados = []
@@ -1283,7 +1339,7 @@ class VentasUIModern(QWidget):
             total_item = item['cantidad'] * item['precio_unitario']
             total_lbl = QLabel(f"${total_item:,.0f}")
             total_lbl.setStyleSheet(
-                f"font-size: 9pt; font-weight: bold; color: {COLORS['primary']}; {transparent}"
+                f"font-size: 9pt; font-weight: 500; color: {COLORS['primary']}; {transparent}"
             )
             info_row.addWidget(total_lbl)
             fl.addLayout(info_row)
@@ -1370,7 +1426,7 @@ class VentasUIModern(QWidget):
                     QPushButton {{
                         background: {COLORS['primary']}; color: white;
                         border: none; border-radius: 4px;
-                        padding: 6px; font-size: 9pt; font-weight: bold;
+                        padding: 6px; font-size: 9pt; font-weight: 500;
                     }}
                 """)
             else:
@@ -1501,6 +1557,7 @@ class VentasUIModern(QWidget):
                     'total': venta.total,
                     'subtotal': venta.subtotal,
                     'descuento': venta.descuento,
+                    'iva': getattr(venta, 'iva', 0) or 0,
                     'metodo_pago': metodo_pago,
                     'cliente_nombre': (
                         self.cliente_seleccionado.nombre
@@ -1548,7 +1605,7 @@ class VentasUIModern(QWidget):
 
         title = QLabel("✅ VENTA EXITOSA")
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(f"font-size: 16pt; font-weight: bold; color: #10b981; {transparent}")
+        title.setStyleSheet(f"font-size: 16pt; font-weight: 500; color: #10b981; {transparent}")
         cl.addWidget(title)
 
         numero = venta_data.get('numero_factura', '')
@@ -1561,7 +1618,7 @@ class VentasUIModern(QWidget):
             f"Método: {metodo}",
         ]:
             lbl = QLabel(text)
-            bold = "font-weight: bold;" if "Total" in text else ""
+            bold = "font-weight: 500;" if "Total" in text else ""
             lbl.setStyleSheet(f"font-size: 11pt; {bold} {transparent}")
             cl.addWidget(lbl)
 
@@ -1580,7 +1637,7 @@ class VentasUIModern(QWidget):
             QPushButton {
                 background: #2563eb; color: white; border: none;
                 border-radius: 5px; padding: 8px 16px;
-                font-size: 10pt; font-weight: bold;
+                font-size: 10pt; font-weight: 500;
             }
             QPushButton:hover { background: #1d4ed8; }
         """)
@@ -1692,7 +1749,7 @@ class VentasUIModern(QWidget):
         hl = QHBoxLayout(hdr)
         hl.setContentsMargins(20, 0, 20, 0)
         t = QLabel("💳 Ventas a Crédito Pendientes")
-        t.setStyleSheet(f"font-size: 16pt; font-weight: bold; color: white; {transparent}")
+        t.setStyleSheet(f"font-size: 16pt; font-weight: 500; color: white; {transparent}")
         hl.addWidget(t)
         lay.addWidget(hdr)
 
@@ -1711,7 +1768,7 @@ class VentasUIModern(QWidget):
             (f"Facturas: {len(ventas)}", COLORS['text_primary']),
         ]:
             l = QLabel(txt)
-            weight = "font-weight: bold;" if "Cobrar" in txt else ""
+            weight = "font-weight: 500;" if "Cobrar" in txt else ""
             l.setStyleSheet(f"font-size: 12pt; {weight} color: {color}; {transparent}")
             tbl.addWidget(l)
 
@@ -1799,7 +1856,7 @@ class VentasUIModern(QWidget):
             QPushButton {
                 background: #059669; color: white; border: none;
                 border-radius: 5px; padding: 10px 20px;
-                font-size: 10pt; font-weight: bold;
+                font-size: 10pt; font-weight: 500;
             }
             QPushButton:hover { background: #047857; }
         """)
@@ -1857,7 +1914,7 @@ class VentasUIModern(QWidget):
 
             saldo_label = QLabel(f"Saldo Pendiente: ${saldo_actual[0]:,.0f}")
             saldo_label.setStyleSheet(
-                f"font-size: 12pt; font-weight: bold; color: #DC2626; {transparent}"
+                f"font-size: 12pt; font-weight: 500; color: #DC2626; {transparent}"
             )
             ig_lay.addWidget(saldo_label)
             lay.addWidget(info_grp)
@@ -1952,7 +2009,7 @@ class VentasUIModern(QWidget):
                 QPushButton {
                     background: #059669; color: white; border: none;
                     border-radius: 5px; padding: 10px 20px;
-                    font-size: 10pt; font-weight: bold;
+                    font-size: 10pt; font-weight: 500;
                 }
                 QPushButton:hover { background: #047857; }
             """)
@@ -2007,7 +2064,7 @@ class VentasUIModern(QWidget):
         hl = QHBoxLayout(hdr)
         hl.setContentsMargins(20, 0, 20, 0)
         t = QLabel("💳 Venta a Crédito")
-        t.setStyleSheet(f"font-size: 15pt; font-weight: bold; color: white; {transparent}")
+        t.setStyleSheet(f"font-size: 15pt; font-weight: 500; color: white; {transparent}")
         hl.addWidget(t)
         lay.addWidget(hdr)
 
@@ -2169,7 +2226,7 @@ class VentasUIModern(QWidget):
             QPushButton {{
                 background: {COLORS['success']}; color: white; border: none;
                 border-radius: 5px; padding: 11px 28px;
-                font-size: 10pt; font-weight: bold;
+                font-size: 10pt; font-weight: 500;
             }}
             QPushButton:hover {{ background: {COLORS['success_dark']}; }}
         """)
@@ -2245,6 +2302,8 @@ class VentasUIModern(QWidget):
 
         lay.addWidget(btn_w)
 
+        from ui.widgets import hacer_dialogo_responsivo
+        hacer_dialogo_responsivo(dlg, 560, 560)
         dlg.exec()
         return resultado['cliente_id']
 
@@ -2291,7 +2350,7 @@ class VentasUIModern(QWidget):
         hl = QVBoxLayout(hdr)
         hl.setContentsMargins(20, 15, 20, 15)
         t = QLabel("⚠️ Cliente con Facturas Pendientes")
-        t.setStyleSheet(f"font-size: 14pt; font-weight: bold; color: white; {transparent}")
+        t.setStyleSheet(f"font-size: 14pt; font-weight: 500; color: white; {transparent}")
         hl.addWidget(t)
         st = QLabel("El cliente tiene facturas de crédito sin pagar completamente")
         st.setStyleSheet(f"font-size: 10pt; color: white; {transparent}")
@@ -2308,7 +2367,7 @@ class VentasUIModern(QWidget):
         q_lbl = QLabel(
             "¿Desea agregar los productos a una factura existente o crear una nueva?"
         )
-        q_lbl.setStyleSheet(f"font-size: 10pt; font-weight: bold; {transparent}")
+        q_lbl.setStyleSheet(f"font-size: 10pt; font-weight: 500; {transparent}")
         q_lbl.setWordWrap(True)
         cl.addWidget(q_lbl)
 
@@ -2379,7 +2438,7 @@ class VentasUIModern(QWidget):
             QPushButton {
                 background: #059669; color: white; border: none;
                 border-radius: 5px; padding: 12px 20px;
-                font-size: 10pt; font-weight: bold;
+                font-size: 10pt; font-weight: 500;
             }
             QPushButton:hover { background: #047857; }
         """)
@@ -2401,6 +2460,8 @@ class VentasUIModern(QWidget):
         bwl.addWidget(btn_new)
 
         lay.addWidget(btn_w)
+        from ui.widgets import hacer_dialogo_responsivo
+        hacer_dialogo_responsivo(dlg, 700, 500)
         dlg.exec()
         return resultado['factura_id']
 

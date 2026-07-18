@@ -1,0 +1,76 @@
+<h2 class="sr-only">Rediseño de la ventana Reporte de Ventas por Período de FerrePro.</h2>
+<div style="font-family: var(--font-sans); border-radius: var(--border-radius-lg); overflow: hidden; border: 0.5px solid var(--color-border-secondary); background: #f5f7fa;">
+
+  <div style="display:flex; align-items:center; justify-content:space-between; background:#e9edf2; padding:7px 12px;">
+    <span style="font-size:11px; color:#475569;"><i class="ti ti-chart-bar" style="font-size:14px; vertical-align:-2px; margin-right:6px; color:#185fa5;" aria-hidden="true"></i>Reporte de Ventas por Período</span>
+    <i class="ti ti-x" style="font-size:15px; color:#64748b;" aria-hidden="true"></i>
+  </div>
+
+  <div style="background:#0f1b30; padding:12px 14px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:11px;">
+      <div style="font-size:14px; font-weight:500; color:#fff;"><i class="ti ti-chart-bar" style="font-size:16px; vertical-align:-2px; margin-right:7px; color:#f5a623;" aria-hidden="true"></i>Reporte de Ventas por Período</div>
+      <div style="display:flex; gap:8px;">
+        <button style="display:flex; align-items:center; gap:6px; background:#fff; color:#1a2332; border:none; padding:7px 12px; border-radius:8px; font-size:11px; font-weight:500; cursor:pointer;"><i class="ti ti-upload" style="font-size:14px;" aria-hidden="true"></i>Exportar</button>
+        <button style="display:flex; align-items:center; gap:6px; background:#fff; color:#1a2332; border:none; padding:7px 12px; border-radius:8px; font-size:11px; font-weight:500; cursor:pointer;"><i class="ti ti-printer" style="font-size:14px;" aria-hidden="true"></i>Imprimir</button>
+      </div>
+    </div>
+    <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+      <span style="font-size:11px; color:#cdd7e6;">Desde:</span>
+      <div style="display:flex; align-items:center; gap:8px; background:#fff; border-radius:7px; padding:6px 10px; font-size:11px; color:#1a2332;">2026-05-21 <i class="ti ti-chevron-down" style="font-size:13px; color:#94a3b8;" aria-hidden="true"></i></div>
+      <span style="font-size:11px; color:#cdd7e6;">Hasta:</span>
+      <div style="display:flex; align-items:center; gap:8px; background:#fff; border-radius:7px; padding:6px 10px; font-size:11px; color:#1a2332;">2026-06-20 <i class="ti ti-chevron-down" style="font-size:13px; color:#94a3b8;" aria-hidden="true"></i></div>
+      <button style="display:flex; align-items:center; gap:6px; background:#1d9e75; color:#fff; border:none; padding:7px 14px; border-radius:8px; font-size:11px; font-weight:500; cursor:pointer;"><i class="ti ti-search" style="font-size:14px;" aria-hidden="true"></i>Generar Reporte</button>
+    </div>
+  </div>
+
+  <div style="padding:14px;">
+    <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:12px;">
+      <div style="border-radius:10px; overflow:hidden; border:0.5px solid #e6eaf0; background:#fff;"><div style="height:3px; background:#378add;"></div><div style="padding:10px 12px;"><div style="font-size:10px; color:#64748b;"><i class="ti ti-coin" style="color:#378add; font-size:13px; vertical-align:-2px; margin-right:4px;" aria-hidden="true"></i>Total Vendido</div><div style="font-size:16px; font-weight:500; color:#0f6e56; margin-top:4px; font-variant-numeric:tabular-nums;">$ 1,050.00</div></div></div>
+      <div style="border-radius:10px; overflow:hidden; border:0.5px solid #e6eaf0; background:#fff;"><div style="height:3px; background:#534ab7;"></div><div style="padding:10px 12px;"><div style="font-size:10px; color:#64748b;"><i class="ti ti-receipt-tax" style="color:#534ab7; font-size:13px; vertical-align:-2px; margin-right:4px;" aria-hidden="true"></i>Total Impuestos</div><div style="font-size:16px; font-weight:500; color:#1a2332; margin-top:4px; font-variant-numeric:tabular-nums;">$ 0.00</div></div></div>
+      <div style="border-radius:10px; overflow:hidden; border:0.5px solid #e6eaf0; background:#fff;"><div style="height:3px; background:#1d9e75;"></div><div style="padding:10px 12px;"><div style="font-size:10px; color:#64748b;"><i class="ti ti-file-invoice" style="color:#1d9e75; font-size:13px; vertical-align:-2px; margin-right:4px;" aria-hidden="true"></i>N° de Facturas</div><div style="font-size:16px; font-weight:500; color:#1a2332; margin-top:4px;">3</div></div></div>
+      <div style="border-radius:10px; overflow:hidden; border:0.5px solid #e6eaf0; background:#fff;"><div style="height:3px; background:#f5a623;"></div><div style="padding:10px 12px;"><div style="font-size:10px; color:#64748b;"><i class="ti ti-chart-bar" style="color:#b07a12; font-size:13px; vertical-align:-2px; margin-right:4px;" aria-hidden="true"></i>Venta Promedio</div><div style="font-size:16px; font-weight:500; color:#1a2332; margin-top:4px; font-variant-numeric:tabular-nums;">$ 350.00</div></div></div>
+    </div>
+
+    <div style="font-size:11px; color:#64748b; margin-bottom:8px;">Mostrando 3 ventas · Período: 2026-05-21 → 2026-06-20</div>
+
+    <div style="border-radius:12px; border:0.5px solid #e6eaf0; background:#fff; overflow-x:auto;">
+      <table style="border-collapse:collapse; width:100%; min-width:700px; font-size:11px; table-layout:fixed;">
+        <thead><tr style="background:#0f1b30; color:#cdd7e6;">
+          <th style="text-align:left; padding:10px 10px; width:44px;">ID</th>
+          <th style="text-align:left; padding:10px 10px; width:112px;">N° Factura</th>
+          <th style="text-align:left; padding:10px 10px; width:120px;">Fecha</th>
+          <th style="text-align:left; padding:10px 10px; width:110px;">Cliente</th>
+          <th style="text-align:right; padding:10px 10px; width:80px;">Total</th>
+          <th style="text-align:left; padding:10px 10px; width:100px;">Método de Pago</th>
+          <th style="text-align:center; padding:10px 10px; width:110px;">Estado</th>
+        </tr></thead>
+        <tbody id="vpBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div style="display:flex; align-items:center; justify-content:space-between; background:#eef1f6; padding:9px 14px; border-top:0.5px solid #e0e5ec;">
+    <div style="display:flex; gap:9px;">
+      <button style="display:flex; align-items:center; gap:6px; background:#2f6fb0; color:#fff; border:none; padding:8px 14px; border-radius:8px; font-size:11px; font-weight:500; cursor:pointer;"><i class="ti ti-eye" style="font-size:14px;" aria-hidden="true"></i>Ver Detalle</button>
+      <button style="display:flex; align-items:center; gap:6px; background:#fff; color:#1a2332; border:0.5px solid #d4dae3; padding:8px 14px; border-radius:8px; font-size:11px; font-weight:500; cursor:pointer;"><i class="ti ti-printer" style="font-size:14px;" aria-hidden="true"></i>Imprimir Factura</button>
+    </div>
+    <span style="font-size:11px; color:#94a3b8; font-style:italic;">Seleccione una venta de la tabla</span>
+  </div>
+</div>
+<script>
+const vp = [
+  ["55","20260616-0003","2026-06-16 13:51","Público General","$ 350.00","EFECTIVO"],
+  ["54","20260616-0002","2026-06-16 13:43","Público General","$ 350.00","EFECTIVO"],
+  ["53","20260616-0001","2026-06-16 13:36","Público General","$ 350.00","EFECTIVO"]
+];
+document.getElementById('vpBody').innerHTML = vp.map((r,i)=>`
+  <tr style="background:${i%2?'#fafbfc':'#fff'}; border-top:0.5px solid #eef1f6; color:#334155;">
+    <td style="padding:10px;">${r[0]}</td>
+    <td style="padding:10px; color:#1a2332; font-weight:500;">${r[1]}</td>
+    <td style="padding:10px;">${r[2]}</td>
+    <td style="padding:10px;">${r[3]}</td>
+    <td style="padding:10px; text-align:right; font-variant-numeric:tabular-nums;">${r[4]}</td>
+    <td style="padding:10px; color:#64748b;">${r[5]}</td>
+    <td style="padding:10px; text-align:center;"><span style="background:#eaf3de; color:#3b6d11; padding:2px 9px; border-radius:9px; font-size:10px; font-weight:500;">COMPLETADA</span></td>
+  </tr>`).join('');
+</script>

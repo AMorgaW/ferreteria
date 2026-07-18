@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Interfaz de Usuario para Gestión de Alertas (PySide6)
 """
@@ -46,12 +46,13 @@ class AlertasUI(QWidget):
         header.addStretch()
 
         # Botones
-        btn_marcar = QPushButton("[OK] Marcar Todas como Leídas")
+        btn_marcar = QPushButton("✓  Marcar Todas como Leídas")
         btn_marcar.setFont(make_font(FONTS['body']))
         btn_marcar.setCursor(Qt.PointingHandCursor)
+        btn_marcar.setMinimumHeight(38)
         btn_marcar.setStyleSheet(
             f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
+            f"border-radius: 9px; padding: 9px 16px; font-weight: 500; }}"
             f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
         )
         btn_marcar.clicked.connect(self.marcar_todas_leidas)
@@ -142,12 +143,12 @@ class AlertasUI(QWidget):
         total = len(alertas)
         no_leidas = len([a for a in alertas if not a.leida])
         self.contador_label.setText(
-            f"[REPORTE] Total: {total} alertas | [ALERTA] Sin leer: {no_leidas}"
+            f"Total: {total} alertas    ·    Sin leer: {no_leidas}"
         )
 
         # Mostrar alertas
         if not alertas:
-            lbl = QLabel("[OK] No hay alertas")
+            lbl = QLabel("✓  No hay alertas")
             lbl.setFont(make_font(FONTS['heading']))
             lbl.setStyleSheet(f"color: {COLORS['text_light']}; background: transparent;")
             lbl.setAlignment(Qt.AlignCenter)
@@ -219,12 +220,12 @@ class AlertasUI(QWidget):
         acciones_layout = QHBoxLayout()
 
         if not alerta.leida:
-            btn_leida = QPushButton("[OK] Marcar como leída")
+            btn_leida = QPushButton("✓  Marcar como leída")
             btn_leida.setFont(make_font(FONTS['small']))
             btn_leida.setCursor(Qt.PointingHandCursor)
             btn_leida.setStyleSheet(
                 f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-                f"border-radius: 4px; padding: 3px 10px; }}"
+                f"border-radius: 7px; padding: 4px 12px; font-weight: 500; }}"
                 f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
             )
             btn_leida.clicked.connect(lambda checked, aid=alerta.id: self.marcar_leida(aid))

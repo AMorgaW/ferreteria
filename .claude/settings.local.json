@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(python:*)",
-      "Bash(sqlite3:*)"
+      "Bash(sqlite3:*)",
+      "Bash(where iscc *)",
+      "Bash(pip show *)",
+      "Bash(findstr /B \"Name Version\")"
     ]
   }
 }

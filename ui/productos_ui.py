@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Interfaz de usuario para gestión de productos (PySide6)
 Con autocompletado, búsqueda de proveedores y distinción entre unidad base y presentación
@@ -7,13 +7,15 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QCheckBox,
     QGroupBox, QGridLayout, QDialog, QMessageBox, QMenu, QFrame,
-    QAbstractItemView, QSizePolicy
+    QAbstractItemView, QSizePolicy, QFileDialog, QScrollArea, QApplication
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool
 from PySide6.QtGui import QFont, QColor, QCursor
 
 from models import Producto
 from ui_config import COLORS, FONTS, make_font
+from formato import formatear_stock
+from ui.async_worker import FunctionWorker
 
 
 class ProductosUI(QWidget):
@@ -42,6 +44,12 @@ class ProductosUI(QWidget):
         ]
         self.marcas_existentes = []
         self.proveedores_lista = []
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(350)
+        self._search_timer.timeout.connect(self.cargar_productos)
+        self._thread_pool = QThreadPool.globalInstance()
+        self._load_seq = 0
 
         self.cargar_datos_autocompletado()
         self.crear_ui()
@@ -50,7 +58,7 @@ class ProductosUI(QWidget):
     def cargar_datos_autocompletado(self):
         """Carga datos para autocompletado"""
         try:
-            productos = self.productos_repo.buscar_productos('')
+            productos = self.productos_repo.buscar_productos('', limite=1000)
 
             self.marcas_existentes = sorted(list(set(
                 p['marca'] for p in productos if p.get('marca')
@@ -107,15 +115,28 @@ class ProductosUI(QWidget):
         btn_nuevo.setMinimumWidth(180)
         btn_nuevo.setStyleSheet(f"""
             QPushButton {{
-                background: {COLORS['primary']}; color: #ffffff;
-                border: none; border-radius: 8px;
+                background: {COLORS['accent']}; color: {COLORS['on_accent']};
+                border: none; border-radius: 9px;
                 padding: 10px 20px; font-size: 11pt;
-                font-weight: bold; font-family: 'Segoe UI';
+                font-weight: 500; font-family: 'Segoe UI';
             }}
-            QPushButton:hover {{ background: {COLORS['primary_dark']}; }}
+            QPushButton:hover {{ background: {COLORS['accent_hover']}; }}
+            QPushButton:pressed {{ background: {COLORS['accent_dark']}; }}
         """)
         btn_nuevo.clicked.connect(self.crear_producto)
         header.addWidget(btn_nuevo)
+
+        btn_exportar = QPushButton("  📤  Exportar")
+        btn_exportar.setCursor(QCursor(Qt.PointingHandCursor))
+        btn_exportar.setMinimumHeight(42)
+        btn_exportar.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['bg_primary']}; color: {COLORS['text_body']}; "
+            f"border: 1px solid {COLORS['border_input']}; border-radius: 9px; "
+            f"padding: 10px 18px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['bg_hover']}; border-color: {COLORS['primary_border']}; }}"
+        )
+        btn_exportar.clicked.connect(self.exportar_inventario)
+        header.addWidget(btn_exportar)
 
         layout.addLayout(header)
 
@@ -126,7 +147,7 @@ class ProductosUI(QWidget):
         self.search_entry.setPlaceholderText("\U0001f50d  Buscar producto...")
         self.search_entry.setFont(make_font(FONTS['body']))
         self.search_entry.setMinimumHeight(38)
-        self.search_entry.textChanged.connect(lambda: self.cargar_productos())
+        self.search_entry.textChanged.connect(lambda: self._search_timer.start())
         search_bar.addWidget(self.search_entry, 1)
 
         btn_filtros = QPushButton("\u2630  FILTROS")
@@ -162,23 +183,23 @@ class ProductosUI(QWidget):
         self.table.setStyleSheet(f"""
             QTableWidget {{
                 background: white;
-                border: 1px solid #e2e8f0;
-                border-radius: 6px;
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
                 gridline-color: transparent;
             }}
             QTableWidget::item {{
-                padding: 6px 8px;
+                padding: 7px 8px;
             }}
             QTableWidget::item:selected {{
-                background: #e0f2fe;
+                background: {COLORS['table_selection']};
                 color: {COLORS['text_primary']};
             }}
             QHeaderView::section {{
                 background: {COLORS['table_header']};
-                color: white;
-                font-weight: bold;
+                color: {COLORS['table_header_fg']};
+                font-weight: 500;
                 font-size: 9pt;
-                padding: 8px 4px;
+                padding: 10px 8px;
                 border: none;
             }}
         """)
@@ -198,35 +219,79 @@ class ProductosUI(QWidget):
 
         try:
             termino = self.search_entry.text().strip()
-            productos = self.productos_repo.buscar_productos(termino)
+            if self.productos_repo.cache_disponible():
+                productos = self.productos_repo.buscar_productos_cache(termino, limite=250)
+                self._renderizar_productos(productos)
+                return
 
+            self._load_seq += 1
+            seq = self._load_seq
+            worker = FunctionWorker(self.productos_repo.buscar_productos, termino, True, 250)
+            worker.signals.result.connect(lambda productos, s=seq: self._on_productos_cargados(productos, s))
+            worker.signals.error.connect(lambda e: QMessageBox.critical(self, "Error", f"Error cargando productos:\n{e}"))
+            self._thread_pool.start(worker)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error cargando productos:\n{str(e)}")
+
+    def _on_productos_cargados(self, productos, seq):
+        if seq != self._load_seq:
+            return
+        self._renderizar_productos(productos)
+
+    def exportar_inventario(self):
+        """Exporta el inventario completo a un archivo Excel (.xlsx)."""
+        try:
+            import exportar
+            sugerido = exportar.nombre_sugerido("inventario")
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Exportar inventario a Excel", sugerido, "Excel (*.xlsx)")
+            if not path:
+                return
+            if not path.lower().endswith(".xlsx"):
+                path += ".xlsx"
+            exportar.exportar_inventario(self.productos_repo, path)
+            QMessageBox.information(self, "Exportación exitosa",
+                                   f"Inventario exportado a:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error al exportar", str(e))
+
+    def _renderizar_productos(self, productos):
+            self.table.setRowCount(0)
             for p in productos:
                 ganancia_neta = p['precio_venta'] - p['precio_compra']
                 margen = ((ganancia_neta / p['precio_compra']) * 100) if p['precio_compra'] > 0 else 0
 
                 if p.get('viene_en_caja'):
                     unidad_base = 'Unidad'
-                    unidades_caja = p.get('unidades_por_caja', 1)
-                    presentacion = f"Caja ({unidades_caja} u/caja)" if unidades_caja > 1 else "\u2014"
                 else:
                     unidad_base = p.get('unidad_medida', 'Unidad')
                     if unidad_base:
                         unidad_base = unidad_base.capitalize()
+
+                # Mostrar el tama\u00f1o/medida real; si no hay, el empaque; si no, "\u2014"
+                tamano = (p.get('presentacion') or '').strip()
+                if tamano:
+                    presentacion = tamano
+                elif p.get('viene_en_caja') and p.get('unidades_por_caja', 1) > 1:
+                    presentacion = f"Caja ({p.get('unidades_por_caja', 1)} u/caja)"
+                else:
                     presentacion = "\u2014"
 
-                if p['stock'] <= 0:
-                    bg_color = '#fff1f2'
-                elif p['stock'] <= p['stock_minimo']:
-                    bg_color = '#fffbeb'
+                row = self.table.rowCount()
+                # Semáforo de stock: crítico (bajo el mínimo) tiñe toda la fila;
+                # el resto alterna en zebra.
+                critico = p['stock'] < p['stock_minimo']
+                if critico:
+                    bg_color = '#fef6f6'
                 else:
-                    bg_color = '#ffffff'
+                    bg_color = '#ffffff' if row % 2 == 0 else '#fafbfc'
 
                 id_formateado = f"#{p['id']}" if not str(p['id']).startswith('#') else p['id']
                 ganancia_texto = f"\u2191${ganancia_neta:,.2f}" if ganancia_neta >= 0 else f"\u2193${abs(ganancia_neta):,.2f}"
 
-                row = self.table.rowCount()
                 self.table.insertRow(row)
 
+                stock_txt = formatear_stock(p['stock'], p.get('permite_decimales'))
                 valores = [
                     id_formateado,
                     p['nombre'],
@@ -236,22 +301,66 @@ class ProductosUI(QWidget):
                     f"${p['precio_venta']:,.2f}",
                     ganancia_texto,
                     f"{margen:.1f}%",
-                    str(p['stock']),
-                    str(p['stock_minimo']),
+                    stock_txt,
+                    formatear_stock(p['stock_minimo'], p.get('permite_decimales')),
                     unidad_base,
                     presentacion
                 ]
 
+                # Alineación: montos/cantidades a la derecha; texto a la izquierda.
+                right_cols = {4, 5, 6, 7}
+                center_cols = {9}
+                fg_cols = {
+                    0: '#94a3b8',                       # ID atenuado
+                    1: COLORS['text_primary'],          # Nombre destacado
+                    6: ('#1d9e75' if ganancia_neta >= 0 else '#a32d2d'),  # Ganancia
+                    9: COLORS['text_secondary'],        # Stock mínimo
+                }
                 for col, val in enumerate(valores):
+                    if col == 8:
+                        # Pill de semáforo en la columna Stock.
+                        celda = QTableWidgetItem('')
+                        celda.setBackground(QColor(bg_color))
+                        self.table.setItem(row, col, celda)
+                        self.table.setCellWidget(
+                            row, col,
+                            self._crear_pill_stock(stock_txt, p['stock'],
+                                                   p['stock_minimo'], bg_color))
+                        continue
                     item = QTableWidgetItem(str(val))
                     item.setBackground(QColor(bg_color))
-                    item.setForeground(QColor(COLORS['text_primary']))
-                    if col != 1:
+                    item.setForeground(QColor(fg_cols.get(col, COLORS['text_body'])))
+                    if col in right_cols:
+                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    elif col in center_cols:
                         item.setTextAlignment(Qt.AlignCenter)
+                    else:
+                        item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                     self.table.setItem(row, col, item)
 
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Error cargando productos:\n{str(e)}")
+    def _crear_pill_stock(self, texto, stock, minimo, bg_fila):
+        """Crea un widget 'pill' (semáforo) para la celda de stock, centrado
+        sobre el color de la fila: rojo si bajo el mínimo, ámbar si en el
+        mínimo, verde si por encima."""
+        if stock < minimo:
+            bg, fg = '#fcebeb', '#a32d2d'
+        elif stock == minimo:
+            bg, fg = '#faeeda', '#854f0b'
+        else:
+            bg, fg = '#eaf3de', '#3b6d11'
+        cont = QWidget()
+        cont.setStyleSheet(f"background: {bg_fila};")
+        lay = QHBoxLayout(cont)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setAlignment(Qt.AlignCenter)
+        lbl = QLabel(texto)
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setMinimumWidth(34)
+        lbl.setStyleSheet(
+            f"background: {bg}; color: {fg}; border-radius: 10px;"
+            f" padding: 2px 10px; font-weight: 500;")
+        lay.addWidget(lbl)
+        return cont
 
     # ------------------------------------------------------------------
     #  CRUD helpers
@@ -279,8 +388,15 @@ class ProductosUI(QWidget):
         """Abre el formulario mejorado con autocompletado"""
         ventana = QDialog(self)
         ventana.setWindowTitle(f"{'Crear' if modo == 'crear' else 'Editar'} Producto")
-        ventana.setFixedSize(950, 800)
         ventana.setModal(True)
+        # Tamaño responsivo: nunca más grande que la pantalla; alto máx 85vh.
+        _scr = (self.screen().availableGeometry() if self.screen()
+                else QApplication.primaryScreen().availableGeometry())
+        _w = min(950, int(_scr.width() * 0.95))
+        _h = min(800, int(_scr.height() * 0.85))
+        ventana.resize(_w, _h)
+        ventana.setMaximumHeight(int(_scr.height() * 0.9))
+        ventana.move(_scr.center().x() - _w // 2, _scr.center().y() - _h // 2)
 
         main_layout = QVBoxLayout(ventana)
         main_layout.setContentsMargins(0, 0, 0, 0)
@@ -345,12 +461,43 @@ class ProductosUI(QWidget):
         marca_combo = QComboBox()
         marca_combo.setFont(make_font(FONTS['body']))
         marca_combo.setEditable(True)
+        marca_combo.setInsertPolicy(QComboBox.NoInsert)
         marca_combo.addItems(self.marcas_existentes)
+        marca_combo.setCurrentText("")  # arrancar vacío para que se vea el listado
+        # Autocompletado tipo búsqueda: al escribir muestra las marcas ya
+        # registradas que coinciden (coincidencia parcial, sin distinguir
+        # mayúsculas), igual que el bloque de proveedor.
+        from PySide6.QtWidgets import QCompleter
+        _comp_marca = QCompleter(self.marcas_existentes, marca_combo)
+        _comp_marca.setCaseSensitivity(Qt.CaseInsensitive)
+        _comp_marca.setFilterMode(Qt.MatchContains)
+        _comp_marca.setCompletionMode(QCompleter.PopupCompletion)
+        marca_combo.setCompleter(_comp_marca)
         if producto_dict and producto_dict.get('marca'):
             marca_combo.setCurrentText(producto_dict['marca'])
         info_grid.addWidget(marca_combo, 3, 1)
 
-        info_grid.addWidget(self._label("Proveedor"), 4, 0, 1, 2, Qt.AlignLeft)
+        # Tamaño / Medida (presentación) — distingue variantes del mismo artículo
+        info_grid.addWidget(self._label("Tamaño / Medida (variante)"), 4, 0, Qt.AlignLeft)
+        info_grid.addWidget(self._label("SKU / Código (auto si vacío)"), 4, 1, Qt.AlignLeft)
+
+        presentacion_size_edit = QLineEdit(
+            (producto_dict.get('presentacion') or '') if producto_dict else '')
+        presentacion_size_edit.setFont(make_font(FONTS['body']))
+        presentacion_size_edit.setPlaceholderText('Ej: 1/2", 3 pulgadas, 50 kg, 1 galón, rojo')
+        presentacion_size_edit.setToolTip(
+            "Sirve para diferenciar variantes del MISMO artículo.\n"
+            "Ej: «Tornillo» en 1/2\", 3/4\" y 1\", o «Pintura» en 1 galón y 1/4.\n"
+            "Escribe la medida, tamaño, color o presentación que distingue esta versión.")
+        info_grid.addWidget(presentacion_size_edit, 5, 0)
+
+        sku_edit = QLineEdit(
+            (producto_dict.get('codigo_barras') or '') if producto_dict else '')
+        sku_edit.setFont(make_font(FONTS['body']))
+        sku_edit.setPlaceholderText("Se genera automáticamente")
+        info_grid.addWidget(sku_edit, 5, 1)
+
+        info_grid.addWidget(self._label("Proveedor"), 6, 0, 1, 2, Qt.AlignLeft)
 
         prov_lay = QHBoxLayout()
         proveedor_combo = QComboBox()
@@ -388,7 +535,7 @@ class ProductosUI(QWidget):
             f"background: {COLORS['info']}; color: white; border: none; border-radius: 4px;"
         )
         prov_lay.addWidget(btn_buscar_prov)
-        info_grid.addLayout(prov_lay, 5, 0, 1, 2)
+        info_grid.addLayout(prov_lay, 7, 0, 1, 2)
 
         info_grid.setColumnStretch(0, 1)
         info_grid.setColumnStretch(1, 1)
@@ -529,14 +676,23 @@ class ProductosUI(QWidget):
         tooltip_lbl.setStyleSheet(f"color: {COLORS['text_secondary']};")
         inv_grid.addWidget(tooltip_lbl, 3, 0, 1, 2)
 
-        inv_grid.addWidget(self._label("Presentación (opcional)"), 4, 0, 1, 2, Qt.AlignLeft)
-        presentacion_combo = QComboBox()
-        presentacion_combo.setFont(make_font(FONTS['body']))
-        presentaciones = ['Sin empaque', 'Caja', 'Paquete', 'Blister']
-        presentacion_combo.addItems(presentaciones)
+        # ¿Viene en caja/empaque? — checkbox PROMINENTE (antes era un combo escondido).
+        viene_en_caja_check = QCheckBox("\U0001f4e6 Este producto viene en caja / empaque")
+        viene_en_caja_check.setFont(make_font(FONTS['body_bold']))
+        viene_en_caja_check.setStyleSheet(f"color: {COLORS['primary']};")
+        viene_en_caja_check.setCursor(QCursor(Qt.PointingHandCursor))
         if producto_dict and producto_dict.get('viene_en_caja'):
-            presentacion_combo.setCurrentText('Caja')
-        inv_grid.addWidget(presentacion_combo, 5, 0, 1, 2)
+            viene_en_caja_check.setChecked(True)
+        inv_grid.addWidget(viene_en_caja_check, 4, 0, 1, 2)
+
+        hint_empaque = QLabel(
+            "Marca la casilla si el producto llega empacado. Debajo indicas cuántas "
+            "cajas y cuántas unidades trae cada una, y el stock se calcula solo "
+            "(ej: 2 cajas × 12 = 24 unidades).")
+        hint_empaque.setFont(make_font(FONTS['small']))
+        hint_empaque.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        hint_empaque.setWordWrap(True)
+        inv_grid.addWidget(hint_empaque, 5, 0, 1, 2)
 
         stock_label_widget = QLabel("Stock Actual")
         stock_label_widget.setFont(make_font(FONTS['body']))
@@ -588,6 +744,11 @@ class ProductosUI(QWidget):
         unidades_por_caja_edit.setFont(make_font(FONTS['body']))
         cajas_lay.addWidget(unidades_por_caja_edit)
 
+        total_empaque_lbl = QLabel("Total: 0 unidades")
+        total_empaque_lbl.setFont(make_font(FONTS['body_bold']))
+        total_empaque_lbl.setStyleSheet("color: #047857;")
+        cajas_lay.addWidget(total_empaque_lbl)
+
         tip_media = QLabel("\U0001f4a1 Media caja se calcula automáticamente (mitad)")
         tip_media.setFont(make_font(FONTS['small']))
         tip_media.setStyleSheet(f"color: {COLORS['text_secondary']};")
@@ -637,34 +798,39 @@ class ProductosUI(QWidget):
         info_cajas_lbl.setAlignment(Qt.AlignCenter)
         cajas_lay.addWidget(info_cajas_lbl)
 
-        right_column.addWidget(cajas_group)
+        # El panel de empaque va DEBAJO del checkbox, en la columna izquierda,
+        # para que todo el flujo "viene en caja → cajas × unidades = total" quede
+        # junto y visible (antes estaba oculto en la columna derecha).
+        left_column.addWidget(cajas_group)
 
-        # Presentación toggle logic
-        def actualizar_campos_presentacion(text):
-            es_empaque = text in ('Caja', 'Paquete', 'Blister')
-            cajas_group.setVisible(es_empaque)
+        def _calcular_stock_empaque():
+            try:
+                cajas = int(num_cajas_edit.text() or 0)
+                unidades = int(unidades_por_caja_edit.text() or 1)
+                total = cajas * unidades
+                stock_edit.setText(str(total))
+                total_empaque_lbl.setText(f"Total: {total} unidades  ({cajas} × {unidades})")
+            except Exception:
+                stock_edit.setText('0')
+                total_empaque_lbl.setText("Total: 0 unidades")
+
+        num_cajas_edit.textChanged.connect(_calcular_stock_empaque)
+        unidades_por_caja_edit.textChanged.connect(_calcular_stock_empaque)
+
+        # Toggle del empaque, ahora gobernado por el checkbox (bool).
+        def actualizar_campos_presentacion(es_empaque):
+            cajas_group.setVisible(bool(es_empaque))
             if es_empaque:
-                stock_label_widget.setText("Stock (calculado)")
+                stock_label_widget.setText("Stock (calculado por empaque)")
                 stock_label_widget.setStyleSheet(f"color: {COLORS['info']};")
                 stock_edit.setReadOnly(True)
-
-                def calcular_stock():
-                    try:
-                        cajas = int(num_cajas_edit.text() or 0)
-                        unidades = int(unidades_por_caja_edit.text() or 1)
-                        stock_edit.setText(str(cajas * unidades))
-                    except Exception:
-                        stock_edit.setText('0')
-
-                num_cajas_edit.textChanged.connect(calcular_stock)
-                unidades_por_caja_edit.textChanged.connect(calcular_stock)
-
                 if producto_dict and producto_dict.get('viene_en_caja'):
                     stock_actual = producto_dict.get('stock', 0)
                     unidades_caja = producto_dict.get('unidades_por_caja', 1)
                     if unidades_caja > 0:
-                        num_cajas_edit.setText(str(stock_actual // unidades_caja))
-                    calcular_stock()
+                        num_cajas_edit.setText(str(int(stock_actual // unidades_caja)))
+                    unidades_por_caja_edit.setText(str(unidades_caja))
+                _calcular_stock_empaque()
             else:
                 stock_label_widget.setText("Stock Actual")
                 stock_label_widget.setStyleSheet(f"color: {COLORS['text_secondary']};")
@@ -702,8 +868,8 @@ class ProductosUI(QWidget):
                 cajas_group.setTitle("\U0001f4e6 Configuraci\u00f3n de Empaque")
 
         unidad_base_combo.currentTextChanged.connect(actualizar_labels_medida)
-        presentacion_combo.currentTextChanged.connect(actualizar_campos_presentacion)
-        actualizar_campos_presentacion(presentacion_combo.currentText())
+        viene_en_caja_check.toggled.connect(actualizar_campos_presentacion)
+        actualizar_campos_presentacion(viene_en_caja_check.isChecked())
         actualizar_labels_medida(unidad_base_combo.currentText())
 
         # ===== Información / Ayuda =====
@@ -738,7 +904,15 @@ class ProductosUI(QWidget):
 
         body_lay.addLayout(right_column, 1)
 
-        main_layout.addWidget(body, 1)
+        # El cuerpo hace scroll interno; header y footer quedan fijos (sticky),
+        # de modo que los botones Guardar/Cancelar siempre estén visibles.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(f"QScrollArea {{ background: {COLORS['bg_primary']}; border: none; }}")
+        scroll.setWidget(body)
+        main_layout.addWidget(scroll, 1)
 
         # ========== FOOTER ==========
         footer = QFrame()
@@ -747,31 +921,36 @@ class ProductosUI(QWidget):
         footer_lay = QHBoxLayout(footer)
         footer_lay.setAlignment(Qt.AlignCenter)
 
-        btn_guardar = QPushButton("[GUARDAR] Guardar Producto")
+        btn_guardar = QPushButton("💾  Guardar Producto")
         btn_guardar.setFont(make_font(FONTS['body_bold']))
         btn_guardar.setCursor(QCursor(Qt.PointingHandCursor))
+        btn_guardar.setMinimumHeight(44)
         btn_guardar.setStyleSheet(
-            f"background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 12px 30px;"
+            f"QPushButton {{ background: {COLORS['accent']}; color: {COLORS['on_accent']}; border: none; "
+            f"border-radius: 9px; padding: 12px 30px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['accent_hover']}; }}"
         )
         btn_guardar.clicked.connect(lambda: self.guardar_producto(
             ventana, modo, producto_dict,
             nombre_edit, categoria_combo, marca_combo,
             precio_compra_edit, precio_venta_edit,
             stock_edit, stock_min_edit,
-            unidad_base_combo, presentacion_combo,
+            unidad_base_combo, viene_en_caja_check,
             num_cajas_edit, unidades_por_caja_edit,
             permitir_venta_empaque_check,
-            permite_decimales_check
+            permite_decimales_check,
+            presentacion_size_edit, sku_edit
         ))
         footer_lay.addWidget(btn_guardar)
 
-        btn_cancelar = QPushButton("[ERROR] Cancelar")
+        btn_cancelar = QPushButton("Cancelar")
         btn_cancelar.setFont(make_font(FONTS['body']))
         btn_cancelar.setCursor(QCursor(Qt.PointingHandCursor))
+        btn_cancelar.setMinimumHeight(44)
         btn_cancelar.setStyleSheet(
-            f"background: {COLORS['secondary']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 12px 30px;"
+            f"QPushButton {{ background: {COLORS['bg_primary']}; color: {COLORS['text_body']}; "
+            f"border: 1px solid {COLORS['border_input']}; border-radius: 9px; padding: 12px 30px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['bg_hover']}; border-color: {COLORS['primary_border']}; }}"
         )
         btn_cancelar.clicked.connect(ventana.close)
         footer_lay.addWidget(btn_cancelar)
@@ -787,10 +966,11 @@ class ProductosUI(QWidget):
                          nombre_edit, categoria_combo, marca_combo,
                          precio_compra_edit, precio_venta_edit,
                          stock_edit, stock_min_edit,
-                         unidad_base_combo, presentacion_combo,
+                         unidad_base_combo, viene_en_caja_check,
                          num_cajas_edit, unidades_por_caja_edit,
                          permitir_venta_empaque_check,
-                         permite_decimales_check):
+                         permite_decimales_check,
+                         presentacion_size_edit=None, sku_edit=None):
         """Guarda el producto con la nueva lógica de unidad base y presentación"""
         try:
             nombre = nombre_edit.text().strip()
@@ -804,9 +984,14 @@ class ProductosUI(QWidget):
                 return
 
             unidad_base = unidad_base_combo.currentText()
-            presentacion = presentacion_combo.currentText()
+            permite_dec = permite_decimales_check.isChecked()
 
-            tiene_empaque = presentacion in ['Caja', 'Paquete', 'Blister']
+            def _parse_stock(texto):
+                """Respeta decimales solo si el producto los permite."""
+                texto = (texto or '').strip() or '0'
+                return float(texto) if permite_dec else int(float(texto))
+
+            tiene_empaque = viene_en_caja_check.isChecked()
 
             if tiene_empaque:
                 num_cajas = int(num_cajas_edit.text() or 0)
@@ -818,7 +1003,7 @@ class ProductosUI(QWidget):
                 viene_en_caja = True
                 vende_por_empaque = 1 if permitir_venta_empaque_check.isChecked() else 0
             else:
-                stock_total = int(stock_edit.text() or 0)
+                stock_total = _parse_stock(stock_edit.text())
                 num_cajas = 0
                 unidades_caja = 1
                 unidades_media_caja = 1
@@ -830,12 +1015,19 @@ class ProductosUI(QWidget):
             if proveedor_id == 0:
                 proveedor_id = None
 
+            # Tamaño/medida (presentación) y SKU ingresados por el usuario
+            presentacion_size = (presentacion_size_edit.text().strip()
+                                 if presentacion_size_edit else '') or None
+            sku_val = (sku_edit.text().strip() if sku_edit else '')
+            codigo_barras = sku_val or (producto_dict.get('codigo_barras') if producto_dict else None)
+
             producto = Producto(
                 id=producto_dict['id'] if producto_dict else None,
-                codigo_barras=producto_dict.get('codigo_barras') if producto_dict else None,
+                codigo_barras=codigo_barras,
                 nombre=nombre,
                 categoria=categoria_combo.currentText().strip() or None,
                 marca=marca_combo.currentText().strip() or None,
+                presentacion=presentacion_size,
                 proveedor_id=proveedor_id,
                 precio_compra=float(precio_compra_edit.text().replace(',', '') or 0),
                 precio_venta=precio_venta,
@@ -846,7 +1038,7 @@ class ProductosUI(QWidget):
                 unidades_por_caja=unidades_caja,
                 unidades_por_media_caja=unidades_media_caja,
                 vende_por_empaque=vende_por_empaque,
-                permite_decimales=permite_decimales_check.isChecked()
+                permite_decimales=permite_dec
             )
 
             if modo == 'crear':

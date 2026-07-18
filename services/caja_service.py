@@ -8,6 +8,14 @@ from typing import Optional, Tuple
 from datetime import datetime
 
 
+def _reconciliar_pagos_proveedor():
+    try:
+        from repositories.abonos_compras_repo import reconciliar_pagos_proveedor_huerfanos
+        reconciliar_pagos_proveedor_huerfanos()
+    except Exception as e:
+        print(f"[CAJA] No se pudieron reconciliar pagos a proveedor: {e}")
+
+
 class CajaService:
     """Servicio para gestión de caja"""
     
@@ -56,7 +64,11 @@ class CajaService:
                     usuario_id, monto_inicial, fecha_apertura
                 ) VALUES (?, ?, CURRENT_TIMESTAMP)
             ''', (self.auth.usuario_actual.id, monto_inicial))
-            
+            _caja_id = cursor.lastrowid
+
+            from repositories._outbox import encolar
+            encolar(conn, "cash_session", _caja_id, "create", "cierres_caja")
+
             conn.commit()
             
             # Registrar en auditoría
@@ -102,10 +114,18 @@ class CajaService:
             ''', (caja_abierta['fecha_apertura'],))
             
             ventas = dict(cursor.fetchone())
+            resumen_cierre = self.obtener_resumen_cierre()
+            ventas = {
+                'efectivo': resumen_cierre['efectivo'],
+                'tarjeta': resumen_cierre['tarjeta'],
+                'transferencia': resumen_cierre['transferencia'],
+                'otros': resumen_cierre['otros'],
+                'total_ventas': resumen_cierre['total'],
+            }
             
             # Calcular totales
             monto_inicial = caja_abierta['monto_inicial']
-            monto_esperado = monto_inicial + ventas['efectivo']
+            monto_esperado = resumen_cierre['esperado']
             diferencia = monto_real - monto_esperado
             
             # Actualizar el cierre de caja
@@ -134,9 +154,12 @@ class CajaService:
                 observaciones,
                 caja_abierta['id']
             ))
-            
+
+            from repositories._outbox import encolar
+            encolar(conn, "cash_session", caja_abierta['id'], "update", "cierres_caja")
+
             conn.commit()
-            
+
             # Registrar en auditoría
             self.auth.registrar_auditoria(
                 self.auth.usuario_actual.id,
@@ -177,6 +200,8 @@ class CajaService:
                 'egresos_total': 0
             }
         
+        _reconciliar_pagos_proveedor()
+
         fecha_hoy = datetime.now().strftime('%Y-%m-%d')
         
         conn = self.db.conectar()
@@ -264,6 +289,8 @@ class CajaService:
                 'egresos_total': 0
             }
         
+        _reconciliar_pagos_proveedor()
+
         conn = self.db.conectar()
         cursor = conn.cursor()
         

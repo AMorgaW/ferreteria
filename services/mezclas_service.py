@@ -175,6 +175,12 @@ class MezclasService:
                     num_factura,
                     obtener_fecha_actual()
                 ))
+                _mz_mov_id = cursor.lastrowid
+
+                # Local-first: encolar movimiento y producto (stock).
+                from repositories._outbox import encolar
+                encolar(conn, "inventory_movement", _mz_mov_id, "create", "movimientos")
+                encolar(conn, "product", comp['producto_id'], "update", "productos")
 
             conn.commit()
             return True, "Stock descontado exitosamente"

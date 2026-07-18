@@ -8,10 +8,12 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                                 QDialog, QMessageBox, QLineEdit, QComboBox,
                                 QSpinBox, QDoubleSpinBox, QSizePolicy,
                                 QAbstractItemView, QTextEdit, QGroupBox)
-from PySide6.QtCore import Qt, QSize, Signal
+from PySide6.QtCore import Qt, QSize, Signal, QTimer, QThreadPool, QPointF
 from PySide6.QtGui import QFont, QPainter, QColor, QBrush, QPen
 from ui_config import COLORS, FONTS, make_font
-from ui.widgets import ShadowCard, KpiCard, ActionButton
+from formato import formatear_stock
+from ui.widgets import ShadowCard, KpiCard, ActionButton, make_line_icon
+from ui.async_worker import FunctionWorker
 from datetime import datetime, timedelta
 import traceback
 from models import AbonoVenta
@@ -40,13 +42,13 @@ def _clear_layout(layout):
 # ---------------------------------------------------------------------------
 
 class BarChartWidget(QWidget):
-    """Dibuja un gráfico de barras simple con QPainter."""
+    """Dibuja la serie de ventas como gráfico lineal compacto."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._data = []
-        self.setMinimumHeight(250)
-        self.setStyleSheet("background: white;")
+        self.setMinimumHeight(260)
+        self.setStyleSheet("background: transparent; border: none;")
 
     def set_data(self, datos):
         self._data = datos or []
@@ -55,32 +57,53 @@ class BarChartWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor(COLORS['bg_primary']))
 
         if not self._data:
+            painter.setPen(QColor(COLORS['text_secondary']))
+            painter.setFont(make_font(FONTS['body']))
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "No hay ventas registradas en este período")
             painter.end()
             return
 
         w = self.width()
         h = self.height()
+        left, right, top, bottom = 62, 20, 18, 54
+        chart_width = max(1, w - left - right)
+        chart_height = max(1, h - top - bottom)
 
-        max_valor = max(d['monto'] for d in self._data) if self._data else 1
-        if max_valor == 0:
-            max_valor = 1
+        values = [max(0, float(d.get('monto', 0) or 0)) for d in self._data]
+        max_valor = max(values) if values else 0
+        scale_max = max(1000.0, max_valor)
+        if scale_max > 1000:
+            magnitude = 10 ** max(0, len(str(int(scale_max))) - 2)
+            scale_max = ((int(scale_max) + magnitude - 1) // magnitude) * magnitude
 
         n = len(self._data)
-        bar_width = (w - 100) / n
+        point_step = chart_width / max(1, n - 1)
 
+        # Guías discretas: mejoran la lectura sin competir con los datos.
+        grid_pen = QPen(QColor(COLORS['border']))
+        grid_pen.setStyle(Qt.DashLine)
+        painter.setPen(grid_pen)
+        for step in range(5):
+            y = top + (chart_height * step / 4)
+            painter.drawLine(left, int(y), w - right, int(y))
+
+        painter.setPen(QColor(COLORS['text_secondary']))
+        painter.setFont(make_font(FONTS['small']))
+        for step in range(5):
+            value = scale_max * (4 - step) / 4
+            y = top + (chart_height * step / 4)
+            painter.drawText(0, int(y - 8), left - 10, 16,
+                             Qt.AlignRight | Qt.AlignVCenter, f"{value:,.0f}")
+
+        points = []
         for i, dato in enumerate(self._data):
-            x1 = 50 + i * bar_width
-            x2 = x1 + bar_width - 10
-
-            bar_height = (dato['monto'] / max_valor) * (h - 70)
-            y_top = h - 30 - bar_height
-
-            # Barra
-            painter.setBrush(QBrush(QColor(COLORS['primary'])))
-            painter.setPen(QPen(QColor(COLORS['primary_dark']), 2))
-            painter.drawRect(int(x1), int(y_top), int(x2 - x1), int(bar_height))
+            x = left + (i * point_step if n > 1 else chart_width / 2)
+            y = top + chart_height - (values[i] / scale_max) * chart_height
+            points.append(QPointF(x, y))
 
             # Etiqueta de fecha
             fecha = dato['fecha'].split('-')[2] if '-' in str(dato['fecha']) else str(i + 1)
@@ -88,14 +111,36 @@ class BarChartWidget(QWidget):
             painter.setFont(make_font(FONTS['small']))
             fm = painter.fontMetrics()
             tw = fm.horizontalAdvance(fecha)
-            painter.drawText(int((x1 + x2) / 2 - tw / 2), h - 8, fecha)
+            painter.drawText(int(x - tw / 2), h - 32, fecha)
 
-            # Valor encima de la barra
-            if dato['monto'] > 0:
+            if values[i] > 0:
                 painter.setPen(QColor(COLORS['text_primary']))
-                text = f"${dato['monto']:,.0f}"
+                text = f"${values[i]:,.0f}"
                 tw2 = fm.horizontalAdvance(text)
-                painter.drawText(int((x1 + x2) / 2 - tw2 / 2), int(y_top - 8), text)
+                painter.drawText(int(x - tw2 / 2), int(y - 10), text)
+
+        line_pen = QPen(QColor(COLORS['accent']), 2.3, Qt.SolidLine,
+                        Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(line_pen)
+        for i in range(1, len(points)):
+            painter.drawLine(points[i - 1], points[i])
+
+        painter.setBrush(QBrush(QColor('white')))
+        painter.setPen(QPen(QColor(COLORS['accent']), 2))
+        for point in points:
+            painter.drawEllipse(point, 4, 4)
+
+        # Leyenda centrada, coherente con la moneda del sistema.
+        legend_y = h - 8
+        legend_text = "Ventas (COP)"
+        painter.setFont(make_font(FONTS['small']))
+        legend_width = painter.fontMetrics().horizontalAdvance(legend_text)
+        legend_x = (w - legend_width) / 2
+        painter.setPen(QPen(QColor(COLORS['accent']), 2))
+        painter.drawLine(int(legend_x - 28), legend_y - 4,
+                         int(legend_x - 8), legend_y - 4)
+        painter.setPen(QColor(COLORS['text_secondary']))
+        painter.drawText(int(legend_x), legend_y, legend_text)
 
         painter.end()
 
@@ -115,10 +160,11 @@ class DashboardUI(QWidget):
         self.alertas = alertas_service
         self.auth = auth_manager
         self.cuentas_service = cuentas_por_cobrar_service
+        self._thread_pool = QThreadPool.globalInstance()
 
         try:
             self.crear_ui()
-            self.cargar_datos()
+            QTimer.singleShot(50, self.cargar_datos)
         except Exception as e:
             print(f"ERROR CRITICO en DashboardUI.__init__: {e}")
             traceback.print_exc()
@@ -139,6 +185,7 @@ class DashboardUI(QWidget):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_area.setStyleSheet(
             f"QScrollArea {{ background: {COLORS['bg_secondary']}; border: none; }}"
         )
@@ -173,14 +220,16 @@ class DashboardUI(QWidget):
         header_frame = QWidget()
         header_frame.setStyleSheet(f"background: {COLORS['bg_secondary']};")
         header_layout = QHBoxLayout(header_frame)
-        header_layout.setContentsMargins(30, 20, 30, 10)
+        header_layout.setContentsMargins(30, 22, 30, 12)
 
         # Título con icono
         left_layout = QHBoxLayout()
-        left_layout.setSpacing(10)
+        left_layout.setSpacing(14)
 
-        icon_lbl = QLabel("📊")
-        icon_lbl.setFont(QFont('Segoe UI', 32))
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(make_line_icon('grid', COLORS['primary'], 34).pixmap(34, 34))
+        icon_lbl.setFixedSize(42, 42)
+        icon_lbl.setAlignment(Qt.AlignCenter)
         icon_lbl.setStyleSheet("background: transparent; border: none;")
         left_layout.addWidget(icon_lbl)
 
@@ -189,13 +238,17 @@ class DashboardUI(QWidget):
         es_vendedor = (self.auth.usuario_actual and self.auth.usuario_actual.rol == 'VENDEDOR')
         titulo_dashboard = f"Mis Ventas — {self.auth.usuario_actual.nombre_completo}" if es_vendedor else "Dashboard Principal"
         title_lbl = QLabel(titulo_dashboard)
-        title_lbl.setFont(make_font(FONTS['large']))
+        title_lbl.setFont(make_font(FONTS['xlarge']))
         title_lbl.setStyleSheet(
             f"color: {COLORS['text_primary']}; background: transparent; border: none;"
+            " font-size: 18pt; font-weight: 500;"
         )
         title_col.addWidget(title_lbl)
 
-        hora_actual = datetime.now().strftime("%d de %B, %Y - %H:%M")
+        ahora = datetime.now()
+        meses = ("enero", "febrero", "marzo", "abril", "mayo", "junio",
+                 "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
+        hora_actual = f"{ahora.day} de {meses[ahora.month - 1]} de {ahora.year} · {ahora:%H:%M}"
         date_lbl = QLabel(hora_actual)
         date_lbl.setFont(make_font(FONTS['body']))
         date_lbl.setStyleSheet(
@@ -209,12 +262,14 @@ class DashboardUI(QWidget):
 
         # Botón de actualizar
         btn_refresh = ActionButton(
-            text="🔄 Actualizar",
-            bg=COLORS['primary'], fg='white',
-            hover_bg=COLORS['primary_dark'],
-            border_color=COLORS['primary'],
-            bold=True, command=self.cargar_datos,
+            text="Actualizar datos",
+            bg=COLORS['accent'], fg='white',
+            hover_bg=COLORS['accent_hover'],
+            border_color=COLORS['accent'], border_radius=9,
+            padx=20, pady=10, bold=True, command=self.cargar_datos,
         )
+        btn_refresh.setIcon(make_line_icon('refresh', 'white', 19))
+        btn_refresh.setIconSize(QSize(19, 19))
         header_layout.addWidget(btn_refresh)
 
         self.scroll_layout.addWidget(header_frame)
@@ -223,33 +278,37 @@ class DashboardUI(QWidget):
         """Crea las tarjetas de KPI principales"""
         cards_container = QWidget()
         cards_container.setStyleSheet(f"background: {COLORS['bg_secondary']};")
-        grid = QHBoxLayout(cards_container)
-        grid.setContentsMargins(30, 20, 30, 20)
-        grid.setSpacing(20)
+        grid = QGridLayout(cards_container)
+        grid.setContentsMargins(30, 10, 30, 16)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(14)
+        self.cards_grid = grid
+        self._cards_columns = None
 
         self.card_ventas_hoy = self.crear_tarjeta_kpi(
-            "💰 Ventas de Hoy", "$0", "0 ventas",
+            "Ventas de Hoy", "$0", "0 ventas",
             COLORS['success'], COLORS['success_dark'],
         )
-        grid.addWidget(self.card_ventas_hoy['card'])
 
         self.card_ventas_mes = self.crear_tarjeta_kpi(
-            "📅 Ventas del Mes", "$0", "0 ventas",
-            COLORS['primary'], COLORS['primary_dark'],
+            "Ventas del Mes", "$0", "0 ventas",
+            COLORS['accent'], COLORS['accent_dark'],
         )
-        grid.addWidget(self.card_ventas_mes['card'])
 
         self.card_stock_critico = self.crear_tarjeta_kpi(
-            "⚠️ Stock Crítico", "0", "productos",
+            "Stock Crítico", "0", "productos",
             COLORS['danger'], COLORS['danger_dark'],
         )
-        grid.addWidget(self.card_stock_critico['card'])
 
         self.card_cuentas = self.crear_tarjeta_kpi(
-            "💳 Cuentas por Cobrar", "$0", "0 cuentas",
+            "Cuentas por Cobrar", "$0", "0 cuentas",
             COLORS['warning'], COLORS['warning_dark'],
         )
-        grid.addWidget(self.card_cuentas['card'])
+        self._cards_widgets = [
+            self.card_ventas_hoy['card'], self.card_ventas_mes['card'],
+            self.card_stock_critico['card'], self.card_cuentas['card'],
+        ]
+        self._ajustar_grid_tarjetas()
 
         # Click handlers
         self.card_ventas_hoy['card'].mousePressEvent = (
@@ -268,49 +327,95 @@ class DashboardUI(QWidget):
 
         self.scroll_layout.addWidget(cards_container)
 
+    def _ajustar_grid_tarjetas(self):
+        """Refluye las tarjetas según el ancho disponible, sin alterar datos."""
+        width = self.width()
+        columns = 4 if width >= 1080 else (2 if width >= 620 else 1)
+        if columns == self._cards_columns:
+            return
+        self._cards_columns = columns
+        for index, card in enumerate(self._cards_widgets):
+            self.cards_grid.addWidget(card, index // columns, index % columns)
+        for column in range(4):
+            self.cards_grid.setColumnStretch(column, 1 if column < columns else 0)
+
+    def resizeEvent(self, event):
+        """Mantiene la composición del dashboard en resoluciones reducidas."""
+        if hasattr(self, 'cards_grid'):
+            self._ajustar_grid_tarjetas()
+        super().resizeEvent(event)
+
     def crear_tarjeta_kpi(self, titulo, valor, subtitulo, color, color_hover):
         """Crea una tarjeta KPI con animación hover"""
-        card = ShadowCard(content_margins=(0, 0, 0, 0))
+        card = ShadowCard(content_margins=(0, 0, 0, 0),
+                          border_radius=12, shadow_blur=14)
         card.setCursor(Qt.PointingHandCursor)
-        card.setMinimumHeight(140)
+        card.setMinimumHeight(126)
 
         lay = QVBoxLayout(card)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Barra de color superior
+        # Franja de color superior (4px, color = tipo de dato).
         color_bar = QFrame()
-        color_bar.setFixedHeight(6)
+        color_bar.setFixedHeight(4)
         color_bar.setStyleSheet(f"background: {color}; border: none;")
         lay.addWidget(color_bar)
 
-        # Contenido
+        # Contenido con icono semántico y jerarquía compacta.
         content = QWidget()
         content.setStyleSheet("background: white; border: none;")
-        cl = QVBoxLayout(content)
-        cl.setContentsMargins(25, 20, 25, 20)
+        cl = QHBoxLayout(content)
+        cl.setContentsMargins(18, 16, 18, 16)
+        cl.setSpacing(14)
+
+        if "Hoy" in titulo:
+            icon_key, icon_bg = 'sales_today', '#E7F5EE'
+        elif "Mes" in titulo:
+            icon_key, icon_bg = 'sales_month', COLORS['accent_light']
+        elif "Stock" in titulo:
+            icon_key, icon_bg = 'stock', COLORS['danger_light']
+        else:
+            icon_key, icon_bg = 'credit', COLORS['warning_light']
+
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(52, 52)
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        icon_lbl.setPixmap(make_line_icon(icon_key, color, 27).pixmap(27, 27))
+        icon_lbl.setStyleSheet(
+            f"background: {icon_bg}; border: none; border-radius: 26px;"
+        )
+        cl.addWidget(icon_lbl, 0, Qt.AlignVCenter)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(3)
 
         lbl_titulo = QLabel(titulo)
-        lbl_titulo.setFont(make_font(FONTS['body_bold']))
+        lbl_titulo.setWordWrap(True)
+        lbl_titulo.setFont(make_font(FONTS['body']))
         lbl_titulo.setStyleSheet(
-            f"color: {COLORS['text_secondary']}; background: transparent; border: none;"
-        )
-        cl.addWidget(lbl_titulo)
-
-        lbl_valor = QLabel(valor)
-        lbl_valor.setFont(QFont('Segoe UI', 28, QFont.Bold))
-        lbl_valor.setStyleSheet(
             f"color: {COLORS['text_primary']}; background: transparent; border: none;"
         )
-        lbl_valor.setAlignment(Qt.AlignCenter)
-        cl.addWidget(lbl_valor)
+        text_col.addWidget(lbl_titulo)
+
+        lbl_valor = QLabel(valor)
+        lbl_valor.setFont(QFont('Segoe UI', 20, QFont.Medium))
+        lbl_valor.setStyleSheet(
+            f"color: {COLORS['text_primary']}; background: transparent; border: none;"
+            " font-size: 20pt; font-weight: 500;"
+        )
+        lbl_valor.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        text_col.addWidget(lbl_valor)
 
         lbl_subtitulo = QLabel(subtitulo)
-        lbl_subtitulo.setFont(make_font(FONTS['body']))
+        lbl_subtitulo.setWordWrap(True)
+        lbl_subtitulo.setFont(make_font(FONTS['small']))
         lbl_subtitulo.setStyleSheet(
-            f"color: {COLORS['text_light']}; background: transparent; border: none;"
+            f"color: {color}; background: transparent; border: none;"
         )
-        cl.addWidget(lbl_subtitulo)
+        text_col.addWidget(lbl_subtitulo)
+        cl.addLayout(text_col, 1)
 
         lay.addWidget(content, 1)
 
@@ -343,18 +448,52 @@ class DashboardUI(QWidget):
         section = QWidget()
         section.setStyleSheet(f"background: {COLORS['bg_secondary']};")
         section_layout = QVBoxLayout(section)
-        section_layout.setContentsMargins(30, 20, 30, 20)
+        section_layout.setContentsMargins(30, 8, 30, 22)
 
-        lbl = QLabel("📈 Análisis de Ventas - Últimos 7 Días")
+        graph_card = ShadowCard(border_radius=14, shadow_blur=14,
+                                content_margins=(0, 0, 0, 0))
+        graph_layout = QVBoxLayout(graph_card)
+        graph_layout.setContentsMargins(20, 16, 20, 16)
+        graph_layout.setSpacing(8)
+
+        graph_header = QHBoxLayout()
+        graph_header.setSpacing(10)
+        graph_icon = QLabel()
+        graph_icon.setFixedSize(36, 36)
+        graph_icon.setAlignment(Qt.AlignCenter)
+        graph_icon.setPixmap(make_line_icon('chart', COLORS['accent'], 20).pixmap(20, 20))
+        graph_icon.setStyleSheet(
+            f"background: {COLORS['accent_light']}; border-radius: 18px; border: none;"
+        )
+        graph_header.addWidget(graph_icon)
+
+        lbl = QLabel("Análisis de Ventas · Últimos 7 Días")
         lbl.setFont(make_font(FONTS['heading']))
         lbl.setStyleSheet(
-            f"color: {COLORS['text_primary']}; background: transparent;"
+            f"color: {COLORS['text_primary']}; background: transparent; border: none;"
         )
-        section_layout.addWidget(lbl)
+        graph_header.addWidget(lbl)
+        graph_header.addStretch()
 
-        graph_card = ShadowCard()
-        graph_layout = QVBoxLayout(graph_card)
-        graph_layout.setContentsMargins(20, 20, 20, 20)
+        period_chip = QFrame()
+        period_chip.setStyleSheet(
+            f"QFrame {{ background: white; border: 1px solid {COLORS['border_input']};"
+            " border-radius: 8px; }}"
+        )
+        period_layout = QHBoxLayout(period_chip)
+        period_layout.setContentsMargins(10, 6, 10, 6)
+        period_layout.setSpacing(6)
+        period_icon = QLabel()
+        period_icon.setPixmap(make_line_icon('calendar', COLORS['text_secondary'], 16).pixmap(16, 16))
+        period_icon.setStyleSheet("background: transparent; border: none;")
+        period_text = QLabel("Últimos 7 días")
+        period_text.setStyleSheet(
+            f"color: {COLORS['text_secondary']}; background: transparent; border: none;"
+        )
+        period_layout.addWidget(period_icon)
+        period_layout.addWidget(period_text)
+        graph_header.addWidget(period_chip)
+        graph_layout.addLayout(graph_header)
 
         self.grafico_widget = BarChartWidget()
         graph_layout.addWidget(self.grafico_widget)
@@ -512,28 +651,34 @@ class DashboardUI(QWidget):
 
     def cargar_datos(self):
         """Carga y actualiza todos los datos del dashboard"""
-        try:
-            es_vendedor = (self.auth.usuario_actual and self.auth.usuario_actual.rol == 'VENDEDOR')
-            uid = self.auth.usuario_actual.id if es_vendedor else None
-            datos = self.reportes.dashboard_principal(usuario_id=uid)
+        worker = FunctionWorker(self._obtener_datos_dashboard)
+        worker.signals.result.connect(self._aplicar_datos_dashboard)
+        worker.signals.error.connect(lambda e: print(f"Error al cargar datos: {e}"))
+        self._thread_pool.start(worker)
 
+    def _obtener_datos_dashboard(self):
+        es_vendedor = (self.auth.usuario_actual and self.auth.usuario_actual.rol == 'VENDEDOR')
+        uid = self.auth.usuario_actual.id if es_vendedor else None
+        datos = self.reportes.dashboard_principal(usuario_id=uid)
+
+        if self.cuentas_service:
+            try:
+                totales = self.cuentas_service.obtener_totales_cuentas_por_cobrar()
+                datos['cuentas_cobrar'] = {
+                    'monto_pendiente': totales['total_por_cobrar'],
+                    'cuentas_pendientes': totales['total_facturas_pendientes'],
+                }
+            except Exception as e:
+                print(f"Error al cargar cuentas por cobrar: {e}")
+
+        return datos
+
+    def _aplicar_datos_dashboard(self, datos):
+        try:
             self.actualizar_card_ventas_hoy(datos['ventas_hoy'])
             self.actualizar_card_ventas_mes(datos['ventas_mes'])
             self.actualizar_card_stock_critico(datos['stock_critico'])
-
-            if self.cuentas_service:
-                try:
-                    totales = self.cuentas_service.obtener_totales_cuentas_por_cobrar()
-                    self.actualizar_card_cuentas_cobrar({
-                        'monto_pendiente': totales['total_por_cobrar'],
-                        'cuentas_pendientes': totales['total_facturas_pendientes'],
-                    })
-                except Exception as e:
-                    print(f"Error al cargar cuentas por cobrar: {e}")
-                    self.actualizar_card_cuentas_cobrar(datos['cuentas_cobrar'])
-            else:
-                self.actualizar_card_cuentas_cobrar(datos['cuentas_cobrar'])
-
+            self.actualizar_card_cuentas_cobrar(datos['cuentas_cobrar'])
             self.dibujar_grafico(datos['grafico_7_dias'])
 
         except Exception as e:
@@ -546,7 +691,7 @@ class DashboardUI(QWidget):
         label = "mis ventas" if es_vendedor else "ventas realizadas"
         self.card_ventas_hoy['subtitulo'].setText(f"{datos['ventas_hoy']} {label}")
         if es_vendedor:
-            self.card_ventas_hoy['titulo'].setText("💰 Mis Ventas de Hoy")
+            self.card_ventas_hoy['titulo'].setText("Mis Ventas de Hoy")
 
     def actualizar_card_ventas_mes(self, datos):
         """Actualiza la tarjeta de ventas del mes"""
@@ -555,7 +700,7 @@ class DashboardUI(QWidget):
         label = "mis ventas" if es_vendedor else "ventas este mes"
         self.card_ventas_mes['subtitulo'].setText(f"{datos['ventas_mes']} {label}")
         if es_vendedor:
-            self.card_ventas_mes['titulo'].setText("📅 Mis Ventas del Mes")
+            self.card_ventas_mes['titulo'].setText("Mis Ventas del Mes")
 
     def actualizar_card_stock_critico(self, count):
         """Actualiza la tarjeta de stock crítico"""
@@ -574,7 +719,7 @@ class DashboardUI(QWidget):
         )
 
     def dibujar_grafico(self, datos):
-        """Dibuja un gráfico simple de barras"""
+        """Actualiza la serie visual del gráfico de ventas."""
         self.grafico_widget.set_data(datos)
 
     # ------------------------------------------------------------------
@@ -845,7 +990,7 @@ class DashboardUI(QWidget):
         tabla.setShowGrid(False)
         tabla.setStyleSheet("""
             QTableWidget { border: 1px solid #e2e8f0; border-radius: 6px; font-size: 9pt; }
-            QHeaderView::section { background: #f8fafc; padding: 6px; font-weight: bold;
+            QHeaderView::section { background: #f8fafc; padding: 6px; font-weight: 500;
                                    border: none; border-bottom: 1px solid #e2e8f0; }
         """)
 
@@ -908,7 +1053,7 @@ class DashboardUI(QWidget):
         btn_cerrar.setFixedWidth(90)
         btn_cerrar.setStyleSheet(
             f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none;"
-            f" border-radius: 6px; padding: 7px 0; font-weight: bold; }}"
+            f" border-radius: 6px; padding: 7px 0; font-weight: 500; }}"
             f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
         )
         btn_cerrar.clicked.connect(dlg.accept)
@@ -1005,7 +1150,7 @@ class DashboardUI(QWidget):
         tabla.setRowCount(len(dias))
         for i, d in enumerate(dias):
             tabla.setItem(i, 0, QTableWidgetItem(str(d.get('fecha', ''))))
-            cant_item = QTableWidgetItem(str(d.get('cantidad', 0)))
+            cant_item = QTableWidgetItem(formatear_stock(d.get('cantidad', 0)))
             cant_item.setTextAlignment(Qt.AlignCenter)
             tabla.setItem(i, 1, cant_item)
             monto_item = QTableWidgetItem(f"${d.get('monto', 0):,.0f}")
@@ -1017,7 +1162,7 @@ class DashboardUI(QWidget):
         btn_cerrar = QPushButton("Cerrar")
         btn_cerrar.setStyleSheet(
             f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none;"
-            f" border-radius: 6px; padding: 8px 24px; font-weight: bold; }}"
+            f" border-radius: 6px; padding: 8px 24px; font-weight: 500; }}"
             f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
         )
         btn_cerrar.clicked.connect(dlg.accept)
@@ -2486,7 +2631,7 @@ class DashboardUI(QWidget):
                         p.get('codigo_barras', '-'),
                         p['nombre'][:45],
                         f"${p['precio_venta']:,.0f}",
-                        str(p['stock']),
+                        formatear_stock(p['stock'], p.get('permite_decimales')),
                     )
                     r = prod_table.rowCount()
                     prod_table.insertRow(r)
@@ -2654,7 +2799,7 @@ class DashboardUI(QWidget):
                     QMessageBox.warning(
                         modal, "Advertencia",
                         f"Stock insuficiente.\n"
-                        f"Disponible: {producto['stock']} "
+                        f"Disponible: {formatear_stock(producto['stock'], producto.get('permite_decimales'))} "
                         f"{producto.get('unidad_base', 'unidades')}",
                     )
                     return

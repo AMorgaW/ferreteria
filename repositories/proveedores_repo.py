@@ -11,6 +11,54 @@ class ProveedoresRepository:
     
     def __init__(self, db_manager):
         self.db = db_manager
+        self._cache = []
+        self._cache_loaded = False
+
+    def invalidar_cache(self):
+        self._cache = []
+        self._cache_loaded = False
+
+    def precargar_cache(self):
+        proveedores = self.listar_proveedores(solo_activos=False)
+        self._cache = proveedores
+        self._cache_loaded = True
+        return proveedores
+
+    def cache_disponible(self) -> bool:
+        return self._cache_loaded
+
+    def buscar_proveedores_cache(
+        self,
+        termino: str = '',
+        solo_activos: bool = True,
+        limite: Optional[int] = 120
+    ) -> List[Proveedor]:
+        if not self._cache_loaded:
+            return []
+
+        termino = (termino or '').strip().lower()
+        resultados = []
+
+        for proveedor in self._cache:
+            if solo_activos and not proveedor.activo:
+                continue
+
+            if termino:
+                texto = " ".join([
+                    proveedor.nombre or '',
+                    proveedor.nit or '',
+                    proveedor.ciudad or '',
+                    proveedor.productos_provee or '',
+                    proveedor.correo or '',
+                ]).lower()
+                if termino not in texto:
+                    continue
+
+            resultados.append(proveedor)
+            if limite and len(resultados) >= limite:
+                break
+
+        return resultados
     
     def crear_proveedor(self, proveedor: Proveedor) -> Tuple[bool, str, Optional[int]]:
         """
@@ -42,10 +90,13 @@ class ProveedoresRepository:
                 1 if proveedor.activo else 0
             ))
             
-            conn.commit()
             proveedor_id = cursor.lastrowid
+            from repositories._outbox import encolar
+            encolar(conn, "supplier", proveedor_id, "create", "proveedores")
+            conn.commit()
             conn.close()
-            
+            self.invalidar_cache()
+
             return True, "Proveedor creado exitosamente", proveedor_id
             
         except Exception as e:
@@ -88,9 +139,12 @@ class ProveedoresRepository:
                 1 if proveedor.activo else 0,
                 proveedor.id
             ))
-            
+
+            from repositories._outbox import encolar
+            encolar(conn, "supplier", proveedor.id, "update", "proveedores")
             conn.commit()
             conn.close()
+            self.invalidar_cache()
             
             return True, "Proveedor actualizado exitosamente"
             
@@ -154,7 +208,7 @@ class ProveedoresRepository:
             )
         return None
     
-    def listar_proveedores(self, solo_activos: bool = True) -> List[Proveedor]:
+    def listar_proveedores(self, solo_activos: bool = True, limite: Optional[int] = None) -> List[Proveedor]:
         """
         Lista todos los proveedores
         [OK] CORREGIDO: Ahora devuelve objetos Proveedor en lugar de diccionarios
@@ -163,9 +217,16 @@ class ProveedoresRepository:
         cursor = conn.cursor()
         
         if solo_activos:
-            cursor.execute('SELECT * FROM proveedores WHERE activo = 1 ORDER BY nombre')
+            query = 'SELECT * FROM proveedores WHERE activo = 1 ORDER BY nombre'
         else:
-            cursor.execute('SELECT * FROM proveedores ORDER BY nombre')
+            query = 'SELECT * FROM proveedores ORDER BY nombre'
+
+        params = []
+        if limite:
+            query += ' LIMIT ?'
+            params.append(limite)
+
+        cursor.execute(query, params)
         
         rows = cursor.fetchall()
         conn.close()
@@ -193,35 +254,52 @@ class ProveedoresRepository:
         
         return proveedores
     
-    def buscar_proveedores(self, termino: str = '', solo_activos: bool = True) -> List[Proveedor]:
+    def buscar_proveedores(
+        self,
+        termino: str = '',
+        solo_activos: bool = True,
+        limite: Optional[int] = None
+    ) -> List[Proveedor]:
         """Busca proveedores por nombre, NIT o ciudad"""
         conn = self.db.conectar()
         cursor = conn.cursor()
         
-        termino_busqueda = f"%{termino}%"
+        termino_busqueda = f"%{termino.lower()}%"
+        params = [
+            termino_busqueda,
+            termino_busqueda,
+            termino_busqueda,
+            termino_busqueda,
+        ]
         
         if solo_activos:
-            cursor.execute('''
+            query = '''
                 SELECT * FROM proveedores 
                 WHERE activo = 1 
                 AND (
-                    nombre LIKE ? OR 
-                    nit LIKE ? OR 
-                    ciudad LIKE ? OR
-                    productos_provee LIKE ?
+                    LOWER(nombre) LIKE ? OR 
+                    LOWER(nit) LIKE ? OR 
+                    LOWER(ciudad) LIKE ? OR
+                    LOWER(productos_provee) LIKE ?
                 )
                 ORDER BY nombre
-            ''', (termino_busqueda, termino_busqueda, termino_busqueda, termino_busqueda))
+            '''
         else:
-            cursor.execute('''
+            query = '''
                 SELECT * FROM proveedores 
                 WHERE 
-                    nombre LIKE ? OR 
-                    nit LIKE ? OR 
-                    ciudad LIKE ? OR
-                    productos_provee LIKE ?
+                    LOWER(nombre) LIKE ? OR 
+                    LOWER(nit) LIKE ? OR 
+                    LOWER(ciudad) LIKE ? OR
+                    LOWER(productos_provee) LIKE ?
                 ORDER BY nombre
-            ''', (termino_busqueda, termino_busqueda, termino_busqueda, termino_busqueda))
+            '''
+
+        if limite:
+            query += ' LIMIT ?'
+            params.append(limite)
+
+        cursor.execute(query, params)
         
         rows = cursor.fetchall()
         conn.close()
@@ -266,14 +344,19 @@ class ProveedoresRepository:
                     conn.close()
                     return False, f"No se puede eliminar. Tiene {count} productos asociados"
                 
+                from repositories._outbox import encolar_borrado
+                encolar_borrado(conn, "supplier", proveedor_id, "proveedores")
                 cursor.execute('DELETE FROM proveedores WHERE id = ?', (proveedor_id,))
                 mensaje = "Proveedor eliminado permanentemente"
             else:
                 cursor.execute('UPDATE proveedores SET activo = 0 WHERE id = ?', (proveedor_id,))
+                from repositories._outbox import encolar
+                encolar(conn, "supplier", proveedor_id, "update", "proveedores")
                 mensaje = "Proveedor desactivado"
-            
+
             conn.commit()
             conn.close()
+            self.invalidar_cache()
             
             return True, mensaje
             

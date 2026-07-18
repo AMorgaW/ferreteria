@@ -14,8 +14,28 @@ __pycache__/
 
 # Base de datos local
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
+
+# Build / empaquetado (regenerables)
+build/
+dist/
+*.spec
+
+# Respaldos automáticos de la BD (runtime)
+backups/
+
+# Config local con credenciales de servidor
+config/local_first_config.json
+
+# Artefactos temporales de pruebas/preview
+_test_*.py
+_preview_*.py
+preview_*.png
+smoke_*.txt
+tmp_*.py
 
 # Logs y archivos temporales
 error_log.txt

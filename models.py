@@ -59,7 +59,6 @@ class Usuario:
     ultimo_acceso: Optional[datetime] = None
 
 @dataclass
-@dataclass
 class Producto:
     """Modelo de producto"""
     id: Optional[int] = None
@@ -67,6 +66,9 @@ class Producto:
     nombre: str = ""
     categoria: Optional[str] = None
     marca: Optional[str] = None
+    # Tamaño / medida / capacidad que distingue variantes del mismo artículo
+    # (ej: "50 kg", "1 galón", "2 pulgadas"). Clave para no mezclar variantes.
+    presentacion: Optional[str] = None
     proveedor_id: Optional[int] = None
     precio_compra: float = 0.0
     precio_venta: float = 0.0
@@ -111,16 +113,23 @@ class Producto:
         if not self.nombre or self.nombre.strip() == "":
             return False, "El nombre del producto es obligatorio"
 
-        if self.precio_venta < 0:
-            return False, "El precio de venta no puede ser negativo"
+        if len(self.nombre.strip()) > 150:
+            return False, "El nombre del producto es demasiado largo (máx. 150 caracteres)"
 
-        if self.precio_compra < 0:
+        if self.precio_venta is None or self.precio_venta <= 0:
+            return False, "El precio de venta debe ser mayor a 0"
+
+        if self.precio_compra is None or self.precio_compra < 0:
             return False, "El precio de compra no puede ser negativo"
 
-        if self.stock < 0:
+        if self.precio_venta < self.precio_compra:
+            return False, ("El precio de venta no puede ser menor al de compra "
+                           "(estaría vendiendo con pérdida)")
+
+        if self.stock is None or self.stock < 0:
             return False, "El stock no puede ser negativo"
 
-        if self.stock_minimo < 0:
+        if self.stock_minimo is None or self.stock_minimo < 0:
             return False, "El stock mínimo no puede ser negativo"
 
         if self.iva < 0 or self.iva > 1:

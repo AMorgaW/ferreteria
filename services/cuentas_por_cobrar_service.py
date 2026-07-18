@@ -259,5 +259,5 @@ class CuentasPorCobrarService:
             fecha = datetime.fromisoformat(fecha_str.replace(' ', 'T'))
             dias = (datetime.now() - fecha).days
             return dias
-        except:
+        except Exception:
             return 0

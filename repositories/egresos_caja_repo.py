@@ -33,6 +33,8 @@ class EgresosCajaRepository:
             ''', (monto, categoria, descripcion, metodo_pago, fecha_egreso, usuario, id_caja))
             
             egreso_id = cursor.lastrowid
+            from repositories._outbox import encolar
+            encolar(conn, "cash_expense", egreso_id, "create", "egresos_caja")
             conn.commit()
             conn.close()
             return egreso_id

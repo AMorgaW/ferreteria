@@ -8,12 +8,14 @@ from PySide6.QtWidgets import (
     QGroupBox, QGridLayout, QDialog, QMessageBox, QMenu, QFrame,
     QAbstractItemView, QSizePolicy, QScrollArea
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool
 from PySide6.QtGui import QFont, QColor, QCursor
 
 from ui_config import COLORS, FONTS, ICONS, make_font
+from ui.widgets import button_qss
 from models import Cliente, AbonoVenta
 from datetime import datetime
+from ui.async_worker import FunctionWorker
 
 
 class ClientesUI(QWidget):
@@ -28,6 +30,12 @@ class ClientesUI(QWidget):
         self.cuentas_service = cuentas_por_cobrar_service
         self.abonos_repo = abonos_ventas_repo
         self.cliente_seleccionado = None
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(350)
+        self._search_timer.timeout.connect(self.buscar_clientes)
+        self._thread_pool = QThreadPool.globalInstance()
+        self._load_seq = 0
 
         self.crear_interfaz()
         self.cargar_clientes()
@@ -58,11 +66,8 @@ class ClientesUI(QWidget):
         btn_nuevo = QPushButton(f"{ICONS['agregar']} Nuevo Cliente")
         btn_nuevo.setFont(make_font(FONTS['body']))
         btn_nuevo.setCursor(QCursor(Qt.PointingHandCursor))
-        btn_nuevo.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
-        )
+        btn_nuevo.setStyleSheet(button_qss('primary'))
+        btn_nuevo.setMinimumHeight(38)
         btn_nuevo.clicked.connect(self.nuevo_cliente)
         header.addWidget(btn_nuevo)
 
@@ -70,22 +75,16 @@ class ClientesUI(QWidget):
             btn_cuentas = QPushButton("💰 Cuentas por Cobrar")
             btn_cuentas.setFont(make_font(FONTS['body']))
             btn_cuentas.setCursor(QCursor(Qt.PointingHandCursor))
-            btn_cuentas.setStyleSheet(
-                "QPushButton { background: #F59E0B; color: white; border: none; "
-                "border-radius: 6px; padding: 8px 15px; }"
-                "QPushButton:hover { background: #D97706; }"
-            )
+            btn_cuentas.setStyleSheet(button_qss('dark'))
+            btn_cuentas.setMinimumHeight(38)
             btn_cuentas.clicked.connect(self.ver_cuentas_por_cobrar_cliente)
             header.addWidget(btn_cuentas)
 
         btn_actualizar = QPushButton(f"{ICONS['actualizar']} Actualizar")
         btn_actualizar.setFont(make_font(FONTS['body']))
         btn_actualizar.setCursor(QCursor(Qt.PointingHandCursor))
-        btn_actualizar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['info']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: #0891b2; }}"
-        )
+        btn_actualizar.setStyleSheet(button_qss('ghost'))
+        btn_actualizar.setMinimumHeight(38)
         btn_actualizar.clicked.connect(self.cargar_clientes)
         header.addWidget(btn_actualizar)
 
@@ -101,7 +100,7 @@ class ClientesUI(QWidget):
         self.search_input.setFont(make_font(FONTS['body']))
         self.search_input.setPlaceholderText("Buscar por nombre, documento, teléfono...")
         self.search_input.setFixedWidth(350)
-        self.search_input.textChanged.connect(self.buscar_clientes)
+        self.search_input.textChanged.connect(lambda: self._search_timer.start())
         search_layout.addWidget(self.search_input)
         search_layout.addStretch()
 
@@ -137,22 +136,16 @@ class ClientesUI(QWidget):
         btn_editar = QPushButton(f"{ICONS['editar']} Editar")
         btn_editar.setFont(make_font(FONTS['body']))
         btn_editar.setCursor(QCursor(Qt.PointingHandCursor))
-        btn_editar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
-        )
+        btn_editar.setStyleSheet(button_qss('ghost'))
+        btn_editar.setMinimumHeight(38)
         btn_editar.clicked.connect(self.editar_cliente)
         bottom.addWidget(btn_editar)
 
         btn_eliminar = QPushButton(f"{ICONS['eliminar']} Eliminar")
         btn_eliminar.setFont(make_font(FONTS['body']))
         btn_eliminar.setCursor(QCursor(Qt.PointingHandCursor))
-        btn_eliminar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['danger']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: {COLORS['danger_dark']}; }}"
-        )
+        btn_eliminar.setStyleSheet(button_qss('ghost_danger'))
+        btn_eliminar.setMinimumHeight(38)
         btn_eliminar.clicked.connect(self.eliminar_cliente)
         bottom.addWidget(btn_eliminar)
 
@@ -175,30 +168,19 @@ class ClientesUI(QWidget):
         """Carga todos los clientes en la tabla"""
         self.table.setRowCount(0)
 
-        clientes = self.clientes_repo.listar_clientes(solo_activos=False)
+        if self.clientes_repo.cache_disponible():
+            self._renderizar_clientes(
+                self.clientes_repo.buscar_clientes_cache(solo_activos=False, limite=500),
+                "Total"
+            )
+            return
 
-        for row, cliente in enumerate(clientes):
-            self.table.insertRow(row)
-            estado = "Activo" if cliente.activo else "Inactivo"
-            valores = [
-                str(cliente.id),
-                f"{cliente.tipo_documento} {cliente.numero_documento}",
-                cliente.nombre,
-                cliente.telefono or '-',
-                cliente.ciudad or '-',
-                f"${cliente.limite_credito:,.0f}",
-                f"${cliente.saldo_pendiente:,.0f}",
-                estado,
-            ]
-            for col, val in enumerate(valores):
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignCenter)
-                if not cliente.activo:
-                    item.setBackground(QColor('#fee2e2'))
-                    item.setForeground(QColor('#991b1b'))
-                self.table.setItem(row, col, item)
-
-        self.stats_label.setText(f"Total: {len(clientes)} clientes")
+        self._load_seq += 1
+        seq = self._load_seq
+        worker = FunctionWorker(self.clientes_repo.listar_clientes, False, 500)
+        worker.signals.result.connect(lambda clientes, s=seq: self._on_clientes_cargados(clientes, s, "Total"))
+        worker.signals.error.connect(lambda e: QMessageBox.critical(self, "Error", f"Error cargando clientes:\n{e}"))
+        self._thread_pool.start(worker)
 
     def buscar_clientes(self):
         """Busca clientes según el criterio"""
@@ -206,11 +188,29 @@ class ClientesUI(QWidget):
 
         self.table.setRowCount(0)
 
-        if criterio:
-            clientes = self.clientes_repo.buscar_clientes(criterio, solo_activos=False)
-        else:
-            clientes = self.clientes_repo.listar_clientes(solo_activos=False)
+        if self.clientes_repo.cache_disponible():
+            limite = 250 if criterio else 500
+            clientes = self.clientes_repo.buscar_clientes_cache(criterio, solo_activos=False, limite=limite)
+            self._renderizar_clientes(clientes, "Encontrados")
+            return
 
+        self._load_seq += 1
+        seq = self._load_seq
+        if criterio:
+            worker = FunctionWorker(self.clientes_repo.buscar_clientes, criterio, False, 250)
+        else:
+            worker = FunctionWorker(self.clientes_repo.listar_clientes, False, 500)
+        worker.signals.result.connect(lambda clientes, s=seq: self._on_clientes_cargados(clientes, s, "Encontrados"))
+        worker.signals.error.connect(lambda e: QMessageBox.critical(self, "Error", f"Error buscando clientes:\n{e}"))
+        self._thread_pool.start(worker)
+
+    def _on_clientes_cargados(self, clientes, seq, etiqueta):
+        if seq != self._load_seq:
+            return
+        self._renderizar_clientes(clientes, etiqueta)
+
+    def _renderizar_clientes(self, clientes, etiqueta):
+        self.table.setRowCount(0)
         for row, cliente in enumerate(clientes):
             self.table.insertRow(row)
             estado = "Activo" if cliente.activo else "Inactivo"
@@ -232,7 +232,7 @@ class ClientesUI(QWidget):
                     item.setForeground(QColor('#991b1b'))
                 self.table.setItem(row, col, item)
 
-        self.stats_label.setText(f"Encontrados: {len(clientes)} clientes")
+        self.stats_label.setText(f"{etiqueta}: {len(clientes)} clientes")
 
     # ------------------------------------------------------------------
     #  Acciones
@@ -703,6 +703,8 @@ class FormularioCliente(QDialog):
         if cliente:
             self.cargar_datos()
 
+        from ui.widgets import hacer_dialogo_responsivo
+        hacer_dialogo_responsivo(self, 600, 700)
         self.exec()
 
     def crear_formulario(self):
@@ -818,22 +820,16 @@ class FormularioCliente(QDialog):
         btn_guardar = QPushButton(f"{ICONS['guardar']} Guardar")
         btn_guardar.setFont(make_font(FONTS['body_bold']))
         btn_guardar.setCursor(QCursor(Qt.PointingHandCursor))
-        btn_guardar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 10px 20px; }}"
-            f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
-        )
+        btn_guardar.setMinimumHeight(42)
+        btn_guardar.setStyleSheet(button_qss('success'))
         btn_guardar.clicked.connect(self.guardar)
         btn_layout.addWidget(btn_guardar)
 
         btn_cancelar = QPushButton(f"{ICONS['cancelar']} Cancelar")
         btn_cancelar.setFont(make_font(FONTS['body']))
         btn_cancelar.setCursor(QCursor(Qt.PointingHandCursor))
-        btn_cancelar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['secondary']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 10px 20px; }}"
-            f"QPushButton:hover {{ background: #475569; }}"
-        )
+        btn_cancelar.setMinimumHeight(42)
+        btn_cancelar.setStyleSheet(button_qss('ghost'))
         btn_cancelar.clicked.connect(self.reject)
         btn_layout.addWidget(btn_cancelar)
 

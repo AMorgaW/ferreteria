@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Diálogo para buscar y seleccionar productos (PySide6)
 """
@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QAbstractItemView
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from ui_config import COLORS, FONTS, make_font
 
 
@@ -17,6 +17,10 @@ class BuscarProductoDialog(QDialog):
         super().__init__(parent)
         self.productos_repo = productos_repo
         self.producto_seleccionado = None
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self.cargar_productos)
 
         self.crear_ventana()
         self.cargar_productos()
@@ -59,7 +63,7 @@ class BuscarProductoDialog(QDialog):
         self.search_entry = QLineEdit()
         self.search_entry.setFont(make_font(FONTS['body']))
         self.search_entry.setPlaceholderText("Escriba para buscar...")
-        self.search_entry.textChanged.connect(self.cargar_productos)
+        self.search_entry.textChanged.connect(lambda: self._search_timer.start())
         self.search_entry.setFocus()
         search_layout.addWidget(self.search_entry)
 
@@ -97,24 +101,26 @@ class BuscarProductoDialog(QDialog):
         btn_layout = QHBoxLayout(btn_frame)
         btn_layout.setContentsMargins(20, 15, 20, 15)
 
-        btn_seleccionar = QPushButton("[OK] Seleccionar")
+        btn_seleccionar = QPushButton("✓  Seleccionar")
         btn_seleccionar.setFont(make_font(FONTS['body_bold']))
         btn_seleccionar.setCursor(Qt.PointingHandCursor)
+        btn_seleccionar.setMinimumHeight(40)
         btn_seleccionar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 10px 25px; }}"
-            f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
+            f"QPushButton {{ background: {COLORS['accent']}; color: {COLORS['on_accent']}; border: none; "
+            f"border-radius: 9px; padding: 10px 25px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['accent_hover']}; }}"
         )
         btn_seleccionar.clicked.connect(self.seleccionar_producto)
         btn_layout.addWidget(btn_seleccionar)
 
-        btn_cancelar = QPushButton("[ERROR] Cancelar")
+        btn_cancelar = QPushButton("Cancelar")
         btn_cancelar.setFont(make_font(FONTS['body']))
         btn_cancelar.setCursor(Qt.PointingHandCursor)
+        btn_cancelar.setMinimumHeight(40)
         btn_cancelar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['secondary']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 10px 25px; }}"
-            f"QPushButton:hover {{ background: #4b5563; }}"
+            f"QPushButton {{ background: {COLORS['bg_primary']}; color: {COLORS['text_body']}; "
+            f"border: 1px solid {COLORS['border_input']}; border-radius: 9px; padding: 10px 25px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['bg_hover']}; border-color: {COLORS['primary_border']}; }}"
         )
         btn_cancelar.clicked.connect(self.reject)
         btn_layout.addWidget(btn_cancelar)
@@ -128,7 +134,10 @@ class BuscarProductoDialog(QDialog):
 
         try:
             termino = self.search_entry.text().strip()
-            productos = self.productos_repo.buscar_productos(termino)
+            if self.productos_repo.cache_disponible():
+                productos = self.productos_repo.buscar_productos_cache(termino, limite=120)
+            else:
+                productos = self.productos_repo.buscar_productos(termino, limite=120)
 
             for row, p in enumerate(productos):
                 self.table.insertRow(row)

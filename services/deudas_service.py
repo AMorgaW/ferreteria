@@ -221,5 +221,5 @@ class DeudasService:
             
             dias = (datetime.now() - fecha).days
             return max(0, dias)
-        except:
+        except Exception:
             return 0

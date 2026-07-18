@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Interfaz de Usuario para Reportes y Estadísticas (PySide6)
 """
@@ -13,6 +13,7 @@ from PySide6.QtGui import QFont, QColor, QPainter, QPen, QBrush
 
 from datetime import datetime, timedelta
 from ui_config import COLORS, FONTS, ICONS, make_font
+from formato import formatear_stock
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -339,13 +340,14 @@ def _setup_table(table, columns, row_height=32):
     table.setSelectionMode(QAbstractItemView.SingleSelection)
     table.setEditTriggers(QAbstractItemView.NoEditTriggers)
     table.setAlternatingRowColors(True)
+    table.setShowGrid(False)
     table.horizontalHeader().setStretchLastSection(True)
     table.setStyleSheet(
-        "QTableWidget { background: white; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: none; }"
-        "QTableWidget::item { padding: 4px; }"
-        "QTableWidget::item:selected { background: #dbeafe; color: #1e3a5f; }"
-        "QHeaderView::section { background: #1e40af; color: white; font-weight: bold; "
-        "padding: 6px; border: none; font-size: 10pt; }"
+        f"QTableWidget {{ background: white; alternate-background-color: {COLORS['table_row_alt']}; gridline-color: transparent; border: 1px solid {COLORS['border']}; border-radius: 12px; }}"
+        "QTableWidget::item { padding: 7px 6px; }"
+        f"QTableWidget::item:selected {{ background: {COLORS['table_selection']}; color: {COLORS['text_primary']}; }}"
+        f"QHeaderView::section {{ background: {COLORS['table_header']}; color: {COLORS['table_header_fg']}; font-weight: 500; "
+        "padding: 10px 8px; border: none; font-size: 10pt; }"
     )
 
 
@@ -393,41 +395,31 @@ class ReportesUI(QWidget):
         menu_frame = QFrame()
         menu_frame.setStyleSheet("background: white; border: 1px solid #d1d5db; border-radius: 8px;")
         menu_layout = QVBoxLayout(menu_frame)
-        menu_layout.setContentsMargins(30, 30, 30, 30)
-        menu_layout.setAlignment(Qt.AlignCenter)
+        menu_layout.setContentsMargins(30, 24, 30, 30)
+        menu_layout.setAlignment(Qt.AlignTop)
 
         # Grid de botones
         grid = QGridLayout()
         grid.setSpacing(10)
 
         reportes = [
-            ("📊 Ventas por Período", self.reporte_ventas_periodo, COLORS['primary']),
-            ("💰 Productos Más Vendidos", self.reporte_top_productos, COLORS['success']),
-            ("💳 Ventas por Método de Pago", self.reporte_metodos_pago, COLORS['info']),
-            ("📈 Estadísticas Generales", self.reporte_estadisticas, COLORS['primary']),
-            ("📊 Comparativa de Períodos", self.reporte_comparativa, COLORS['warning']),
-            ("💹 Reporte de Rentabilidad", self.reporte_rentabilidad, COLORS['success']),
-            ("📋 Cuentas por Cobrar", self.reporte_cuentas_cobrar, '#8b5cf6'),
-            ("🔄 Rotación de Inventario", self.reporte_rotacion, COLORS['danger']),
-            ("💵 Flujo de Caja", self.reporte_flujo_caja, '#0891b2'),
-            ("📅 Reporte del Día", self.reporte_del_dia, '#0f766e'),
+            ("📊", "Ventas por período", self.reporte_ventas_periodo, COLORS['primary']),
+            ("💰", "Productos más vendidos", self.reporte_top_productos, COLORS['success']),
+            ("💳", "Ventas por método de pago", self.reporte_metodos_pago, COLORS['info']),
+            ("📈", "Estadísticas generales", self.reporte_estadisticas, COLORS['primary']),
+            ("📊", "Comparativa de períodos", self.reporte_comparativa, COLORS['warning']),
+            ("💹", "Reporte de rentabilidad", self.reporte_rentabilidad, COLORS['success']),
+            ("📋", "Cuentas por cobrar", self.reporte_cuentas_cobrar, '#534ab7'),
+            ("🔄", "Rotación de inventario", self.reporte_rotacion, COLORS['danger']),
+            ("💵", "Flujo de caja", self.reporte_flujo_caja, '#2f6fb0'),
+            ("📅", "Reporte del día", self.reporte_del_dia, '#0f6e56'),
         ]
 
         row_i = 0
         col_i = 0
-        for texto, comando, color in reportes:
-            btn = QPushButton(texto)
-            btn.setFont(make_font(FONTS['body']))
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setMinimumHeight(50)
-            dark = _oscurecer(color)
-            btn.setStyleSheet(
-                f"QPushButton {{ background: {color}; color: white; border: none; "
-                f"border-radius: 6px; padding: 15px 20px; text-align: center; }}"
-                f"QPushButton:hover {{ background: {dark}; }}"
-            )
-            btn.clicked.connect(comando)
-            grid.addWidget(btn, row_i, col_i)
+        for icono, texto, comando, color in reportes:
+            card = self._crear_tarjeta_reporte(icono, texto, color, comando)
+            grid.addWidget(card, row_i, col_i)
             col_i += 1
             if col_i > 1:
                 col_i = 0
@@ -438,6 +430,52 @@ class ReportesUI(QWidget):
         menu_layout.addLayout(grid)
         frame_layout.addWidget(menu_frame, 1)
         main_layout.addWidget(main_frame)
+
+    def _crear_tarjeta_reporte(self, icono, texto, color, comando):
+        """Tarjeta de reporte: barra de acento vertical (4px) a la izquierda,
+        ícono + título y chevron a la derecha. Clic abre la misma ventana que
+        antes (no cambia comportamiento)."""
+        card = QFrame()
+        card.setCursor(Qt.PointingHandCursor)
+        card.setObjectName("repCard")
+        card.setStyleSheet(
+            f"#repCard {{ background: {COLORS['bg_primary']};"
+            f" border: 1px solid {COLORS['border']}; border-radius: 12px; }}"
+            f"#repCard:hover {{ background: {COLORS['bg_hover']}; }}"
+        )
+        row = QHBoxLayout(card)
+        row.setContentsMargins(0, 0, 14, 0)
+        row.setSpacing(12)
+
+        # Barra de acento vertical (4px)
+        barra = QFrame()
+        barra.setFixedWidth(4)
+        barra.setStyleSheet(
+            f"background: {color}; border-top-left-radius: 12px;"
+            f" border-bottom-left-radius: 12px;")
+        row.addWidget(barra)
+
+        ico = QLabel(icono)
+        ico.setStyleSheet("background: transparent; border: none; font-size: 15pt;")
+        row.addSpacing(6)
+        row.addWidget(ico)
+
+        lbl = QLabel(texto)
+        lbl.setFont(make_font(FONTS['body']))
+        lbl.setStyleSheet(
+            f"color: {COLORS['text_primary']}; background: transparent; border: none;")
+        row.addWidget(lbl)
+        row.addStretch()
+
+        chevron = QLabel("›")
+        chevron.setStyleSheet(
+            f"color: {COLORS['text_light']}; background: transparent;"
+            f" border: none; font-size: 16pt;")
+        row.addWidget(chevron)
+
+        card.setMinimumHeight(58)
+        card.mousePressEvent = lambda e, c=comando: c()
+        return card
 
     def _oscurecer(self, hex_color):
         return _oscurecer(hex_color)
@@ -484,10 +522,10 @@ class ReportesUI(QWidget):
 class VentanaTopProductos(QDialog):
     """Dashboard de Top Productos Vendidos con KPIs, tabla moderna y alertas de stock"""
 
-    AZUL = '#1e3a5f'
-    AZUL_CLARO = '#2563eb'
-    AZUL_HEADER = '#1e40af'
-    VERDE = '#059669'
+    AZUL = '#0f1b30'
+    AZUL_CLARO = '#2f6fb0'
+    AZUL_HEADER = '#0f1b30'
+    VERDE = '#1d9e75'
     VERDE_CLARO = '#10b981'
     NARANJA = '#f59e0b'
     ROJO = '#ef4444'
@@ -816,10 +854,10 @@ class VentanaTopProductos(QDialog):
                 (rank_txt, Qt.AlignCenter, None),
                 (p.get('nombre', ''), Qt.AlignLeft | Qt.AlignVCenter, None),
                 (p.get('categoria', ''), Qt.AlignLeft | Qt.AlignVCenter, None),
-                (str(p.get('cantidad_vendida', 0)), Qt.AlignCenter, None),
+                (formatear_stock(p.get('cantidad_vendida', 0)), Qt.AlignCenter, None),
                 (f"$ {p.get('monto_total', 0):,.2f}", Qt.AlignRight | Qt.AlignVCenter, None),
                 (f"{p.get('porcentaje_ingresos', 0)}%", Qt.AlignCenter, None),
-                (f"{stock} {unidad}", Qt.AlignCenter, None),
+                (f"{formatear_stock(stock, p.get('permite_decimales'))} {unidad}", Qt.AlignCenter, None),
                 (estado_txt, Qt.AlignCenter, estado_color),
             ]
 
@@ -831,7 +869,23 @@ class VentanaTopProductos(QDialog):
                 self.table.setItem(idx, col, item)
 
     def _exportar(self):
-        QMessageBox.information(self, "Exportar", "Funcionalidad de exportación en desarrollo.")
+        from PySide6.QtWidgets import QTableWidget, QFileDialog
+        import exportar as _exp
+        tabla = self.findChild(QTableWidget)
+        if tabla is None or tabla.rowCount() == 0:
+            QMessageBox.information(self, "Exportar", "No hay datos para exportar.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar a Excel", _exp.nombre_sugerido("reporte"), "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            _exp.exportar_tabla_qt(tabla, path)
+            QMessageBox.information(self, "Exportación exitosa", f"Exportado a:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al exportar", str(exc))
 
     def _imprimir(self):
         QMessageBox.information(self, "Imprimir", "Funcionalidad de impresión en desarrollo.")
@@ -844,10 +898,10 @@ class VentanaTopProductos(QDialog):
 class VentanaMetodosPago(QDialog):
     """Dashboard compacto de Ventas por Método de Pago"""
 
-    AZUL = '#1e3a5f'
-    AZUL_CLARO = '#2563eb'
-    AZUL_HEADER = '#1e40af'
-    VERDE = '#059669'
+    AZUL = '#0f1b30'
+    AZUL_CLARO = '#2f6fb0'
+    AZUL_HEADER = '#0f1b30'
+    VERDE = '#1d9e75'
     VERDE_CLARO = '#10b981'
     NARANJA = '#f59e0b'
     ROJO = '#ef4444'
@@ -1278,7 +1332,23 @@ class VentanaMetodosPago(QDialog):
         self._dibujar_tabla(self.datos)
 
     def _exportar(self):
-        QMessageBox.information(self, "Exportar", "Funcionalidad de exportación en desarrollo.")
+        from PySide6.QtWidgets import QTableWidget, QFileDialog
+        import exportar as _exp
+        tabla = self.findChild(QTableWidget)
+        if tabla is None or tabla.rowCount() == 0:
+            QMessageBox.information(self, "Exportar", "No hay datos para exportar.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar a Excel", _exp.nombre_sugerido("reporte"), "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            _exp.exportar_tabla_qt(tabla, path)
+            QMessageBox.information(self, "Exportación exitosa", f"Exportado a:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al exportar", str(exc))
 
     def _imprimir(self):
         QMessageBox.information(self, "Imprimir", "Funcionalidad de impresión en desarrollo.")
@@ -1291,9 +1361,9 @@ class VentanaMetodosPago(QDialog):
 class VentanaEstadisticasDashboard(QDialog):
     """Dashboard visual de Estadísticas Generales con tarjetas KPI agrupadas."""
 
-    AZUL_HEADER = '#1e40af'
-    AZUL_COBALT = '#2563eb'
-    VERDE = '#059669'
+    AZUL_HEADER = '#0f1b30'
+    AZUL_COBALT = '#2f6fb0'
+    VERDE = '#1d9e75'
     VERDE_CLARO = '#10b981'
     ROJO = '#ef4444'
     NARANJA = '#f59e0b'
@@ -1490,7 +1560,23 @@ class VentanaEstadisticasDashboard(QDialog):
             return "$0.00"
 
     def _exportar(self):
-        QMessageBox.information(self, "Exportar", "Funcionalidad de exportación en desarrollo.")
+        from PySide6.QtWidgets import QTableWidget, QFileDialog
+        import exportar as _exp
+        tabla = self.findChild(QTableWidget)
+        if tabla is None or tabla.rowCount() == 0:
+            QMessageBox.information(self, "Exportar", "No hay datos para exportar.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar a Excel", _exp.nombre_sugerido("reporte"), "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            _exp.exportar_tabla_qt(tabla, path)
+            QMessageBox.information(self, "Exportación exitosa", f"Exportado a:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al exportar", str(exc))
 
     def _imprimir(self):
         QMessageBox.information(self, "Imprimir", "Funcionalidad de impresión en desarrollo.")
@@ -1618,9 +1704,9 @@ class VentanaReporte(QDialog):
 class VentanaRentabilidadDashboard(QDialog):
     """Dashboard visual de Rentabilidad con tarjetas KPI + gráfica + top productos."""
 
-    AZUL_HEADER = '#1e40af'
-    AZUL_COBALT = '#2563eb'
-    VERDE = '#059669'
+    AZUL_HEADER = '#0f1b30'
+    AZUL_COBALT = '#2f6fb0'
+    VERDE = '#1d9e75'
     VERDE_CLARO = '#10b981'
     NARANJA = '#f59e0b'
     ROJO = '#ef4444'
@@ -1838,7 +1924,7 @@ class VentanaRentabilidadDashboard(QDialog):
         table.setColumnWidth(2, 90)
         table.setStyleSheet(
             "QTableWidget { background: white; alternate-background-color: #f8fafc; border: none; gridline-color: #eef2f7; }"
-            "QHeaderView::section { background: #eef2f7; color: #64748b; font-weight: bold; "
+            "QHeaderView::section { background: #eef2f7; color: #64748b; font-weight: 500; "
             "padding: 3px; border: none; font-size: 8pt; }"
         )
 
@@ -1902,7 +1988,23 @@ class VentanaRentabilidadDashboard(QDialog):
             return "$0"
 
     def _exportar(self):
-        QMessageBox.information(self, "Exportar", "Funcionalidad de exportación en desarrollo.")
+        from PySide6.QtWidgets import QTableWidget, QFileDialog
+        import exportar as _exp
+        tabla = self.findChild(QTableWidget)
+        if tabla is None or tabla.rowCount() == 0:
+            QMessageBox.information(self, "Exportar", "No hay datos para exportar.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar a Excel", _exp.nombre_sugerido("reporte"), "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            _exp.exportar_tabla_qt(tabla, path)
+            QMessageBox.information(self, "Exportación exitosa", f"Exportado a:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al exportar", str(exc))
 
     def _imprimir(self):
         QMessageBox.information(self, "Imprimir", "Funcionalidad de impresión en desarrollo.")
@@ -1915,9 +2017,9 @@ class VentanaRentabilidadDashboard(QDialog):
 class VentanaCuentasCobrar(QDialog):
     """Dashboard de Cuentas por Cobrar con KPIs, búsqueda y tabla profesional."""
 
-    AZUL_HEADER = '#1e40af'
-    AZUL_COBALT = '#2563eb'
-    VERDE = '#059669'
+    AZUL_HEADER = '#0f1b30'
+    AZUL_COBALT = '#2f6fb0'
+    VERDE = '#1d9e75'
     VERDE_CLARO = '#d1fae5'
     NARANJA = '#f59e0b'
     NARANJA_CLARO = '#fef3c7'
@@ -2115,7 +2217,23 @@ class VentanaCuentasCobrar(QDialog):
                 self.table.setItem(i, col, item)
 
     def _exportar(self):
-        QMessageBox.information(self, "Exportar", "Funcionalidad de exportación en desarrollo.")
+        from PySide6.QtWidgets import QTableWidget, QFileDialog
+        import exportar as _exp
+        tabla = self.findChild(QTableWidget)
+        if tabla is None or tabla.rowCount() == 0:
+            QMessageBox.information(self, "Exportar", "No hay datos para exportar.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar a Excel", _exp.nombre_sugerido("reporte"), "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            _exp.exportar_tabla_qt(tabla, path)
+            QMessageBox.information(self, "Exportación exitosa", f"Exportado a:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al exportar", str(exc))
 
     def _imprimir(self):
         QMessageBox.information(self, "Imprimir", "Funcionalidad de impresión en desarrollo.")
@@ -2128,9 +2246,9 @@ class VentanaCuentasCobrar(QDialog):
 class VentanaRotacionInventario(QDialog):
     """Dashboard analítico de Rotación de Inventario con KPIs, tabla y semáforo."""
 
-    AZUL_HEADER = '#1e40af'
-    AZUL_COBALT = '#2563eb'
-    VERDE = '#059669'
+    AZUL_HEADER = '#0f1b30'
+    AZUL_COBALT = '#2f6fb0'
+    VERDE = '#1d9e75'
     VERDE_BG = '#d1fae5'
     AMARILLO = '#d97706'
     AMARILLO_BG = '#fef3c7'
@@ -2340,7 +2458,23 @@ class VentanaRotacionInventario(QDialog):
                 self.table.setItem(i, col, item)
 
     def _exportar(self):
-        QMessageBox.information(self, "Exportar", "Funcionalidad de exportación en desarrollo.")
+        from PySide6.QtWidgets import QTableWidget, QFileDialog
+        import exportar as _exp
+        tabla = self.findChild(QTableWidget)
+        if tabla is None or tabla.rowCount() == 0:
+            QMessageBox.information(self, "Exportar", "No hay datos para exportar.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar a Excel", _exp.nombre_sugerido("reporte"), "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            _exp.exportar_tabla_qt(tabla, path)
+            QMessageBox.information(self, "Exportación exitosa", f"Exportado a:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al exportar", str(exc))
 
     def _imprimir(self):
         QMessageBox.information(self, "Imprimir", "Funcionalidad de impresión en desarrollo.")
@@ -2353,9 +2487,9 @@ class VentanaRotacionInventario(QDialog):
 class VentanaFlujoCajaDashboard(QDialog):
     """Dashboard de Flujo de Caja con KPIs, desglose, gráfica de tendencia."""
 
-    AZUL_HEADER = '#1e40af'
-    AZUL_COBALT = '#2563eb'
-    VERDE = '#059669'
+    AZUL_HEADER = '#0f1b30'
+    AZUL_COBALT = '#2f6fb0'
+    VERDE = '#1d9e75'
     VERDE_CLARO = '#d1fae5'
     NARANJA = '#d97706'
     NARANJA_CLARO = '#fef3c7'
@@ -2639,7 +2773,7 @@ class VentanaFlujoCajaDashboard(QDialog):
         table.setColumnWidth(0, 120)
         table.setStyleSheet(
             "QTableWidget { background: white; alternate-background-color: #f8fafc; border: none; gridline-color: #eef2f7; }"
-            "QHeaderView::section { background: #e2e8f0; color: #0f172a; font-weight: bold; "
+            "QHeaderView::section { background: #e2e8f0; color: #0f172a; font-weight: 500; "
             "padding: 4px; border: none; font-size: 9pt; }"
         )
 
@@ -2673,7 +2807,23 @@ class VentanaFlujoCajaDashboard(QDialog):
                 self._clear_layout(item.layout())
 
     def _exportar(self):
-        QMessageBox.information(self, "Exportar", "Funcionalidad de exportación en desarrollo.")
+        from PySide6.QtWidgets import QTableWidget, QFileDialog
+        import exportar as _exp
+        tabla = self.findChild(QTableWidget)
+        if tabla is None or tabla.rowCount() == 0:
+            QMessageBox.information(self, "Exportar", "No hay datos para exportar.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar a Excel", _exp.nombre_sugerido("reporte"), "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            _exp.exportar_tabla_qt(tabla, path)
+            QMessageBox.information(self, "Exportación exitosa", f"Exportado a:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al exportar", str(exc))
 
     def _imprimir(self):
         QMessageBox.information(self, "Imprimir", "Funcionalidad de impresión en desarrollo.")
@@ -3046,10 +3196,10 @@ class VentanaComparativa(QDialog):
 class VentanaVentasPeriodo(QDialog):
     """Ventana profesional de Reporte de Ventas por Período con KPIs y DataGrid"""
 
-    AZUL = '#1e3a5f'
-    AZUL_CLARO = '#2563eb'
-    AZUL_HEADER = '#1e40af'
-    VERDE = '#059669'
+    AZUL = '#0f1b30'
+    AZUL_CLARO = '#2f6fb0'
+    AZUL_HEADER = '#0f1b30'
+    VERDE = '#1d9e75'
     VERDE_CLARO = '#10b981'
     GRIS_BG = '#f1f5f9'
     GRIS_FILA = '#f8fafc'
@@ -3319,6 +3469,13 @@ class VentanaVentasPeriodo(QDialog):
                 ]
 
                 for col, (text, align, fg) in enumerate(values):
+                    if col == 6:
+                        # Estado como pill (semáforo), igual que el mockup.
+                        fila_bg = '#ffffff' if idx % 2 == 0 else '#fafbfc'
+                        self.table.setItem(idx, col, QTableWidgetItem(''))
+                        self.table.setCellWidget(idx, col,
+                                                 self._pill_estado(estado, fila_bg))
+                        continue
                     item = QTableWidgetItem(text)
                     item.setTextAlignment(align)
                     item.setForeground(QColor(fg))
@@ -3336,6 +3493,37 @@ class VentanaVentasPeriodo(QDialog):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error al generar reporte:\n{str(e)}")
+
+    def _pill_estado(self, estado, fila_bg='#ffffff'):
+        """Devuelve un widget 'pill' (badge redondeado) para la columna Estado,
+        con los colores del semáforo del sistema (igual al mockup). El fondo del
+        contenedor iguala el color de la fila (zebra) para que no aparezca un
+        recuadro blanco detrás del pill."""
+        e = (estado or '').upper()
+        if e == 'COMPLETADA':
+            bg, fg = '#eaf3de', '#3b6d11'
+        elif e == 'PENDIENTE':
+            bg, fg = '#faeeda', '#854f0b'
+        elif e in ('ANULADA', 'CANCELADA'):
+            bg, fg = '#fcebeb', '#a32d2d'
+        else:
+            bg, fg = '#eef1f6', '#64748b'
+        cont = QWidget()
+        cont.setObjectName("estadoPillCont")
+        cont.setStyleSheet(
+            f"QWidget#estadoPillCont {{ background: {fila_bg}; border: none; }}")
+        lay = QHBoxLayout(cont)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setAlignment(Qt.AlignCenter)
+        lbl = QLabel(estado or '')
+        lbl.setObjectName("estadoPillLbl")
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet(
+            f"QLabel#estadoPillLbl {{ background: {bg}; color: {fg};"
+            f" border: none; border-radius: 9px; padding: 2px 11px;"
+            f" font-size: 8pt; font-weight: 500; }}")
+        lay.addWidget(lbl)
+        return cont
 
     def _get_venta_seleccionada(self):
         row = self.table.currentRow()
@@ -3366,7 +3554,23 @@ class VentanaVentasPeriodo(QDialog):
                                 "Funcionalidad de impresión en desarrollo.")
 
     def _exportar(self):
-        QMessageBox.information(self, "Exportar", "Funcionalidad de exportación en desarrollo.")
+        from PySide6.QtWidgets import QTableWidget, QFileDialog
+        import exportar as _exp
+        tabla = self.findChild(QTableWidget)
+        if tabla is None or tabla.rowCount() == 0:
+            QMessageBox.information(self, "Exportar", "No hay datos para exportar.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar a Excel", _exp.nombre_sugerido("reporte"), "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            _exp.exportar_tabla_qt(tabla, path)
+            QMessageBox.information(self, "Exportación exitosa", f"Exportado a:\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error al exportar", str(exc))
 
     def _imprimir(self):
         QMessageBox.information(self, "Imprimir", "Funcionalidad de impresión general en desarrollo.")
@@ -3379,8 +3583,8 @@ class VentanaVentasPeriodo(QDialog):
 class VentanaDetalleVenta(QDialog):
     """Popup con el detalle completo de una venta incluyendo productos"""
 
-    AZUL = '#1e3a5f'
-    VERDE = '#059669'
+    AZUL = '#0f1b30'
+    VERDE = '#1d9e75'
     GRIS_BG = '#f1f5f9'
     GRIS_FILA = '#f8fafc'
     TEXTO = '#0f172a'
@@ -3479,11 +3683,11 @@ class VentanaDetalleVenta(QDialog):
         ]
         _setup_table(self.table, columns, row_height=28)
         self.table.setStyleSheet(
-            "QTableWidget { background: white; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #d1d5db; }"
-            "QTableWidget::item { padding: 4px; }"
-            "QTableWidget::item:selected { background: #dbeafe; color: #1e3a5f; }"
-            f"QHeaderView::section {{ background: {self.AZUL}; color: white; font-weight: bold; "
-            "padding: 4px; border: none; font-size: 9pt; }"
+            f"QTableWidget {{ background: white; alternate-background-color: {COLORS['table_row_alt']}; gridline-color: transparent; border: 1px solid {COLORS['border']}; border-radius: 12px; }}"
+            "QTableWidget::item { padding: 7px 6px; }"
+            f"QTableWidget::item:selected {{ background: {COLORS['table_selection']}; color: {COLORS['text_primary']}; }}"
+            f"QHeaderView::section {{ background: {COLORS['table_header']}; color: {COLORS['table_header_fg']}; font-weight: 500; "
+            "padding: 9px 8px; border: none; font-size: 9pt; }"
         )
 
         tabla_wrapper = QVBoxLayout()
@@ -3593,7 +3797,7 @@ class VentanaDetalleVenta(QDialog):
             for idx, row in enumerate(rows):
                 values = [
                     (row['nombre'], Qt.AlignLeft | Qt.AlignVCenter),
-                    (str(row['cantidad']), Qt.AlignCenter),
+                    (formatear_stock(row['cantidad']), Qt.AlignCenter),
                     (f"$ {row['precio_unitario']:,.2f}", Qt.AlignRight | Qt.AlignVCenter),
                     (f"$ {row['descuento']:,.2f}", Qt.AlignRight | Qt.AlignVCenter),
                     (f"$ {row['subtotal']:,.2f}", Qt.AlignRight | Qt.AlignVCenter),
@@ -3991,9 +4195,9 @@ class VentanaReporteDia(QDialog):
             tbl.setAlternatingRowColors(True)
             tbl.horizontalHeader().setStretchLastSection(True)
             tbl.setStyleSheet(
-                "QTableWidget { background: white; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #e2e8f0; border-radius: 8px; }"
-                "QTableWidget::item { padding: 4px; }"
-                "QHeaderView::section { background: #1e40af; color: white; font-weight: bold; padding: 6px; border: none; }"
+                f"QTableWidget {{ background: white; alternate-background-color: {COLORS['table_row_alt']}; gridline-color: transparent; border: 1px solid {COLORS['border']}; border-radius: 12px; }}"
+                "QTableWidget::item { padding: 7px 6px; }"
+                f"QHeaderView::section {{ background: {COLORS['table_header']}; color: {COLORS['table_header_fg']}; font-weight: 500; padding: 9px 8px; border: none; }}"
             )
 
             for r in egresos_rows:

@@ -1,11 +1,12 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Interfaz para registro de entradas de inventario (PySide6)
 Con entrada en múltiples unidades según categoría del producto
 """
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QComboBox, QFrame, QMessageBox, QRadioButton, QButtonGroup, QSizePolicy
+    QComboBox, QFrame, QMessageBox, QRadioButton, QButtonGroup, QSizePolicy,
+    QScrollArea, QApplication
 )
 from PySide6.QtCore import Qt
 from datetime import datetime
@@ -38,7 +39,11 @@ class EntradaInventarioUI(QDialog):
     def crear_ventana(self):
         """Crea la ventana de entrada"""
         self.setWindowTitle("Entrada de Inventario")
-        self.setFixedSize(600, 650)
+        _scr = (self.screen().availableGeometry() if self.screen()
+                else QApplication.primaryScreen().availableGeometry())
+        _w, _h = 600, min(650, int(_scr.height() * 0.85))
+        self.resize(_w, _h)
+        self.setMaximumHeight(int(_scr.height() * 0.9))
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.setStyleSheet("background: white;")
 
@@ -102,9 +107,9 @@ class EntradaInventarioUI(QDialog):
         btn_buscar_prod.setFont(make_font(FONTS['body']))
         btn_buscar_prod.setCursor(Qt.PointingHandCursor)
         btn_buscar_prod.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['info']}; color: white; border: none; "
-            f"border-radius: 4px; padding: 6px 12px; }}"
-            f"QPushButton:hover {{ background: #0891b2; }}"
+            f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
+            f"border-radius: 8px; padding: 7px 14px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
         )
         btn_buscar_prod.clicked.connect(self.buscar_producto)
         producto_row.addWidget(btn_buscar_prod)
@@ -147,9 +152,9 @@ class EntradaInventarioUI(QDialog):
         btn_buscar_prov.setFont(make_font(FONTS['body']))
         btn_buscar_prov.setCursor(Qt.PointingHandCursor)
         btn_buscar_prov.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['info']}; color: white; border: none; "
-            f"border-radius: 4px; padding: 6px 12px; }}"
-            f"QPushButton:hover {{ background: #0891b2; }}"
+            f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
+            f"border-radius: 8px; padding: 7px 14px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
         )
         btn_buscar_prov.clicked.connect(self.buscar_proveedor)
         proveedor_row.addWidget(btn_buscar_prov)
@@ -210,7 +215,14 @@ class EntradaInventarioUI(QDialog):
         content_layout.addWidget(self.factura_entry)
 
         content_layout.addStretch()
-        main_layout.addWidget(content, 1)
+        # Cuerpo con scroll interno: header y footer quedan fijos (sticky).
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: white; }")
+        scroll.setWidget(content)
+        main_layout.addWidget(scroll, 1)
 
         # Footer
         separator = QFrame()
@@ -230,18 +242,18 @@ class EntradaInventarioUI(QDialog):
         btn_guardar.setCursor(Qt.PointingHandCursor)
         btn_guardar.setStyleSheet(
             f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 12px 38px; }}"
+            f"border-radius: 8px; padding: 12px 38px; font-weight: 500; }}"
             f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
         )
         btn_guardar.clicked.connect(self.guardar_entrada)
 
-        btn_cancelar = QPushButton("❌ Cancelar")
+        btn_cancelar = QPushButton("✕  Cancelar")
         btn_cancelar.setFont(make_font(FONTS['body']))
         btn_cancelar.setCursor(Qt.PointingHandCursor)
         btn_cancelar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['secondary']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 12px 38px; }}"
-            f"QPushButton:hover {{ background: #475569; }}"
+            f"QPushButton {{ background: {COLORS['bg_primary']}; color: {COLORS['text_body']}; "
+            f"border: 1px solid {COLORS['border_input']}; border-radius: 9px; padding: 12px 38px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['bg_hover']}; border-color: {COLORS['primary_border']}; }}"
         )
         btn_cancelar.clicked.connect(self.reject)
 

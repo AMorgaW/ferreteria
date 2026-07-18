@@ -6,10 +6,118 @@ Todos los colores se leen de COLORS (ui_config) — fuente única de verdad.
 from PySide6.QtWidgets import (QFrame, QLabel, QHBoxLayout, QVBoxLayout,
                                 QPushButton, QGraphicsDropShadowEffect,
                                 QWidget, QSizePolicy)
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtCore import Qt, Signal, QPropertyAnimation, QEasingCurve, QSize, QRectF
+from PySide6.QtGui import (QFont, QColor, QIcon, QPixmap, QPainter, QPen,
+                           QBrush, QPainterPath)
 
 from ui_config import COLORS
+
+
+def make_line_icon(name, color='#FFFFFF', size=24):
+    """Crea iconos vectoriales compactos sin depender de fuentes emoji."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.scale(size / 24.0, size / 24.0)
+    pen = QPen(QColor(color), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+
+    if name in ('dashboard', 'grid'):
+        for x, y in ((3, 3), (13, 3), (3, 13), (13, 13)):
+            painter.drawRoundedRect(QRectF(x, y, 8, 8), 1.4, 1.4)
+    elif name in ('productos', 'box'):
+        painter.drawRect(QRectF(4, 7, 16, 13))
+        painter.drawLine(4, 7, 12, 3)
+        painter.drawLine(12, 3, 20, 7)
+        painter.drawLine(12, 3, 12, 20)
+        painter.drawLine(4, 7, 12, 11)
+        painter.drawLine(20, 7, 12, 11)
+    elif name in ('clientes', 'usuarios'):
+        painter.drawEllipse(QRectF(8, 3, 8, 8))
+        painter.drawArc(QRectF(4, 11, 16, 10), 0, 180 * 16)
+        if name == 'clientes':
+            painter.drawEllipse(QRectF(2, 7, 5, 5))
+            painter.drawEllipse(QRectF(17, 7, 5, 5))
+    elif name in ('proveedores', 'brand'):
+        path = QPainterPath()
+        path.moveTo(3, 10); path.lineTo(12, 3); path.lineTo(21, 10)
+        painter.drawPath(path)
+        painter.drawRect(QRectF(5, 10, 14, 11))
+        painter.drawRect(QRectF(10, 14, 4, 7))
+    elif name in ('compras', 'cart', 'sales_today'):
+        painter.drawLine(3, 5, 6, 5)
+        painter.drawLine(6, 5, 8, 16)
+        painter.drawLine(8, 16, 19, 16)
+        painter.drawLine(8, 8, 21, 8)
+        painter.drawLine(21, 8, 19, 14)
+        painter.drawEllipse(QRectF(8, 18, 2, 2))
+        painter.drawEllipse(QRectF(17, 18, 2, 2))
+    elif name in ('ventas', 'coin'):
+        painter.drawEllipse(QRectF(4, 4, 16, 16))
+        painter.drawLine(12, 7, 12, 17)
+        painter.drawArc(QRectF(8, 7, 8, 5), 30 * 16, 230 * 16)
+        painter.drawArc(QRectF(8, 12, 8, 5), 210 * 16, 230 * 16)
+    elif name in ('movimientos', 'clipboard'):
+        painter.drawRoundedRect(QRectF(5, 4, 14, 17), 1.5, 1.5)
+        painter.drawRoundedRect(QRectF(8, 2, 8, 4), 1, 1)
+        painter.drawLine(8, 10, 16, 10)
+        painter.drawLine(8, 14, 16, 14)
+        painter.drawLine(8, 18, 13, 18)
+    elif name in ('caja', 'credit'):
+        painter.drawRoundedRect(QRectF(3, 6, 18, 13), 2, 2)
+        painter.drawLine(3, 10, 21, 10)
+        painter.drawLine(7, 15, 12, 15)
+        if name == 'credit':
+            painter.drawEllipse(QRectF(15, 13, 7, 7))
+    elif name in ('reportes', 'chart', 'sales_month'):
+        painter.drawLine(4, 20, 21, 20)
+        painter.drawLine(4, 20, 4, 4)
+        painter.drawRoundedRect(QRectF(7, 12, 3, 7), 1, 1)
+        painter.drawRoundedRect(QRectF(12, 8, 3, 11), 1, 1)
+        painter.drawRoundedRect(QRectF(17, 4, 3, 15), 1, 1)
+    elif name in ('configuracion', 'settings'):
+        painter.drawEllipse(QRectF(8, 8, 8, 8))
+        for x1, y1, x2, y2 in ((12, 2, 12, 6), (12, 18, 12, 22),
+                               (2, 12, 6, 12), (18, 12, 22, 12),
+                               (5, 5, 8, 8), (16, 16, 19, 19),
+                               (5, 19, 8, 16), (16, 8, 19, 5)):
+            painter.drawLine(x1, y1, x2, y2)
+    elif name == 'stock':
+        path = QPainterPath()
+        path.moveTo(12, 3); path.lineTo(22, 20); path.lineTo(2, 20); path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawLine(12, 8, 12, 14)
+        painter.drawPoint(12, 17)
+    elif name == 'calendar':
+        painter.drawRoundedRect(QRectF(4, 5, 16, 15), 2, 2)
+        painter.drawLine(4, 9, 20, 9)
+        painter.drawLine(8, 3, 8, 7)
+        painter.drawLine(16, 3, 16, 7)
+    elif name == 'refresh':
+        painter.drawArc(QRectF(4, 4, 16, 16), 35 * 16, 285 * 16)
+        painter.drawLine(18, 4, 20, 8)
+        painter.drawLine(18, 4, 14, 5)
+    elif name == 'alertas':
+        painter.drawArc(QRectF(6, 5, 12, 12), 0, 180 * 16)
+        painter.drawLine(6, 11, 6, 17)
+        painter.drawLine(18, 11, 18, 17)
+        painter.drawLine(5, 17, 19, 17)
+        painter.drawArc(QRectF(10, 17, 4, 4), 180 * 16, 180 * 16)
+    elif name == 'support':
+        painter.drawArc(QRectF(4, 4, 16, 16), 0, 180 * 16)
+        painter.drawLine(4, 12, 4, 18)
+        painter.drawLine(20, 12, 20, 18)
+        painter.drawLine(20, 18, 16, 18)
+    elif name == 'salir':
+        painter.drawRect(QRectF(4, 3, 11, 18))
+        painter.drawLine(10, 12, 22, 12)
+        painter.drawLine(18, 8, 22, 12)
+        painter.drawLine(18, 16, 22, 12)
+
+    painter.end()
+    return QIcon(pixmap)
 
 
 class ShadowCard(QFrame):
@@ -30,7 +138,7 @@ class ShadowCard(QFrame):
         super().__init__(parent)
         bg_card = bg_card or COLORS['bg_primary']
         shadow_color = shadow_color or COLORS['shadow_card']
-        border_css = f"border: 1px solid {border_color};" if border_color else "border: none;"
+        border_css = f"border: 1px solid {border_color or COLORS['border']};"
         self.setStyleSheet(f"""
             ShadowCard {{
                 background: {bg_card};
@@ -47,9 +155,91 @@ class ShadowCard(QFrame):
         self.setContentsMargins(*content_margins)
 
 
+def button_qss(kind='primary', radius=9):
+    """QSS inline reutilizable para botones, con el lenguaje visual FERREPRO.
+    kind: primary | success | dark | ghost | ghost_danger | danger | warning."""
+    C = COLORS
+    base = (f"QPushButton {{ border-radius: {radius}px; padding: 9px 16px; }}")
+    specs = {
+        'primary': (C['accent'], C['on_accent'], 'none', '500', C['accent_hover']),
+        'success': (C['success'], 'white', 'none', '500', C['success_dark']),
+        'dark': (C['primary'], 'white', 'none', '500', C['primary_dark']),
+        'danger': (C['danger'], 'white', 'none', '500', C['danger_dark']),
+        'warning': (C['warning'], 'white', 'none', '500', C['warning_dark']),
+    }
+    if kind == 'ghost':
+        return (
+            f"QPushButton {{ background: {C['bg_primary']}; color: {C['text_body']};"
+            f" border: 1px solid {C['border_input']}; border-radius: {radius}px;"
+            f" padding: 9px 16px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {C['bg_hover']}; border-color: {C['primary_border']}; }}"
+        )
+    if kind == 'ghost_danger':
+        return (
+            f"QPushButton {{ background: {C['bg_primary']}; color: {C['danger']};"
+            f" border: 1px solid {C['danger']}; border-radius: {radius}px;"
+            f" padding: 9px 16px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {C['danger']}; color: white; }}"
+        )
+    bg, fg, border, weight, hover = specs.get(kind, specs['primary'])
+    return (
+        f"QPushButton {{ background: {bg}; color: {fg}; border: {border};"
+        f" border-radius: {radius}px; padding: 9px 16px; font-weight: {weight}; }}"
+        f"QPushButton:hover {{ background: {hover}; }}"
+    )
+
+
+class AnimatedCard(ShadowCard):
+    """
+    ShadowCard que eleva su sombra suavemente al pasar el mouse
+    (micro-interacción natural vía QPropertyAnimation sobre el blur).
+    """
+
+    def __init__(self, *args, hover_blur=None, **kwargs):
+        base_blur = kwargs.get('shadow_blur', 18)
+        super().__init__(*args, **kwargs)
+        self._base_blur = base_blur
+        self._hover_blur = hover_blur if hover_blur is not None else base_blur + 12
+        self._shadow_effect = self.graphicsEffect()
+        self._hover_anim = QPropertyAnimation(self._shadow_effect, b"blurRadius", self)
+        self._hover_anim.setDuration(160)
+        self._hover_anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def _animate_blur(self, value):
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._shadow_effect.blurRadius())
+        self._hover_anim.setEndValue(value)
+        self._hover_anim.start()
+
+    def enterEvent(self, event):
+        self._animate_blur(self._hover_blur)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate_blur(self._base_blur)
+        super().leaveEvent(event)
+
+
+class Badge(QLabel):
+    """Etiqueta tipo pill (estado / conteo)."""
+
+    def __init__(self, text='', parent=None, bg=None, fg='white',
+                 font_size=7, bold=True):
+        super().__init__(text, parent)
+        bg = bg or COLORS['success']
+        weight = '500'
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(f"""
+            background: {bg}; color: {fg};
+            border-radius: 9px; padding: 2px 10px;
+            font-size: {font_size}pt; font-weight: {weight};
+        """)
+        self.setFixedHeight(20)
+
+
 class HoverButton(QPushButton):
     """
-    Botón del sidebar con efecto hover suave y estado activo (pill azul claro).
+    Botón del sidebar con efecto hover suave y estado activo (pill).
     """
 
     def __init__(self, parent=None, text='', icon='',
@@ -58,7 +248,8 @@ class HoverButton(QPushButton):
                  hover_bg=None, hover_fg=None,
                  active_bg=None, active_fg=None,
                  padx=18, pady=10, command=None):
-        display = f"{icon}  {text}" if icon else text
+        self._icon_key = icon if icon and icon.isascii() else None
+        display = text if self._icon_key else (f"{icon}  {text}" if icon else text)
         super().__init__(display, parent)
         self.setCursor(Qt.PointingHandCursor)
 
@@ -80,20 +271,29 @@ class HoverButton(QPushButton):
     def _apply_style(self):
         bg = self._active_bg if self._is_active else self._bg
         fg = self._active_fg if self._is_active else self._fg
-        weight = '600' if self._is_active else 'normal'
+        weight = '500' if self._is_active else 'normal'
         hover_bg = self._active_bg if self._is_active else self._hover_bg
         hover_fg = self._active_fg if self._is_active else self._hover_fg
+        if self._icon_key:
+            self.setIcon(make_line_icon(self._icon_key, fg, 20))
+            self.setIconSize(QSize(20, 20))
         self.setStyleSheet(f"""
             QPushButton {{
                 background: {bg}; color: {fg};
-                border: none; border-radius: 8px;
-                text-align: left; padding: 8px 14px;
+                border: none; border-radius: 9px;
+                text-align: left; padding: 10px 14px;
                 font-family: '{self._font_family}';
                 font-size: {self._font_size}pt;
                 font-weight: {weight};
             }}
             QPushButton:hover {{
                 background: {hover_bg}; color: {hover_fg};
+            }}
+            QPushButton:pressed {{
+                background: {COLORS['primary_dark']}; color: white;
+            }}
+            QPushButton:focus {{
+                border: 1px solid {COLORS['accent']};
             }}
         """)
 
@@ -120,7 +320,7 @@ class ActionButton(QPushButton):
         fg = fg or COLORS['text_secondary']
         border_color = border_color or COLORS['border_input']
         hbg = hover_bg or self._lighten(bg)
-        weight = 'bold' if bold else 'normal'
+        weight = '500' if bold else 'normal'
         self.setStyleSheet(f"""
             QPushButton {{
                 background: {bg}; color: {fg};
@@ -132,6 +332,16 @@ class ActionButton(QPushButton):
             }}
             QPushButton:hover {{
                 background: {hbg};
+            }}
+            QPushButton:pressed {{
+                background: {self._lighten(hbg)};
+            }}
+            QPushButton:focus {{
+                border: 2px solid {COLORS['primary_border']};
+            }}
+            QPushButton:disabled {{
+                background: {COLORS['bg_pressed']}; color: {COLORS['text_light']};
+                border-color: {COLORS['border']};
             }}
         """)
         if command:
@@ -148,9 +358,10 @@ class ActionButton(QPushButton):
             return '#f0f0f0'
 
 
-class KpiCard(ShadowCard):
+class KpiCard(AnimatedCard):
     """
     Tarjeta KPI con título, valor, subtítulo y badge opcional.
+    Eleva su sombra al pasar el mouse (hereda de AnimatedCard).
     """
 
     def __init__(self, parent=None, title='', value='', subtitle='',
@@ -169,7 +380,7 @@ class KpiCard(ShadowCard):
 
         title_lbl = QLabel(title)
         title_lbl.setStyleSheet(f"""
-            font-size: 7pt; font-weight: 600; color: {title_color};
+            font-size: 7pt; font-weight: 500; color: {title_color};
             letter-spacing: 0.8px; text-transform: uppercase;
             background: transparent; border: none;
         """)
@@ -179,7 +390,7 @@ class KpiCard(ShadowCard):
         row.setSpacing(10)
         val_lbl = QLabel(value)
         val_lbl.setStyleSheet(f"""
-            font-size: 20pt; font-weight: bold; color: {value_color};
+            font-size: 20pt; font-weight: 500; color: {value_color};
             background: transparent; border: none;
         """)
         row.addWidget(val_lbl)
@@ -189,7 +400,7 @@ class KpiCard(ShadowCard):
             badge.setStyleSheet(f"""
                 background: {badge_color}; color: white;
                 border-radius: 9px; padding: 2px 10px;
-                font-size: 7pt; font-weight: bold;
+                font-size: 7pt; font-weight: 500;
             """)
             badge.setFixedHeight(20)
             row.addWidget(badge, 0, Qt.AlignVCenter)
@@ -211,3 +422,51 @@ class KpiCard(ShadowCard):
 
     def set_value(self, text):
         self._value_label.setText(text)
+
+
+def hacer_dialogo_responsivo(dialog, ancho_pref=None, alto_pref=None,
+                             alto_max_factor=0.9):
+    """Garantiza que un QDialog nunca exceda el tamaño de la pantalla y que,
+    si su contenido no cabe en lo alto, pueda desplazarse con scroll — de modo
+    que ningún control (incluidos los botones de acción) quede inalcanzable en
+    pantallas pequeñas o laptops.
+
+    No modifica widgets, campos ni lógica: reubica el layout ya construido del
+    diálogo dentro de un QScrollArea y ajusta tamaño/posición. Llamar DESPUÉS
+    de construir todo el contenido y ANTES de exec().
+    """
+    from PySide6.QtWidgets import QScrollArea, QApplication
+    scr = (dialog.screen().availableGeometry() if dialog.screen()
+           else QApplication.primaryScreen().availableGeometry())
+
+    w = ancho_pref or dialog.width()
+    h = alto_pref or dialog.height()
+    w = min(w, int(scr.width() * 0.95))
+    h_max = int(scr.height() * alto_max_factor)
+    h = min(h, h_max)
+
+    old_layout = dialog.layout()
+    if old_layout is not None:
+        # Mover el layout (y todos sus hijos) a un contenedor desplazable.
+        contenido = QWidget()
+        contenido.setLayout(old_layout)
+        scroll = QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.setWidget(contenido)
+        nuevo = QVBoxLayout(dialog)
+        nuevo.setContentsMargins(0, 0, 0, 0)
+        nuevo.setSpacing(0)
+        nuevo.addWidget(scroll)
+
+    # Liberar cualquier tamaño fijo previo y limitar a la pantalla.
+    dialog.setMinimumSize(0, 0)
+    dialog.setMaximumHeight(h_max)
+    dialog.resize(w, h)
+    try:
+        center = scr.center()
+        dialog.move(center.x() - w // 2, center.y() - h // 2)
+    except Exception:
+        pass

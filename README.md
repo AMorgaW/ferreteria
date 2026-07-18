@@ -2,6 +2,24 @@
 
 Aplicación de escritorio para gestión integral de una ferretería. Desarrollada en **Python + PySide6** con base de datos local **SQLite** y sincronización en la nube con **Supabase (PostgreSQL)**.
 
+## Modo Local-First
+
+El sistema incluye un servidor local para que el computador administrador trabaje como base central de la ferreteria y las PCs trabajadoras se conecten por WiFi/LAN sin depender de Supabase para cada accion.
+
+Inicio rapido del servidor local:
+
+```bat
+run_local_server.bat
+```
+
+En las PCs trabajadoras usa la IP local del computador principal, por ejemplo:
+
+```text
+http://192.168.1.10:8000
+```
+
+La sincronizacion con Supabase se ejecuta en segundo plano y usa la cola local `sync_queue`. Consulta [LOCAL_FIRST.md](LOCAL_FIRST.md) para configuracion, endpoints, pruebas manuales y detalles de sincronizacion.
+
 ---
 
 ## Tabla de Contenidos
@@ -235,6 +253,6 @@ Se crean automáticamente al primer inicio:
 | Usuario | Contraseña | Rol |
 |---|---|---|
 | `admin` | `admin123` | Administrador |
-| `empleado` | `emp123` | Vendedor |
+| `empleado` | `empleado123` | Vendedor |
 
 Se recomienda cambiar estas contraseñas desde el módulo **Usuarios** después del primer acceso.

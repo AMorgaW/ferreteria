@@ -22,7 +22,9 @@ class ComprasRepository:
         tipo_compra: str = 'CONTADO',
         observaciones: str = None,
         usuario_id: int = None,
-        monto_pagado_inicial: float = 0.0
+        monto_pagado_inicial: float = 0.0,
+        tipo_pago_inicial: str = None,
+        numero_comprobante_inicial: str = None
     ) -> Tuple[bool, str, Optional[int]]:
         """
         Crea una nueva compra con múltiples productos
@@ -57,16 +59,6 @@ class ComprasRepository:
             if monto_pagado < 0:
                 monto_pagado = 0.0
 
-            saldo_inicial = max(0.0, total - monto_pagado)
-
-            # Determinar estado de pago
-            if monto_pagado <= 0:
-                estado_pago = 'PENDIENTE'
-            elif monto_pagado >= total:
-                estado_pago = 'PAGADO'
-            else:
-                estado_pago = 'PARCIAL'
-
             cursor.execute('''
                 INSERT INTO compras (
                     proveedor_id, numero_factura, fecha, tipo_compra,
@@ -82,12 +74,14 @@ class ComprasRepository:
                 observaciones,
                 usuario_id,
                 'COMPLETADA',
-                estado_pago,
-                monto_pagado,
-                saldo_inicial
+                'PENDIENTE',
+                0,
+                total
             ))
 
             compra_id = cursor.lastrowid
+            from repositories._outbox import encolar
+            encolar(conn, "purchase", compra_id, "create", "compras")
 
             # Insertar detalles de compra y actualizar inventario
             for item in productos:
@@ -102,6 +96,7 @@ class ComprasRepository:
                         compra_id, producto_id, cantidad, precio_unitario, subtotal
                     ) VALUES (?, ?, ?, ?, ?)
                 ''', (compra_id, producto_id, cantidad, precio_unitario, subtotal))
+                encolar(conn, "purchase_detail", cursor.lastrowid, "create", "detalle_compras")
 
                 # Actualizar stock del producto
                 cursor.execute('''
@@ -130,6 +125,41 @@ class ComprasRepository:
                     f"Compra #{compra_id}",
                     obtener_fecha_actual()
                 ))
+                _compra_mov_id = cursor.lastrowid
+
+                # Local-first: sincronizar stock del producto y el movimiento.
+                from repositories._outbox import encolar
+                encolar(conn, "inventory_movement", _compra_mov_id, "create", "movimientos")
+                encolar(conn, "product", producto_id, "update", "productos")
+
+            if monto_pagado > 0:
+                usuario_pago = "Sistema"
+                if usuario_id:
+                    cursor.execute("SELECT username FROM usuarios WHERE id = ?", (usuario_id,))
+                    usuario_row = cursor.fetchone()
+                    if usuario_row:
+                        usuario_pago = usuario_row['username'] if hasattr(usuario_row, 'keys') else usuario_row[0]
+
+                from models import Abono
+                from repositories.abonos_compras_repo import registrar_abono_compra_en_transaccion
+                abono_inicial = Abono(
+                    id_compra=compra_id,
+                    monto_abono=monto_pagado,
+                    fecha_abono=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    tipo_pago=tipo_pago_inicial or 'Efectivo',
+                    numero_comprobante=numero_comprobante_inicial,
+                    usuario=usuario_pago,
+                    observaciones='Pago inicial de compra'
+                )
+                registrar_abono_compra_en_transaccion(conn, cursor, abono_inicial)
+
+            # Auditoría del registro de compra (evento + sincronización).
+            cursor.execute('''
+                INSERT INTO auditoria (usuario_id, accion, modulo, descripcion, ip_address)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (usuario_id, "REGISTRAR_COMPRA", "Compras",
+                  f"Compra #{compra_id} a proveedor {proveedor_id} por ${total:,.0f}", None))
+            encolar(conn, "audit_log", cursor.lastrowid, "create", "auditoria")
 
             conn.commit()
             conn.close()
@@ -229,7 +259,7 @@ class ComprasRepository:
                 LEFT JOIN detalle_compras dc ON c.id = dc.compra_id
                 WHERE DATE(c.fecha) >= DATE('now', '-' || ? || ' days')
                     OR (c.estado_pago != 'PAGADO' AND c.saldo_pendiente > 0)
-                GROUP BY c.id
+                GROUP BY c.id, p.nombre, u.nombre_completo
                 ORDER BY c.fecha DESC
                 LIMIT ?
             ''', (dias, limite))
@@ -380,6 +410,17 @@ class ComprasRepository:
         cursor = conn.cursor()
 
         try:
+            # Guard anti-doble-cancelación: si ya está cancelada, no revertir
+            # de nuevo el stock (evita descuadre de inventario y kardex).
+            cursor.execute('SELECT estado FROM compras WHERE id = ?', (compra_id,))
+            fila = cursor.fetchone()
+            if not fila:
+                conn.close()
+                return False, "Compra no encontrada"
+            if str(fila['estado']).upper() == 'CANCELADA':
+                conn.close()
+                return False, "La compra ya estaba cancelada"
+
             # Obtener detalles de la compra
             cursor.execute('''
                 SELECT producto_id, cantidad
@@ -389,13 +430,25 @@ class ComprasRepository:
 
             detalles = cursor.fetchall()
 
-            # Revertir inventario
+            # Revertir inventario y registrar el asiento de reversa en el kardex
+            from repositories._outbox import encolar
             for detalle in detalles:
                 cursor.execute('''
                     UPDATE productos
                     SET stock = stock - ?
                     WHERE id = ?
                 ''', (detalle['cantidad'], detalle['producto_id']))
+                encolar(conn, "product", detalle['producto_id'], "update", "productos")
+
+                # Movimiento de reversa para que el kardex cuadre con el stock.
+                cursor.execute('''
+                    INSERT INTO movimientos (
+                        tipo, producto_id, cantidad, precio_unitario, costo_total,
+                        motivo, fecha
+                    ) VALUES ('SALIDA_AJUSTE', ?, ?, 0, 0, ?, ?)
+                ''', (detalle['producto_id'], detalle['cantidad'],
+                      f'Cancelación de compra #{compra_id}', obtener_fecha_actual()))
+                encolar(conn, "inventory_movement", cursor.lastrowid, "create", "movimientos")
 
             # Marcar compra como cancelada
             cursor.execute('''
@@ -403,6 +456,7 @@ class ComprasRepository:
                 SET estado = 'CANCELADA'
                 WHERE id = ?
             ''', (compra_id,))
+            encolar(conn, "purchase", compra_id, "update", "compras")
 
             conn.commit()
             conn.close()

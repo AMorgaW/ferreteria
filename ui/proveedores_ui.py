@@ -8,11 +8,12 @@ from PySide6.QtWidgets import (
     QGroupBox, QGridLayout, QDialog, QMessageBox, QFrame, QSlider,
     QAbstractItemView, QSpinBox, QScrollArea
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool
 from PySide6.QtGui import QFont, QColor, QCursor
 
 from models import Proveedor
 from ui_config import COLORS, FONTS, make_font
+from ui.async_worker import FunctionWorker
 
 
 class ProveedoresUI(QWidget):
@@ -24,6 +25,12 @@ class ProveedoresUI(QWidget):
         self.repo = proveedores_repo
         self.auth = auth_manager
         self.proveedor_seleccionado = None
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(350)
+        self._search_timer.timeout.connect(self.buscar_proveedores)
+        self._thread_pool = QThreadPool.globalInstance()
+        self._load_seq = 0
 
         self.crear_ui()
         self.cargar_proveedores()
@@ -55,21 +62,24 @@ class ProveedoresUI(QWidget):
         btn_nuevo.setFont(make_font(FONTS['body_bold']))
         btn_nuevo.setCursor(QCursor(Qt.PointingHandCursor))
         btn_nuevo.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
+            f"QPushButton {{ background: {COLORS['accent']}; color: {COLORS['on_accent']}; border: none; "
+            f"border-radius: 9px; padding: 9px 16px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['accent_hover']}; }}"
+            f"QPushButton:pressed {{ background: {COLORS['accent_dark']}; }}"
         )
         btn_nuevo.clicked.connect(self.nuevo_proveedor)
         header.addWidget(btn_nuevo)
 
+        ghost_qss = (
+            f"QPushButton {{ background: {COLORS['bg_primary']}; color: {COLORS['text_body']}; "
+            f"border: 1px solid {COLORS['border_input']}; border-radius: 9px; padding: 9px 16px; }}"
+            f"QPushButton:hover {{ background: {COLORS['bg_hover']}; border-color: {COLORS['primary_border']}; }}"
+        )
+
         btn_editar = QPushButton("✏️ Editar")
         btn_editar.setFont(make_font(FONTS['body_bold']))
         btn_editar.setCursor(QCursor(Qt.PointingHandCursor))
-        btn_editar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['info']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: {COLORS['primary']}; }}"
-        )
+        btn_editar.setStyleSheet(ghost_qss)
         btn_editar.clicked.connect(self.editar_proveedor)
         header.addWidget(btn_editar)
 
@@ -77,9 +87,9 @@ class ProveedoresUI(QWidget):
         btn_eliminar.setFont(make_font(FONTS['body_bold']))
         btn_eliminar.setCursor(QCursor(Qt.PointingHandCursor))
         btn_eliminar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['danger']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: {COLORS['danger_dark']}; }}"
+            f"QPushButton {{ background: {COLORS['bg_primary']}; color: {COLORS['danger']}; "
+            f"border: 1px solid {COLORS['danger']}; border-radius: 9px; padding: 9px 16px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['danger']}; color: white; }}"
         )
         btn_eliminar.clicked.connect(self.eliminar_proveedor)
         header.addWidget(btn_eliminar)
@@ -87,11 +97,7 @@ class ProveedoresUI(QWidget):
         btn_actualizar = QPushButton("🔄 Actualizar")
         btn_actualizar.setFont(make_font(FONTS['body']))
         btn_actualizar.setCursor(QCursor(Qt.PointingHandCursor))
-        btn_actualizar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['secondary']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 15px; }}"
-            f"QPushButton:hover {{ background: {COLORS['secondary_dark']}; }}"
-        )
+        btn_actualizar.setStyleSheet(ghost_qss)
         btn_actualizar.clicked.connect(self.cargar_proveedores)
         header.addWidget(btn_actualizar)
 
@@ -107,7 +113,7 @@ class ProveedoresUI(QWidget):
         self.search_input.setFont(make_font(FONTS['body']))
         self.search_input.setPlaceholderText("Buscar por nombre, NIT, ciudad...")
         self.search_input.setFixedWidth(350)
-        self.search_input.textChanged.connect(self.buscar_proveedores)
+        self.search_input.textChanged.connect(lambda: self._search_timer.start())
         search_layout.addWidget(self.search_input)
         search_layout.addStretch()
 
@@ -142,31 +148,18 @@ class ProveedoresUI(QWidget):
         self.table.setRowCount(0)
 
         try:
-            proveedores = self.repo.listar_proveedores(solo_activos=False)
+            if self.repo.cache_disponible():
+                self._renderizar_proveedores(
+                    self.repo.buscar_proveedores_cache(solo_activos=False, limite=500)
+                )
+                return
 
-            for row_idx, proveedor in enumerate(proveedores):
-                self.table.insertRow(row_idx)
-                estado = "✅ Activo" if proveedor.activo else "❌ Inactivo"
-                calificacion = "⭐" * int(proveedor.calificacion)
-
-                valores = [
-                    str(proveedor.id),
-                    proveedor.nit or 'N/A',
-                    proveedor.nombre,
-                    proveedor.telefono or 'N/A',
-                    proveedor.ciudad or 'N/A',
-                    proveedor.contacto_nombre or 'N/A',
-                    proveedor.productos_provee or 'N/A',
-                    calificacion,
-                    str(proveedor.dias_credito),
-                    estado,
-                ]
-
-                for col, val in enumerate(valores):
-                    item = QTableWidgetItem(val)
-                    item.setTextAlignment(Qt.AlignCenter)
-                    self.table.setItem(row_idx, col, item)
-
+            self._load_seq += 1
+            seq = self._load_seq
+            worker = FunctionWorker(self.repo.listar_proveedores, False, 500)
+            worker.signals.result.connect(lambda proveedores, s=seq: self._on_proveedores_cargados(proveedores, s))
+            worker.signals.error.connect(lambda e: QMessageBox.critical(self, "Error", f"Error al cargar proveedores:\n{e}"))
+            self._thread_pool.start(worker)
         except Exception as e:
             QMessageBox.critical(self, "Error",
                                  f"Error al cargar proveedores:\n{str(e)}")
@@ -178,35 +171,57 @@ class ProveedoresUI(QWidget):
 
         try:
             if criterio:
-                proveedores = self.repo.buscar_proveedores(criterio, solo_activos=False)
+                if self.repo.cache_disponible():
+                    proveedores = self.repo.buscar_proveedores_cache(criterio, solo_activos=False, limite=250)
+                    self._renderizar_proveedores(proveedores)
+                    return
+                worker = FunctionWorker(self.repo.buscar_proveedores, criterio, False, 250)
             else:
-                proveedores = self.repo.listar_proveedores(solo_activos=False)
+                if self.repo.cache_disponible():
+                    proveedores = self.repo.buscar_proveedores_cache(solo_activos=False, limite=500)
+                    self._renderizar_proveedores(proveedores)
+                    return
+                worker = FunctionWorker(self.repo.listar_proveedores, False, 500)
 
-            for row_idx, proveedor in enumerate(proveedores):
-                self.table.insertRow(row_idx)
-                estado = "✅ Activo" if proveedor.activo else "❌ Inactivo"
-                calificacion = "⭐" * int(proveedor.calificacion)
+            self._load_seq += 1
+            seq = self._load_seq
+            worker.signals.result.connect(lambda proveedores, s=seq: self._on_proveedores_cargados(proveedores, s))
+            worker.signals.error.connect(lambda e: QMessageBox.critical(self, "Error", f"Error al buscar:\n{e}"))
+            self._thread_pool.start(worker)
 
-                valores = [
-                    str(proveedor.id),
-                    proveedor.nit or 'N/A',
-                    proveedor.nombre,
-                    proveedor.telefono or 'N/A',
-                    proveedor.ciudad or 'N/A',
-                    proveedor.contacto_nombre or 'N/A',
-                    proveedor.productos_provee or 'N/A',
-                    calificacion,
-                    str(proveedor.dias_credito),
-                    estado,
-                ]
-
-                for col, val in enumerate(valores):
-                    item = QTableWidgetItem(val)
-                    item.setTextAlignment(Qt.AlignCenter)
-                    self.table.setItem(row_idx, col, item)
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error al buscar:\n{str(e)}")
+
+    def _on_proveedores_cargados(self, proveedores, seq):
+        if seq != self._load_seq:
+            return
+        self._renderizar_proveedores(proveedores)
+
+    def _renderizar_proveedores(self, proveedores):
+        self.table.setRowCount(0)
+        for row_idx, proveedor in enumerate(proveedores):
+            self.table.insertRow(row_idx)
+            estado = "✅ Activo" if proveedor.activo else "❌ Inactivo"
+            calificacion = "⭐" * int(proveedor.calificacion)
+
+            valores = [
+                str(proveedor.id),
+                proveedor.nit or 'N/A',
+                proveedor.nombre,
+                proveedor.telefono or 'N/A',
+                proveedor.ciudad or 'N/A',
+                proveedor.contacto_nombre or 'N/A',
+                proveedor.productos_provee or 'N/A',
+                calificacion,
+                str(proveedor.dias_credito),
+                estado,
+            ]
+
+            for col, val in enumerate(valores):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row_idx, col, item)
 
     def nuevo_proveedor(self):
         """Abre ventana para crear nuevo proveedor"""
@@ -274,7 +289,8 @@ class FormularioProveedorWindow(QDialog):
         if proveedor:
             self.cargar_datos()
 
-        self.centrar_ventana()
+        from ui.widgets import hacer_dialogo_responsivo
+        hacer_dialogo_responsivo(self, 600, 750)
         self.exec()
 
     def centrar_ventana(self):
@@ -402,24 +418,26 @@ class FormularioProveedorWindow(QDialog):
         btn_lay = QHBoxLayout(btn_frame)
         btn_lay.setContentsMargins(30, 10, 30, 20)
 
-        btn_guardar = QPushButton("💾 Guardar")
+        btn_guardar = QPushButton("💾  Guardar Proveedor")
         btn_guardar.setFont(make_font(FONTS['body_bold']))
         btn_guardar.setCursor(QCursor(Qt.PointingHandCursor))
+        btn_guardar.setMinimumHeight(42)
         btn_guardar.setStyleSheet(
             f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 10px 20px; }}"
+            f"border-radius: 9px; padding: 11px 22px; font-weight: 500; }}"
             f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
         )
         btn_guardar.clicked.connect(self.guardar)
         btn_lay.addWidget(btn_guardar)
 
-        btn_cancelar = QPushButton("❌ Cancelar")
+        btn_cancelar = QPushButton("✕  Cancelar")
         btn_cancelar.setFont(make_font(FONTS['body_bold']))
         btn_cancelar.setCursor(QCursor(Qt.PointingHandCursor))
+        btn_cancelar.setMinimumHeight(42)
         btn_cancelar.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['danger']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 10px 20px; }}"
-            f"QPushButton:hover {{ background: {COLORS['danger_dark']}; }}"
+            f"QPushButton {{ background: {COLORS['bg_primary']}; color: {COLORS['text_body']}; "
+            f"border: 1px solid {COLORS['border_input']}; border-radius: 9px; padding: 11px 22px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['bg_hover']}; border-color: {COLORS['primary_border']}; }}"
         )
         btn_cancelar.clicked.connect(self.reject)
         btn_lay.addWidget(btn_cancelar)

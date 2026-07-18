@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Interfaz para Registro de Compras a Proveedores (PySide6)
 Sistema de compras completo con múltiples productos por compra
@@ -214,11 +214,12 @@ class ComprasUI(QWidget):
         btn_nueva.setFixedHeight(38)
         btn_nueva.setStyleSheet(f"""
             QPushButton {{
-                background: {COLORS['primary']}; color: white;
+                background: {COLORS['accent']}; color: {COLORS['on_accent']};
                 border: none; border-radius: 10px;
-                padding: 0 22px; font-weight: 600;
+                padding: 0 22px; font-weight: 500;
             }}
-            QPushButton:hover {{ background: {COLORS['primary_dark']}; }}
+            QPushButton:hover {{ background: {COLORS['accent_hover']}; }}
+            QPushButton:pressed {{ background: {COLORS['accent_dark']}; }}
         """)
         btn_nueva.clicked.connect(self.abrir_formulario_compra)
         header_layout.addWidget(btn_nueva)
@@ -328,8 +329,8 @@ class ComprasUI(QWidget):
                 background: {COLORS['table_selection']}; color: {COLORS['text_primary']};
             }}
             QHeaderView::section {{
-                background: {COLORS['table_header']}; color: {COLORS['text_on_dark']};
-                font-size: 8pt; font-weight: 600;
+                background: {COLORS['table_header']}; color: {COLORS['table_header_fg']};
+                font-size: 8pt; font-weight: 500;
                 border: none; padding: 10px 8px;
                 border-right: 1px solid {COLORS['table_header_border']};
             }}
@@ -400,12 +401,19 @@ class ComprasUI(QWidget):
         stats_layout.setSpacing(14)
 
         try:
-            stats = self.compras_repo.obtener_estadisticas_compras()
+            # Estadísticas del MES ACTUAL (no todo el histórico), para no
+            # sobrecargar el historial de transacciones.
+            from datetime import datetime
+            hoy = datetime.now()
+            inicio_mes = hoy.replace(day=1).strftime('%Y-%m-%d')
+            fin_mes = hoy.strftime('%Y-%m-%d')
+            stats = self.compras_repo.obtener_estadisticas_compras(
+                fecha_inicio=inicio_mes, fecha_fin=fin_mes)
 
             cards_data = [
-                ("TOTAL COMPRAS", f"{stats['total_compras']:,}", "+12%", COLORS['primary'], "Anual"),
-                ("MONTO TOTAL", f"${stats['total_monto']:,.0f}", "", COLORS['success'], "Anual"),
-                ("PROMEDIO", f"${stats['promedio_compra']:,.0f}", "↗", COLORS['primary'], ""),
+                ("TOTAL COMPRAS", f"{stats['total_compras']:,}", "", COLORS['primary'], "Este mes"),
+                ("MONTO TOTAL", f"${stats['total_monto']:,.0f}", "", COLORS['success'], "Este mes"),
+                ("PROMEDIO", f"${stats['promedio_compra']:,.0f}", "↗", COLORS['primary'], "Este mes"),
                 ("PROVEEDORES", f"{stats['total_proveedores']}", "Activos", COLORS['warning'], ""),
             ]
 
@@ -755,7 +763,7 @@ class ComprasUI(QWidget):
             btn_guardar.setCursor(Qt.PointingHandCursor)
             btn_guardar.setStyleSheet(f"""
                 QPushButton {{ background: {COLORS['success']}; color: {COLORS['text_on_dark']}; border: none;
-                    border-radius: 6px; padding: 12px 40px; font-weight: bold; }}
+                    border-radius: 6px; padding: 12px 40px; font-weight: 500; }}
                 QPushButton:hover {{ background: {COLORS['success_dark']}; }}
             """)
             btn_guardar.clicked.connect(guardar_abono)
@@ -766,7 +774,7 @@ class ComprasUI(QWidget):
             btn_cancelar.setCursor(Qt.PointingHandCursor)
             btn_cancelar.setStyleSheet(f"""
                 QPushButton {{ background: {COLORS['danger']}; color: {COLORS['text_on_dark']}; border: none;
-                    border-radius: 6px; padding: 12px 40px; font-weight: bold; }}
+                    border-radius: 6px; padding: 12px 40px; font-weight: 500; }}
                 QPushButton:hover {{ background: {COLORS['danger_dark']}; }}
             """)
             btn_cancelar.clicked.connect(limpiar_campos)
@@ -827,7 +835,7 @@ class ComprasUI(QWidget):
             tag_lbl = QLabel("  [DEUDA$] RESUMEN  ")
             tag_lbl.setStyleSheet(f"""
                 background: {METRIC_BG}; color: {ACCENT};
-                font-size: 7pt; font-weight: bold;
+                font-size: 7pt; font-weight: 500;
                 border-radius: 4px; padding: 2px 6px; border: none;
             """)
             tag_row.addWidget(tag_lbl)
@@ -851,7 +859,7 @@ class ComprasUI(QWidget):
             m1_layout.setContentsMargins(16, 8, 16, 8)
             m1_layout.setAlignment(Qt.AlignCenter)
             m1_title = QLabel("FACTURAS PENDIENTES")
-            m1_title.setStyleSheet(f"color: {ACCENT}; font-size: 7pt; font-weight: bold; background: transparent; border: none;")
+            m1_title.setStyleSheet(f"color: {ACCENT}; font-size: 7pt; font-weight: 500; background: transparent; border: none;")
             m1_title.setAlignment(Qt.AlignCenter)
             m1_layout.addWidget(m1_title)
             m1_val = QLabel(f"{totales.get('facturas_pendientes', 0)}")
@@ -867,7 +875,7 @@ class ComprasUI(QWidget):
             m2_layout.setContentsMargins(16, 8, 16, 8)
             m2_layout.setAlignment(Qt.AlignCenter)
             m2_title = QLabel("PROVEEDORES")
-            m2_title.setStyleSheet(f"color: {ACCENT}; font-size: 7pt; font-weight: bold; background: transparent; border: none;")
+            m2_title.setStyleSheet(f"color: {ACCENT}; font-size: 7pt; font-weight: 500; background: transparent; border: none;")
             m2_title.setAlignment(Qt.AlignCenter)
             m2_layout.addWidget(m2_title)
             m2_val = QLabel(f"{totales.get('proveedores_con_deuda', 0)}")
@@ -970,7 +978,7 @@ class FormularioCompra(QDialog):
         group.setFont(make_font(FONTS['body_bold']))
         group.setStyleSheet(f"""
             QGroupBox {{
-                font-weight: bold; color: {COLORS['text_primary']};
+                font-weight: 500; color: {COLORS['text_primary']};
                 border: 1px solid {COLORS['border_input']}; border-radius: 6px;
                 margin-top: 10px; padding-top: 14px;
                 background: {COLORS['bg_primary']};
@@ -1069,7 +1077,20 @@ class FormularioCompra(QDialog):
 
         self.monto_pagado_inicial_entry = QLineEdit("0")
         self.monto_pagado_inicial_entry.setFont(make_font(FONTS['body']))
-        pago_grid.addWidget(self.monto_pagado_inicial_entry, 0, 1)
+        self.monto_pagado_inicial_entry.textChanged.connect(
+            self._formatear_monto_pagado_inicial)
+        _monto_row = QHBoxLayout()
+        _monto_row.addWidget(self.monto_pagado_inicial_entry, 1)
+        btn_pagar_todo = QPushButton("Pagar todo")
+        btn_pagar_todo.setFont(make_font(FONTS['small']))
+        btn_pagar_todo.setToolTip("Rellena el monto con el total de la compra")
+        btn_pagar_todo.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['success']}; color: white; "
+            f"border: none; border-radius: 6px; padding: 4px 12px; }} "
+            f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}")
+        btn_pagar_todo.clicked.connect(self._pagar_todo_compra)
+        _monto_row.addWidget(btn_pagar_todo)
+        pago_grid.addLayout(_monto_row, 0, 1)
 
         lbl_tipo_pago = QLabel("Tipo de Pago:")
         lbl_tipo_pago.setFont(make_font(FONTS['body']))
@@ -1104,6 +1125,29 @@ class FormularioCompra(QDialog):
 
         self.form_layout.addWidget(group)
 
+    def _formatear_monto_pagado_inicial(self):
+        """Muestra el monto con separador de miles (200000 -> 200,000) para no
+        equivocarse con un cero de menos."""
+        e = self.monto_pagado_inicial_entry
+        texto = e.text().replace(',', '').strip()
+        if not texto:
+            return
+        try:
+            valor = int(float(texto))
+        except ValueError:
+            return
+        e.blockSignals(True)
+        pos = e.cursorPosition()
+        len_antes = len(e.text())
+        e.setText(f"{valor:,}")
+        e.setCursorPosition(max(0, pos + len(e.text()) - len_antes))
+        e.blockSignals(False)
+
+    def _pagar_todo_compra(self):
+        """Rellena el monto pagado inicial con el total de la compra."""
+        total = int(getattr(self, "_total_compra_actual", 0) or 0)
+        self.monto_pagado_inicial_entry.setText(f"{total:,}")
+
     def _on_tipo_pago_inicial_change(self, text=None):
         """Muestra u oculta el campo de comprobante seg\u00fan el tipo de pago"""
         try:
@@ -1123,7 +1167,7 @@ class FormularioCompra(QDialog):
         group.setFont(make_font(FONTS['body_bold']))
         group.setStyleSheet(f"""
             QGroupBox {{
-                font-weight: bold; color: {COLORS['text_primary']};
+                font-weight: 500; color: {COLORS['text_primary']};
                 border: 1px solid {COLORS['border_input']}; border-radius: 6px;
                 margin-top: 10px; padding-top: 14px;
                 background: {COLORS['bg_primary']};
@@ -1195,7 +1239,7 @@ class FormularioCompra(QDialog):
         self.frame_cajas.setFont(make_font(FONTS['body_bold']))
         self.frame_cajas.setStyleSheet(f"""
             QGroupBox {{
-                font-weight: bold; color: {COLORS['primary']};
+                font-weight: 500; color: {COLORS['primary']};
                 border: 2px ridge {COLORS['primary_border']}; border-radius: 6px;
                 margin-top: 10px; padding: 15px 20px;
                 background: {COLORS['primary_light']};
@@ -1338,7 +1382,7 @@ class FormularioCompra(QDialog):
             QPushButton {{
                 background: {COLORS['success']}; color: white;
                 border: none; border-radius: 6px;
-                padding: 10px; font-weight: bold;
+                padding: 10px; font-weight: 500;
             }}
             QPushButton:hover {{ background: {COLORS['success_dark']}; }}
         """)
@@ -1359,7 +1403,7 @@ class FormularioCompra(QDialog):
         group.setFont(make_font(FONTS['body_bold']))
         group.setStyleSheet(f"""
             QGroupBox {{
-                font-weight: bold; color: {COLORS['text_primary']};
+                font-weight: 500; color: {COLORS['text_primary']};
                 border: 1px solid {COLORS['border_input']}; border-radius: 6px;
                 margin-top: 10px; padding-top: 14px;
                 background: {COLORS['bg_primary']};
@@ -1458,7 +1502,7 @@ class FormularioCompra(QDialog):
             QPushButton {{
                 background: {COLORS['primary']}; color: white;
                 border: none; border-radius: 6px; padding: 12px 30px;
-                font-weight: bold;
+                font-weight: 500;
             }}
             QPushButton:hover {{ background: {COLORS['primary_dark']}; }}
         """)
@@ -1564,12 +1608,14 @@ class FormularioCompra(QDialog):
             self.presentacion_label.setText(presentacion)
             self.contenido_label.setText(contenido_texto)
 
-            stock_texto = f"{producto.stock} {unidad}"
+            from formato import formatear_stock
+            _stock_fmt = formatear_stock(producto.stock, getattr(producto, 'permite_decimales', None))
+            stock_texto = f"{_stock_fmt} {unidad}"
             if tiene_empaque and hasattr(producto, 'unidades_por_caja'):
                 unidades_por = producto.unidades_por_caja
                 if unidades_por > 1 and producto.stock > 0:
                     cajas_equiv = producto.stock / unidades_por
-                    stock_texto = f"{producto.stock} {unidad}s ({cajas_equiv:.1f} cajas)"
+                    stock_texto = f"{_stock_fmt} {unidad}s ({cajas_equiv:.1f} cajas)"
 
             self.stock_label.setText(stock_texto)
 
@@ -1797,6 +1843,8 @@ class FormularioCompra(QDialog):
                 self.tree_carrito.setItem(row_idx, col_idx, tw_item)
 
         self.total_label.setText(f"TOTAL: ${total:,.0f}")
+        # Guardar el total para el botón "Pagar todo" del pago inicial.
+        self._total_compra_actual = total
 
     def eliminar_del_carrito(self):
         """Elimina el producto seleccionado del carrito"""
@@ -1850,7 +1898,8 @@ class FormularioCompra(QDialog):
             total_carrito = sum(item['cantidad'] * item['precio'] for item in self.carrito)
 
             try:
-                monto_pagado_inicial = float(self.monto_pagado_inicial_entry.text() or "0")
+                monto_pagado_inicial = float(
+                    self.monto_pagado_inicial_entry.text().replace(',', '') or "0")
                 if monto_pagado_inicial < 0:
                     QMessageBox.critical(self, "Error", "El monto pagado inicial no puede ser negativo")
                     return
@@ -1901,7 +1950,9 @@ class FormularioCompra(QDialog):
                 tipo_compra=tipo_compra,
                 observaciones=observaciones,
                 usuario_id=usuario_id,
-                monto_pagado_inicial=monto_pagado_inicial
+                monto_pagado_inicial=monto_pagado_inicial,
+                tipo_pago_inicial=tipo_pago_inicial,
+                numero_comprobante_inicial=comprobante
             )
 
             if exito:

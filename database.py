@@ -7,6 +7,7 @@ import hashlib
 from typing import Optional, List, Tuple
 from datetime import datetime
 import os
+from local_first_db import ensure_local_first_schema
 
 def obtener_fecha_actual():
     """Obtiene la fecha/hora actual en formato local (no UTC)"""
@@ -17,13 +18,21 @@ def obtener_fecha_actual():
 
 class DatabaseManager:
     """Gestor principal de la base de datos (PostgreSQL / Supabase)"""
+    _schema_initialized = False
 
     def __init__(self, db_name="ferreteria.db"):
         # db_name se mantiene por compatibilidad con código existente pero no se usa
         self.db_name = db_name
-        self.crear_estructura_completa()
-        self.crear_usuario_admin_default()
-        self.crear_usuario_empleado_default()
+        if not DatabaseManager._schema_initialized:
+            self.crear_estructura_completa()
+            self.crear_usuario_admin_default()
+            self.crear_usuario_empleado_default()
+            # Usar la MISMA base que pg_compat (LOCAL_DB_PATH), no una ruta
+            # relativa: si difieren, las migraciones/columnas de sync se
+            # aplicarían sobre el archivo equivocado.
+            from local_first_db import DEFAULT_DB_PATH as _LF_DB
+            ensure_local_first_schema(_LF_DB)
+            DatabaseManager._schema_initialized = True
 
     def conectar(self):
         """Abre conexión a PostgreSQL (Supabase)."""
@@ -123,6 +132,7 @@ class DatabaseManager:
                 nombre TEXT NOT NULL,
                 categoria TEXT,
                 marca TEXT,
+                presentacion TEXT,
                 proveedor_id INTEGER,
                 precio_compra REAL DEFAULT 0,
                 precio_venta REAL NOT NULL,
@@ -494,26 +504,53 @@ class DatabaseManager:
         
         # Índices para mejorar rendimiento
         indices = [
+            "CREATE EXTENSION IF NOT EXISTS pg_trgm",
             "CREATE INDEX IF NOT EXISTS idx_productos_codigo ON productos(codigo_barras)",
             "CREATE INDEX IF NOT EXISTS idx_productos_nombre ON productos(nombre)",
+            "CREATE INDEX IF NOT EXISTS idx_productos_activo_nombre ON productos(activo, nombre)",
+            "CREATE INDEX IF NOT EXISTS idx_productos_categoria ON productos(categoria)",
+            "CREATE INDEX IF NOT EXISTS idx_productos_marca ON productos(marca)",
             "CREATE INDEX IF NOT EXISTS idx_productos_proveedor ON productos(proveedor_id)",
+            "CREATE INDEX IF NOT EXISTS idx_productos_nombre_trgm ON productos USING gin (LOWER(nombre) gin_trgm_ops)",
+            "CREATE INDEX IF NOT EXISTS idx_productos_codigo_trgm ON productos USING gin (LOWER(codigo_barras) gin_trgm_ops)",
+            "CREATE INDEX IF NOT EXISTS idx_productos_marca_trgm ON productos USING gin (LOWER(marca) gin_trgm_ops)",
             "CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON ventas(fecha)",
             "CREATE INDEX IF NOT EXISTS idx_ventas_cliente ON ventas(cliente_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ventas_estado_fecha ON ventas(estado, fecha)",
+            "CREATE INDEX IF NOT EXISTS idx_detalle_ventas_venta ON detalle_ventas(venta_id)",
+            "CREATE INDEX IF NOT EXISTS idx_detalle_ventas_producto ON detalle_ventas(producto_id)",
             "CREATE INDEX IF NOT EXISTS idx_movimientos_fecha ON movimientos(fecha)",
             "CREATE INDEX IF NOT EXISTS idx_movimientos_proveedor ON movimientos(proveedor_id)",
             "CREATE INDEX IF NOT EXISTS idx_clientes_documento ON clientes(numero_documento)",
+            "CREATE INDEX IF NOT EXISTS idx_clientes_nombre ON clientes(nombre)",
+            "CREATE INDEX IF NOT EXISTS idx_clientes_activo_nombre ON clientes(activo, nombre)",
+            "CREATE INDEX IF NOT EXISTS idx_clientes_nombre_trgm ON clientes USING gin (LOWER(nombre) gin_trgm_ops)",
+            "CREATE INDEX IF NOT EXISTS idx_clientes_documento_trgm ON clientes USING gin (LOWER(numero_documento) gin_trgm_ops)",
+            "CREATE INDEX IF NOT EXISTS idx_proveedores_nombre ON proveedores(nombre)",
+            "CREATE INDEX IF NOT EXISTS idx_proveedores_nit ON proveedores(nit)",
+            "CREATE INDEX IF NOT EXISTS idx_proveedores_activo_nombre ON proveedores(activo, nombre)",
+            "CREATE INDEX IF NOT EXISTS idx_proveedores_nombre_trgm ON proveedores USING gin (LOWER(nombre) gin_trgm_ops)",
+            "CREATE INDEX IF NOT EXISTS idx_proveedores_nit_trgm ON proveedores USING gin (LOWER(nit) gin_trgm_ops)",
             "CREATE INDEX IF NOT EXISTS idx_compras_fecha ON compras(fecha)",
             "CREATE INDEX IF NOT EXISTS idx_compras_proveedor ON compras(proveedor_id)",
             "CREATE INDEX IF NOT EXISTS idx_detalle_compras_compra ON detalle_compras(compra_id)",
             "CREATE INDEX IF NOT EXISTS idx_detalle_compras_producto ON detalle_compras(producto_id)",
             "CREATE INDEX IF NOT EXISTS idx_abonos_compra ON abonos_compras(id_compra)",
             "CREATE INDEX IF NOT EXISTS idx_abonos_fecha ON abonos_compras(fecha_abono)",
+            "CREATE INDEX IF NOT EXISTS idx_cuentas_cobrar_cliente_estado ON cuentas_por_cobrar(cliente_id, estado)",
+            "CREATE INDEX IF NOT EXISTS idx_cuentas_cobrar_vencimiento ON cuentas_por_cobrar(fecha_vencimiento)",
+            "CREATE INDEX IF NOT EXISTS idx_alertas_leida_fecha ON alertas(leida, fecha_creacion)",
+            "CREATE INDEX IF NOT EXISTS idx_egresos_fecha ON egresos_caja(fecha)",
         ]
         
+        conn.commit()
+
         for indice in indices:
             try:
                 cursor.execute(indice)
+                conn.commit()
             except Exception:
+                conn.rollback()
                 pass  # El índice ya existe
         
         # Crear tabla de configuración de categorías (nueva)
@@ -550,6 +587,10 @@ class DatabaseManager:
             pass
         try:
             cursor.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS unidad_base_producto TEXT")
+        except Exception:
+            pass
+        try:
+            cursor.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS presentacion TEXT")
         except Exception:
             pass
     
@@ -775,7 +816,7 @@ class DatabaseManager:
         for tabla in tablas:
             try:
                 cursor.execute(f"DELETE FROM {tabla}")
-            except:
+            except Exception:
                 pass
 
         conn.commit()

@@ -79,6 +79,14 @@ class AlertasService:
         
         conn.close()
         return alertas
+
+    def contar_no_leidas(self) -> int:
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as count FROM alertas WHERE leida = 0")
+        count = cursor.fetchone()['count']
+        conn.close()
+        return count
     
     def marcar_como_leida(self, alerta_id: int) -> bool:
         """Marca una alerta como leída"""
@@ -175,7 +183,7 @@ class AlertasService:
                             ).fetchone()
                             if proveedor:
                                 mensaje += f"\nProveedor recomendado: {proveedor['nombre']}"
-                        except:
+                        except Exception:
                             pass
                     
                     if self.crear_alerta('STOCK_BAJO', titulo, mensaje, prioridad,
@@ -224,7 +232,7 @@ class AlertasService:
                         conn.close()
                         if proveedor:
                             producto_dict['proveedor_nombre'] = proveedor['nombre']
-                    except:
+                    except Exception:
                         pass
                 
                 productos_criticos.append(producto_dict)
@@ -319,6 +327,121 @@ class AlertasService:
         
         return alertas_creadas
     
+    def verificar_stock_bajo(self) -> int:
+        """Verifica productos con stock bajo en una sola consulta."""
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute("""
+                INSERT INTO alertas (tipo, titulo, mensaje, prioridad, relacionado_id, relacionado_tipo)
+                SELECT
+                    'STOCK_BAJO',
+                    CASE WHEN p.stock = 0 THEN 'Stock Critico' ELSE 'Stock Bajo - Reorden Recomendado' END,
+                    'El producto ''' || p.nombre || ''' tiene stock ' || p.stock || ' (minimo: ' || p.stock_minimo || ')' ||
+                        COALESCE(E'\nProveedor recomendado: ' || pr.nombre, ''),
+                    CASE WHEN p.stock = 0 THEN 'CRITICA' ELSE 'ALTA' END,
+                    p.id,
+                    'PRODUCTO'
+                FROM productos p
+                LEFT JOIN proveedores pr ON pr.id = p.proveedor_id
+                WHERE p.activo = 1
+                  AND p.stock <= p.stock_minimo
+                  AND NOT EXISTS (
+                    SELECT 1 FROM alertas a
+                    WHERE a.tipo = 'STOCK_BAJO'
+                      AND a.relacionado_id = p.id
+                      AND a.relacionado_tipo = 'PRODUCTO'
+                      AND a.leida = 0
+                  )
+            """)
+            count = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            conn.commit()
+            conn.close()
+            return count
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            print(f"Error verificando stock bajo: {e}")
+            return 0
+
+    def verificar_cuentas_vencidas(self) -> int:
+        """Verifica cuentas por cobrar vencidas en una sola consulta."""
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute('''
+                INSERT INTO alertas (tipo, titulo, mensaje, prioridad, relacionado_id, relacionado_tipo)
+                SELECT
+                    'CUENTA_VENCIDA',
+                    'Cuenta Vencida - ' || c.nombre,
+                    'Factura ' || v.numero_factura || ': $' || cpc.saldo_pendiente ||
+                        ' - ' || (CURRENT_DATE - DATE(cpc.fecha_vencimiento)) || ' dias vencida',
+                    'ALTA',
+                    cpc.id,
+                    'CUENTA'
+                FROM cuentas_por_cobrar cpc
+                JOIN clientes c ON cpc.cliente_id = c.id
+                JOIN ventas v ON cpc.venta_id = v.id
+                WHERE cpc.estado = 'PENDIENTE'
+                  AND DATE(cpc.fecha_vencimiento) < CURRENT_DATE
+                  AND NOT EXISTS (
+                    SELECT 1 FROM alertas a
+                    WHERE a.tipo = 'CUENTA_VENCIDA'
+                      AND a.relacionado_id = cpc.id
+                      AND a.relacionado_tipo = 'CUENTA'
+                      AND a.leida = 0
+                  )
+            ''')
+            count = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            conn.commit()
+            conn.close()
+            return count
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            print(f"Error verificando cuentas vencidas: {e}")
+            return 0
+
+    def verificar_clientes_limite_credito(self) -> int:
+        """Verifica clientes cerca del limite de credito en una sola consulta."""
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute('''
+                INSERT INTO alertas (tipo, titulo, mensaje, prioridad, relacionado_id, relacionado_tipo)
+                SELECT
+                    'LIMITE_CREDITO',
+                    'Limite de Credito - ' || c.nombre,
+                    'Cliente ha usado ' || ROUND(((c.saldo_pendiente / c.limite_credito) * 100)::numeric, 1) ||
+                        '% de su limite ($' || c.saldo_pendiente || ' de $' || c.limite_credito || ')',
+                    CASE WHEN ((c.saldo_pendiente / c.limite_credito) * 100) >= 100 THEN 'CRITICA' ELSE 'ALTA' END,
+                    c.id,
+                    'CLIENTE'
+                FROM clientes c
+                WHERE c.activo = 1
+                  AND c.limite_credito > 0
+                  AND ((c.saldo_pendiente / c.limite_credito) * 100) >= 90
+                  AND NOT EXISTS (
+                    SELECT 1 FROM alertas a
+                    WHERE a.tipo = 'LIMITE_CREDITO'
+                      AND a.relacionado_id = c.id
+                      AND a.relacionado_tipo = 'CLIENTE'
+                      AND a.leida = 0
+                  )
+            ''')
+            count = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            conn.commit()
+            conn.close()
+            return count
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            print(f"Error verificando limite de credito: {e}")
+            return 0
+
     def ejecutar_verificaciones_diarias(self) -> Dict[str, int]:
         """Ejecuta todas las verificaciones diarias y retorna resumen"""
         

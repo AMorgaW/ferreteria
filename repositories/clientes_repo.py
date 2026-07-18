@@ -13,6 +13,53 @@ class ClientesRepository:
     
     def __init__(self, db_manager):
         self.db = db_manager
+        self._cache = []
+        self._cache_loaded = False
+
+    def invalidar_cache(self):
+        self._cache = []
+        self._cache_loaded = False
+
+    def precargar_cache(self):
+        clientes = self.listar_clientes(solo_activos=False)
+        self._cache = clientes
+        self._cache_loaded = True
+        return clientes
+
+    def cache_disponible(self) -> bool:
+        return self._cache_loaded
+
+    def buscar_clientes_cache(
+        self,
+        criterio: str = None,
+        solo_activos: bool = True,
+        limite: Optional[int] = 120
+    ) -> List[Cliente]:
+        if not self._cache_loaded:
+            return []
+
+        criterio = (criterio or '').strip().lower()
+        resultados = []
+
+        for cliente in self._cache:
+            if solo_activos and not cliente.activo:
+                continue
+
+            if criterio:
+                texto = " ".join([
+                    cliente.nombre or '',
+                    cliente.numero_documento or '',
+                    cliente.telefono or '',
+                    cliente.ciudad or '',
+                ]).lower()
+                if criterio not in texto:
+                    continue
+
+            resultados.append(cliente)
+            if limite and len(resultados) >= limite:
+                break
+
+        return resultados
     
     def crear_cliente(self, cliente: Cliente) -> Tuple[bool, str, Optional[int]]:
         """Crea un nuevo cliente"""
@@ -35,9 +82,12 @@ class ClientesRepository:
                 1 if cliente.activo else 0
             ))
             
-            conn.commit()
             cliente_id = cursor.lastrowid
+            from repositories._outbox import encolar
+            encolar(conn, "customer", cliente_id, "create", "clientes")
+            conn.commit()
             conn.close()
+            self.invalidar_cache()
             return True, "Cliente creado exitosamente", cliente_id
             
         except sqlite3.IntegrityError:
@@ -59,32 +109,45 @@ class ClientesRepository:
             return self._row_to_cliente(row)
         return None
     
-    def buscar_clientes(self, criterio: str = None, solo_activos: bool = True) -> List[Cliente]:
+    def buscar_clientes(
+        self,
+        criterio: str = None,
+        solo_activos: bool = True,
+        limite: Optional[int] = None
+    ) -> List[Cliente]:
         """Busca clientes por nombre o documento"""
         conn = self.db.conectar()
         cursor = conn.cursor()
         
         if criterio:
-            query = 'SELECT * FROM clientes WHERE (nombre LIKE ? OR numero_documento LIKE ?)'
-            params = [f'%{criterio}%', f'%{criterio}%']
+            query = 'SELECT * FROM clientes WHERE (LOWER(nombre) LIKE ? OR LOWER(numero_documento) LIKE ?)'
+            criterio_busqueda = f'%{criterio.lower()}%'
+            params = [criterio_busqueda, criterio_busqueda]
             if solo_activos:
                 query += ' AND activo = 1'
             query += ' ORDER BY nombre'
+            if limite:
+                query += ' LIMIT ?'
+                params.append(limite)
             cursor.execute(query, params)
         else:
             query = 'SELECT * FROM clientes'
+            params = []
             if solo_activos:
                 query += ' WHERE activo = 1'
             query += ' ORDER BY nombre'
-            cursor.execute(query)
+            if limite:
+                query += ' LIMIT ?'
+                params.append(limite)
+            cursor.execute(query, params)
         
         rows = cursor.fetchall()
         conn.close()
         return [self._row_to_cliente(row) for row in rows]
     
-    def listar_clientes(self, solo_activos: bool = True) -> List[Cliente]:
+    def listar_clientes(self, solo_activos: bool = True, limite: Optional[int] = None) -> List[Cliente]:
         """Lista todos los clientes"""
-        return self.buscar_clientes(criterio=None, solo_activos=solo_activos)
+        return self.buscar_clientes(criterio=None, solo_activos=solo_activos, limite=limite)
     
     def actualizar_cliente(self, cliente: Cliente) -> Tuple[bool, str]:
         """Actualiza los datos de un cliente"""
@@ -106,9 +169,12 @@ class ClientesRepository:
                 cliente.descuento_default, cliente.puntos_fidelidad,
                 1 if cliente.activo else 0, cliente.id
             ))
-            
+
+            from repositories._outbox import encolar
+            encolar(conn, "customer", cliente.id, "update", "clientes")
             conn.commit()
             conn.close()
+            self.invalidar_cache()
             return True, "Cliente actualizado exitosamente"
             
         except sqlite3.IntegrityError:
@@ -129,9 +195,12 @@ class ClientesRepository:
             return False, "No se puede eliminar: el cliente tiene ventas registradas"
         
         try:
+            from repositories._outbox import encolar_borrado
+            encolar_borrado(conn, "customer", cliente_id, "clientes")
             cursor.execute('DELETE FROM clientes WHERE id = ?', (cliente_id,))
             conn.commit()
             conn.close()
+            self.invalidar_cache()
             return True, "Cliente eliminado exitosamente"
         except Exception as e:
             conn.close()
@@ -156,6 +225,7 @@ class ClientesRepository:
         cursor.execute('UPDATE clientes SET saldo_pendiente = ? WHERE id = ?', (nuevo_saldo, cliente_id))
         conn.commit()
         conn.close()
+        self.invalidar_cache()
         return True, "Saldo actualizado exitosamente"
     
     def _row_to_cliente(self, row) -> Cliente:

@@ -3,37 +3,238 @@
 Repositorio para gestión de productos
 Capa de acceso a datos para productos
 """
+import secrets
+from datetime import datetime
 from typing import List, Optional, Tuple
 from models import Producto
+
+
+def _ahora():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 class ProductosRepository:
     """Repositorio de productos"""
     
     def __init__(self, db_manager):
         self.db = db_manager
+        self.auth = None  # se asigna desde main para registrar auditoría
+        self._cache = []
+        self._cache_activos = []
+        self._cache_loaded = False
+
+    def _usuario_id(self):
+        if self.auth and getattr(self.auth, 'usuario_actual', None):
+            return self.auth.usuario_actual.id
+        return None
+
+    def _encolar_sync(self, conn, entity_type, entity_id, operation, table_name):
+        """Encola un cambio del admin en sync_queue para que el servicio
+        local-first lo suba a Supabase (mismo outbox que usa el servidor LAN).
+        Solo aplica en modo local (SQLite); nunca interrumpe la operación
+        principal si algo falla."""
+        try:
+            import os
+            if os.environ.get("DB_MODE", "local").strip().lower() not in (
+                    "local", "sqlite", "server"):
+                return
+            from local_first_db import enqueue_entity
+            enqueue_entity(conn, entity_type, entity_id, operation, table_name)
+        except Exception as exc:
+            print(f"[SYNC] No se pudo encolar {entity_type} {entity_id}: {exc}")
+
+    def _encolar_borrado(self, conn, entity_type, entity_id, table_name):
+        """Encola un borrado remoto (DELETE) para que Supabase elimine la fila.
+        Debe llamarse ANTES de borrar la fila local. Solo en modo local."""
+        try:
+            import os
+            if os.environ.get("DB_MODE", "local").strip().lower() not in (
+                    "local", "sqlite", "server"):
+                return
+            from local_first_db import enqueue_sync
+            enqueue_sync(conn, entity_type, entity_id, "delete",
+                         {"id": entity_id}, table_name)
+        except Exception as exc:
+            print(f"[SYNC] No se pudo encolar borrado {entity_type} {entity_id}: {exc}")
+
+    def _registrar_cambio_precio(self, cursor, producto_id, tipo, anterior, nuevo):
+        """Inserta una fila en historial_precios si el precio realmente cambió."""
+        try:
+            a = float(anterior or 0)
+            n = float(nuevo or 0)
+            if abs(a - n) < 0.0001:
+                return
+            cursor.execute('''
+                INSERT INTO historial_precios
+                    (producto_id, tipo, precio_anterior, precio_nuevo, usuario_id, fecha)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (producto_id, tipo, a, n, self._usuario_id(), _ahora()))
+            self._encolar_sync(cursor.connection, "price_history",
+                               cursor.lastrowid, "create", "historial_precios")
+        except Exception as exc:
+            print(f"[PRECIOS] No se pudo registrar cambio de precio: {exc}")
+
+    def obtener_historial_precios(self, producto_id: int, limite: int = 100) -> List[dict]:
+        """Historial de cambios de precio de un producto (trazabilidad)."""
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                SELECT h.fecha, h.tipo, h.precio_anterior, h.precio_nuevo,
+                       u.nombre_completo AS usuario
+                FROM historial_precios h
+                LEFT JOIN usuarios u ON h.usuario_id = u.id
+                WHERE h.producto_id = ?
+                ORDER BY h.fecha DESC, h.id DESC
+                LIMIT ?
+            ''', (producto_id, limite))
+            return [dict(r) for r in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def _auditar(self, accion: str, descripcion: str):
+        """Registra la acción en auditoría si hay un usuario autenticado."""
+        try:
+            if self.auth and getattr(self.auth, 'usuario_actual', None):
+                self.auth.registrar_auditoria(
+                    self.auth.usuario_actual.id, accion, "Productos", descripcion)
+        except Exception as exc:
+            print(f"[AUDIT] No se pudo registrar auditoría de producto: {exc}")
+
+    def invalidar_cache(self):
+        self._cache = []
+        self._cache_activos = []
+        self._cache_loaded = False
+
+    def precargar_cache(self):
+        productos = self.listar_productos(solo_activos=False)
+        self._cache = productos
+        self._cache_activos = [p for p in productos if p.get('activo', 1)]
+        self._cache_loaded = True
+        return productos
+
+    def cache_disponible(self) -> bool:
+        return self._cache_loaded
+
+    def buscar_productos_cache(self, termino: str = '', categoria: str = None,
+                               solo_activos: bool = True, limite: Optional[int] = 120) -> List[dict]:
+        if not self._cache_loaded:
+            return []
+
+        termino = (termino or '').strip().lower()
+        base = self._cache_activos if solo_activos else self._cache
+        resultados = []
+
+        for producto in base:
+            if categoria and categoria != "Todas" and producto.get('categoria') != categoria:
+                continue
+
+            if termino:
+                nombre = (producto.get('nombre') or '').lower()
+                codigo = (producto.get('codigo_barras') or '').lower()
+                marca = (producto.get('marca') or '').lower()
+                cat = (producto.get('categoria') or '').lower()
+                if termino not in nombre and termino not in codigo and termino not in marca and termino not in cat:
+                    continue
+
+            resultados.append(producto)
+            if limite and len(resultados) >= limite:
+                break
+
+        return resultados
     
+    @staticmethod
+    def _norm(valor) -> str:
+        return (valor or '').strip().lower()
+
+    @staticmethod
+    def _prefijo_sku(producto: Producto) -> str:
+        """Construye un prefijo legible para el SKU a partir de los atributos."""
+        def parte(valor, n):
+            limpio = ''.join(ch for ch in (valor or '').upper() if ch.isalnum())
+            return limpio[:n]
+        partes = [p for p in (parte(producto.categoria, 3),
+                              parte(producto.marca, 3),
+                              parte(producto.presentacion, 3)) if p]
+        return '-'.join(partes) or 'PRD'
+
+    def _generar_sku_unico(self, cursor, producto, producto_id) -> str:
+        """SKU legible + sufijo aleatorio para que sea GLOBALMENTE único.
+
+        Antes era f"{prefijo}-{id_local:05d}", pero el id_local es específico de
+        cada equipo: dos computadores creando productos a la vez generaban el
+        mismo SKU y chocaban con la restricción UNIQUE de codigo_barras. Se
+        añade un sufijo aleatorio (4 hex) que garantiza unicidad entre equipos;
+        además se verifica la unicidad LOCAL y se reintenta si hiciera falta."""
+        base = f"{self._prefijo_sku(producto)}-{producto_id:05d}"
+        for _ in range(30):
+            sku = f"{base}-{secrets.token_hex(2).upper()}"  # 4 hex
+            cursor.execute(
+                "SELECT 1 FROM productos WHERE codigo_barras = ? LIMIT 1", (sku,))
+            if not cursor.fetchone():
+                return sku
+        # Colisión extremadamente improbable: sufijo más largo como último recurso.
+        return f"{base}-{secrets.token_hex(4).upper()}"
+
+    def existe_duplicado(self, nombre, marca, presentacion, unidad_medida,
+                         exclude_id=None) -> bool:
+        """Detecta un duplicado REAL: mismo nombre + marca + presentación +
+        unidad de medida (variantes como 25kg vs 50kg NO se consideran iguales)."""
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            query = '''
+                SELECT id FROM productos
+                WHERE activo = 1
+                  AND LOWER(TRIM(COALESCE(nombre, ''))) = ?
+                  AND LOWER(TRIM(COALESCE(marca, ''))) = ?
+                  AND LOWER(TRIM(COALESCE(presentacion, ''))) = ?
+                  AND LOWER(TRIM(COALESCE(unidad_medida, ''))) = ?
+            '''
+            params = [self._norm(nombre), self._norm(marca),
+                      self._norm(presentacion), self._norm(unidad_medida)]
+            if exclude_id:
+                query += " AND id <> ?"
+                params.append(exclude_id)
+            cursor.execute(query, params)
+            return cursor.fetchone() is not None
+        finally:
+            conn.close()
+
     def crear_producto(self, producto: Producto) -> Tuple[bool, str, Optional[int]]:
         """
         Crea un nuevo producto en la base de datos
         Returns: (éxito, mensaje, id_producto)
         """
+        # 1) Validación en la capa de datos (no solo en el formulario)
+        valido, msg_val = producto.validar()
+        if not valido:
+            return False, msg_val, None
+
+        # 2) Anti-duplicado real (mismo nombre+marca+presentación+unidad)
+        if self.existe_duplicado(producto.nombre, producto.marca,
+                                 producto.presentacion, producto.unidad_medida):
+            return False, ("Ya existe un producto con el mismo nombre, marca, "
+                           "presentación y unidad de medida. Si es una variante "
+                           "distinta, especifique el tamaño/medida en 'Presentación'."), None
+
         conn = self.db.conectar()
         cursor = conn.cursor()
-        
+
         try:
             cursor.execute('''
                 INSERT INTO productos (
-                    codigo_barras, nombre, categoria, marca, proveedor_id,
+                    codigo_barras, nombre, categoria, marca, presentacion, proveedor_id,
                     precio_compra, precio_venta, stock, stock_minimo,
                     ubicacion, descripcion, unidad_medida, viene_en_caja,
                     unidades_por_caja, unidades_por_media_caja, vende_por_empaque,
                     permite_decimales, iva, activo
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 producto.codigo_barras,
                 producto.nombre,
                 producto.categoria,
                 producto.marca,
+                producto.presentacion,
                 producto.proveedor_id,
                 producto.precio_compra,
                 producto.precio_venta,
@@ -50,29 +251,85 @@ class ProductosRepository:
                 producto.iva,
                 1 if producto.activo else 0
             ))
-            
-            conn.commit()
+
             producto_id = cursor.lastrowid
+
+            # 3) SKU/código único automático si el usuario no ingresó uno.
+            #    Globalmente único (sufijo aleatorio) para permitir creación
+            #    simultánea de productos desde varios equipos sin chocar con la
+            #    restricción UNIQUE de codigo_barras.
+            if not (producto.codigo_barras or '').strip():
+                sku = self._generar_sku_unico(cursor, producto, producto_id)
+                cursor.execute('UPDATE productos SET codigo_barras = ? WHERE id = ?',
+                               (sku, producto_id))
+
+            # 4) Trazabilidad (kardex): registrar el stock inicial como movimiento
+            mov_id = None
+            try:
+                if (producto.stock or 0) > 0:
+                    uid = (self.auth.usuario_actual.id
+                           if (self.auth and getattr(self.auth, 'usuario_actual', None))
+                           else None)
+                    cursor.execute('''
+                        INSERT INTO movimientos (tipo, producto_id, usuario_id, cantidad,
+                            precio_unitario, costo_total, motivo, fecha)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', ('ENTRADA_AJUSTE', producto_id, uid, producto.stock,
+                          producto.precio_compra or 0,
+                          (producto.precio_compra or 0) * (producto.stock or 0),
+                          'Stock inicial al crear producto', _ahora()))
+                    mov_id = cursor.lastrowid
+            except Exception as _mov_exc:
+                print(f"[KARDEX] No se pudo registrar stock inicial: {_mov_exc}")
+
+            # 5) Local-first: encolar para sincronizar a Supabase (patrón outbox).
+            self._encolar_sync(conn, "product", producto_id, "create", "productos")
+            if mov_id:
+                self._encolar_sync(conn, "inventory_movement", mov_id,
+                                   "create", "movimientos")
+
+            conn.commit()
             conn.close()
-            
+            self.invalidar_cache()
+
+            self._auditar("CREAR_PRODUCTO",
+                          f"Creó producto '{producto.nombre}' (id {producto_id})")
             return True, "Producto creado exitosamente", producto_id
-            
+
         except Exception as e:
             conn.close()
             return False, f"Error al crear producto: {str(e)}", None
     
     def actualizar_producto(self, producto: Producto) -> Tuple[bool, str]:
         """Actualiza un producto existente"""
+        valido, msg_val = producto.validar()
+        if not valido:
+            return False, msg_val
+
+        if self.existe_duplicado(producto.nombre, producto.marca,
+                                 producto.presentacion, producto.unidad_medida,
+                                 exclude_id=producto.id):
+            return False, ("Ya existe otro producto con el mismo nombre, marca, "
+                           "presentación y unidad de medida.")
+
         conn = self.db.conectar()
         cursor = conn.cursor()
-        
+
         try:
+            # Capturar precios anteriores para el historial de precios
+            cursor.execute('SELECT precio_venta, precio_compra FROM productos WHERE id = ?',
+                           (producto.id,))
+            _ant = cursor.fetchone()
+            precio_venta_ant = _ant['precio_venta'] if _ant else None
+            precio_compra_ant = _ant['precio_compra'] if _ant else None
+
             cursor.execute('''
                 UPDATE productos SET
                     codigo_barras = ?,
                     nombre = ?,
                     categoria = ?,
                     marca = ?,
+                    presentacion = ?,
                     proveedor_id = ?,
                     precio_compra = ?,
                     precio_venta = ?,
@@ -94,6 +351,7 @@ class ProductosRepository:
                 producto.nombre,
                 producto.categoria,
                 producto.marca,
+                producto.presentacion,
                 producto.proveedor_id,
                 producto.precio_compra,
                 producto.precio_venta,
@@ -111,12 +369,24 @@ class ProductosRepository:
                 1 if producto.activo else 0,
                 producto.id
             ))
-            
+
+            # Historial de precios (si cambiaron)
+            self._registrar_cambio_precio(cursor, producto.id, 'venta',
+                                          precio_venta_ant, producto.precio_venta)
+            self._registrar_cambio_precio(cursor, producto.id, 'compra',
+                                          precio_compra_ant, producto.precio_compra)
+
+            # Local-first: encolar la edición para sincronizar a Supabase.
+            self._encolar_sync(conn, "product", producto.id, "update", "productos")
+
             conn.commit()
             conn.close()
-            
+            self.invalidar_cache()
+
+            self._auditar("EDITAR_PRODUCTO",
+                          f"Editó producto '{producto.nombre}' (id {producto.id})")
             return True, "Producto actualizado exitosamente"
-            
+
         except Exception as e:
             conn.close()
             return False, f"Error al actualizar producto: {str(e)}"
@@ -147,22 +417,34 @@ class ProductosRepository:
             return dict(row)
         return None
     
-    def listar_productos(self, solo_activos: bool = True) -> List[dict]:
+    def listar_productos(self, solo_activos: bool = True, limite: Optional[int] = None) -> List[dict]:
         """Lista todos los productos"""
         conn = self.db.conectar()
         cursor = conn.cursor()
         
         if solo_activos:
-            cursor.execute('SELECT * FROM productos WHERE activo = 1 ORDER BY nombre')
+            query = 'SELECT * FROM productos WHERE activo = 1 ORDER BY nombre'
         else:
-            cursor.execute('SELECT * FROM productos ORDER BY nombre')
+            query = 'SELECT * FROM productos ORDER BY nombre'
+
+        params = []
+        if limite:
+            query += ' LIMIT ?'
+            params.append(limite)
+
+        cursor.execute(query, params)
         
         rows = cursor.fetchall()
         conn.close()
         
         return [dict(row) for row in rows]
     
-    def buscar_productos(self, termino: str = '', solo_activos: bool = True) -> List[dict]:
+    def buscar_productos(
+        self,
+        termino: str = '',
+        solo_activos: bool = True,
+        limite: Optional[int] = None
+    ) -> List[dict]:
         """
         Busca productos por nombre, código o categoría
         Este es el método que faltaba y causaba el error
@@ -170,30 +452,42 @@ class ProductosRepository:
         conn = self.db.conectar()
         cursor = conn.cursor()
         
-        termino_busqueda = f"%{termino}%"
+        termino_busqueda = f"%{termino.lower()}%"
+        params = [
+            termino_busqueda,
+            termino_busqueda,
+            termino_busqueda,
+            termino_busqueda,
+        ]
         
         if solo_activos:
-            cursor.execute('''
+            query = '''
                 SELECT * FROM productos 
                 WHERE activo = 1 
                 AND (
-                    nombre LIKE ? OR 
-                    codigo_barras LIKE ? OR 
-                    categoria LIKE ? OR
-                    marca LIKE ?
+                    LOWER(nombre) LIKE ? OR 
+                    LOWER(codigo_barras) LIKE ? OR 
+                    LOWER(categoria) LIKE ? OR
+                    LOWER(marca) LIKE ?
                 )
                 ORDER BY nombre
-            ''', (termino_busqueda, termino_busqueda, termino_busqueda, termino_busqueda))
+            '''
         else:
-            cursor.execute('''
+            query = '''
                 SELECT * FROM productos 
                 WHERE 
-                    nombre LIKE ? OR 
-                    codigo_barras LIKE ? OR 
-                    categoria LIKE ? OR
-                    marca LIKE ?
+                    LOWER(nombre) LIKE ? OR 
+                    LOWER(codigo_barras) LIKE ? OR 
+                    LOWER(categoria) LIKE ? OR
+                    LOWER(marca) LIKE ?
                 ORDER BY nombre
-            ''', (termino_busqueda, termino_busqueda, termino_busqueda, termino_busqueda))
+            '''
+
+        if limite:
+            query += ' LIMIT ?'
+            params.append(limite)
+
+        cursor.execute(query, params)
         
         rows = cursor.fetchall()
         conn.close()
@@ -232,11 +526,14 @@ class ProductosRepository:
                 return False, "Operación inválida"
             
             # Actualizar
-            cursor.execute('UPDATE productos SET stock = ? WHERE id = ?', 
+            cursor.execute('UPDATE productos SET stock = ? WHERE id = ?',
                          (nuevo_stock, producto_id))
+            # Local-first: encolar el cambio de stock para sincronizar a Supabase.
+            self._encolar_sync(conn, "product", producto_id, "update", "productos")
             conn.commit()
             conn.close()
-            
+            self.invalidar_cache()
+
             return True, f"Stock actualizado. Nuevo stock: {nuevo_stock}"
             
         except Exception as e:
@@ -269,21 +566,50 @@ class ProductosRepository:
         
         try:
             if eliminar_permanente:
+                # Encolar el borrado remoto ANTES de borrar la fila local.
+                self._encolar_borrado(conn, "product", producto_id, "productos")
                 cursor.execute('DELETE FROM productos WHERE id = ?', (producto_id,))
                 mensaje = "Producto eliminado permanentemente"
             else:
                 cursor.execute('UPDATE productos SET activo = 0 WHERE id = ?', (producto_id,))
+                # Soft delete: la fila sigue existiendo; se sincroniza como update.
+                self._encolar_sync(conn, "product", producto_id, "update", "productos")
                 mensaje = "Producto desactivado"
-            
+
             conn.commit()
             conn.close()
-            
+            self.invalidar_cache()
+
+            self._auditar(
+                "ELIMINAR_PRODUCTO" if eliminar_permanente else "DESACTIVAR_PRODUCTO",
+                f"{'Eliminó permanentemente' if eliminar_permanente else 'Desactivó'} "
+                f"el producto id {producto_id}")
             return True, mensaje
-            
+
         except Exception as e:
             conn.close()
             return False, f"Error al eliminar producto: {str(e)}"
     
+    def obtener_kardex_producto(self, producto_id: int, limite: int = 200) -> List[dict]:
+        """Kardex básico: historial de movimientos de un producto (trazabilidad).
+        Incluye entradas, salidas por venta, compras y ajustes."""
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                SELECT m.fecha, m.tipo, m.cantidad, m.precio_unitario, m.costo_total,
+                       m.motivo, m.num_factura,
+                       u.nombre_completo AS usuario
+                FROM movimientos m
+                LEFT JOIN usuarios u ON m.usuario_id = u.id
+                WHERE m.producto_id = ?
+                ORDER BY m.fecha DESC, m.id DESC
+                LIMIT ?
+            ''', (producto_id, limite))
+            return [dict(r) for r in cursor.fetchall()]
+        finally:
+            conn.close()
+
     def obtener_categorias(self) -> List[str]:
         """Obtiene lista única de categorías"""
         conn = self.db.conectar()
@@ -395,14 +721,22 @@ class ProductosRepository:
         cursor = conn.cursor()
 
         try:
+            cursor.execute('SELECT precio_compra FROM productos WHERE id = ?', (producto_id,))
+            _a = cursor.fetchone()
+            anterior = _a['precio_compra'] if _a else None
+
             cursor.execute('''
                 UPDATE productos
                 SET precio_compra = ?
                 WHERE id = ?
             ''', (precio_compra, producto_id))
 
+            self._registrar_cambio_precio(cursor, producto_id, 'compra', anterior, precio_compra)
+
+            self._encolar_sync(conn, "product", producto_id, "update", "productos")
             conn.commit()
             conn.close()
+            self.invalidar_cache()
 
             return True, "Precio de compra actualizado"
         except Exception as e:
@@ -415,14 +749,22 @@ class ProductosRepository:
         cursor = conn.cursor()
 
         try:
+            cursor.execute('SELECT precio_venta FROM productos WHERE id = ?', (producto_id,))
+            _a = cursor.fetchone()
+            anterior = _a['precio_venta'] if _a else None
+
             cursor.execute('''
                 UPDATE productos
                 SET precio_venta = ?
                 WHERE id = ?
             ''', (precio_venta, producto_id))
 
+            self._registrar_cambio_precio(cursor, producto_id, 'venta', anterior, precio_venta)
+
+            self._encolar_sync(conn, "product", producto_id, "update", "productos")
             conn.commit()
             conn.close()
+            self.invalidar_cache()
 
             return True, "Precio de venta actualizado"
         except Exception as e:

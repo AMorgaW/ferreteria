@@ -748,8 +748,8 @@ class ReportesService:
                 p.precio_compra, p.precio_venta,
                 COALESCE(SUM(dv.cantidad), 0) as unidades_vendidas,
                 COUNT(DISTINCT dv.venta_id) as num_ventas,
-                CASE 
-                    WHEN p.stock > 0 THEN ROUND(CAST(COALESCE(SUM(dv.cantidad), 0) AS REAL) / p.stock, 2)
+                CASE
+                    WHEN p.stock > 0 THEN ROUND(CAST(COALESCE(SUM(dv.cantidad), 0) AS NUMERIC) / p.stock, 2)
                     ELSE 0
                 END as indice_rotacion
             FROM productos p

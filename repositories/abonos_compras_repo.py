@@ -5,7 +5,244 @@ Maneja la persistencia de pagos parciales a facturas de proveedores
 """
 import pg_compat
 from typing import List, Dict, Optional
+from datetime import datetime
 from models import Abono
+
+
+def _row_value(row, key, index, default=None):
+    try:
+        return row[key]
+    except (KeyError, TypeError, IndexError):
+        try:
+            return row[index]
+        except (TypeError, IndexError):
+            return default
+
+
+def _obtener_caja_abierta_id(cursor):
+    cursor.execute('''
+        SELECT id
+        FROM cierres_caja
+        WHERE fecha_cierre IS NULL
+        ORDER BY fecha_apertura DESC
+        LIMIT 1
+    ''')
+    caja = cursor.fetchone()
+    return _row_value(caja, 'id', 0) if caja else None
+
+
+def _actualizar_estado_compra_en_cursor(cursor, id_compra: int):
+    cursor.execute('''
+        SELECT COALESCE(SUM(monto_abono), 0) FROM abonos_compras
+        WHERE id_compra = ?
+    ''', (id_compra,))
+    total_abonado = cursor.fetchone()[0]
+
+    cursor.execute('''
+        SELECT total FROM compras WHERE id = ?
+    ''', (id_compra,))
+    resultado = cursor.fetchone()
+
+    if not resultado:
+        return
+
+    monto_total = resultado[0]
+
+    if total_abonado >= monto_total:
+        estado = 'PAGADO'
+    elif total_abonado > 0:
+        estado = 'PARCIAL'
+    else:
+        estado = 'PENDIENTE'
+
+    saldo = max(0, monto_total - total_abonado)
+
+    cursor.execute('''
+        UPDATE compras
+        SET estado_pago = ?, monto_pagado = ?, saldo_pendiente = ?
+        WHERE id = ?
+    ''', (estado, total_abonado, saldo, id_compra))
+
+
+def _normalizar_fecha_egreso(fecha):
+    if not fecha:
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    fecha_txt = str(fecha)
+    if len(fecha_txt) <= 10:
+        hoy = datetime.now().strftime('%Y-%m-%d')
+        hora = datetime.now().strftime('%H:%M:%S') if fecha_txt == hoy else '00:00:00'
+        return f"{fecha_txt} {hora}"
+    return fecha_txt[:19]
+
+
+def _crear_egreso_pago_proveedor(cursor, conn, abono_id: int, id_compra: int,
+                                 monto: float, tipo_pago: str, usuario: str,
+                                 numero_comprobante: Optional[str],
+                                 observaciones: Optional[str],
+                                 fecha_egreso=None) -> int:
+    cursor.execute('''
+        SELECT c.numero_factura, p.nombre as proveedor
+        FROM compras c
+        LEFT JOIN proveedores p ON c.proveedor_id = p.id
+        WHERE c.id = ?
+    ''', (id_compra,))
+    compra = cursor.fetchone()
+
+    numero_factura = _row_value(compra, 'numero_factura', 0, '-') if compra else '-'
+    proveedor = _row_value(compra, 'proveedor', 1, 'Proveedor') if compra else 'Proveedor'
+    descripcion = (
+        f"Pago a proveedor {proveedor} - Compra #{id_compra} "
+        f"- Factura {numero_factura} - Abono #{abono_id}"
+    )
+    if numero_comprobante:
+        descripcion += f" - Comprobante {numero_comprobante}"
+    if observaciones:
+        descripcion += f" - {observaciones}"
+
+    cursor.execute('''
+        INSERT INTO egresos_caja
+        (monto, categoria, descripcion, metodo_pago, fecha_egreso, usuario, id_caja)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        monto,
+        'Pago a proveedor',
+        descripcion,
+        tipo_pago,
+        _normalizar_fecha_egreso(fecha_egreso),
+        usuario or 'Sistema',
+        _obtener_caja_abierta_id(cursor)
+    ))
+    egreso_id = cursor.lastrowid
+
+    from repositories._outbox import encolar
+    encolar(conn, "cash_expense", egreso_id, "create", "egresos_caja")
+    return egreso_id
+
+
+def registrar_abono_compra_en_transaccion(conn, cursor, abono: Abono) -> int:
+    cursor.execute('''
+        INSERT INTO abonos_compras
+        (id_compra, monto_abono, fecha_abono, tipo_pago,
+         numero_comprobante, usuario, observaciones)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        abono.id_compra,
+        abono.monto_abono,
+        abono.fecha_abono,
+        abono.tipo_pago,
+        abono.numero_comprobante,
+        abono.usuario,
+        abono.observaciones
+    ))
+
+    abono_id = cursor.lastrowid
+
+    _crear_egreso_pago_proveedor(
+        cursor,
+        conn,
+        abono_id,
+        abono.id_compra,
+        abono.monto_abono,
+        abono.tipo_pago,
+        abono.usuario,
+        abono.numero_comprobante,
+        abono.observaciones,
+        abono.fecha_abono
+    )
+
+    _actualizar_estado_compra_en_cursor(cursor, abono.id_compra)
+
+    from repositories._outbox import encolar
+    encolar(conn, "purchase_payment", abono_id, "create", "abonos_compras")
+    encolar(conn, "purchase", abono.id_compra, "update", "compras")
+
+    return abono_id
+
+
+def reconciliar_pagos_proveedor_huerfanos() -> dict:
+    conn = pg_compat.connect()
+    cursor = conn.cursor()
+    creados = {'abonos': 0, 'egresos': 0}
+
+    try:
+        cursor.execute('''
+            SELECT id, id_compra, monto_abono, fecha_abono, tipo_pago,
+                   numero_comprobante, usuario, observaciones
+            FROM abonos_compras
+            ORDER BY id
+        ''')
+        abonos = cursor.fetchall()
+
+        for row in abonos:
+            abono_id = _row_value(row, 'id', 0)
+            cursor.execute(
+                "SELECT COUNT(*) FROM egresos_caja WHERE descripcion LIKE ?",
+                (f"%Abono #{abono_id}%",)
+            )
+            if cursor.fetchone()[0] > 0:
+                continue
+
+            _crear_egreso_pago_proveedor(
+                cursor,
+                conn,
+                abono_id,
+                _row_value(row, 'id_compra', 1),
+                _row_value(row, 'monto_abono', 2),
+                _row_value(row, 'tipo_pago', 4) or 'Efectivo',
+                _row_value(row, 'usuario', 6) or 'Sistema',
+                _row_value(row, 'numero_comprobante', 5),
+                _row_value(row, 'observaciones', 7),
+                _row_value(row, 'fecha_abono', 3)
+            )
+            creados['egresos'] += 1
+
+        cursor.execute('''
+            SELECT c.id, c.monto_pagado, c.fecha, c.usuario_id,
+                   COALESCE(SUM(a.monto_abono), 0) AS total_abonos
+            FROM compras c
+            LEFT JOIN abonos_compras a ON a.id_compra = c.id
+            WHERE COALESCE(c.monto_pagado, 0) > 0
+            GROUP BY c.id, c.monto_pagado, c.fecha, c.usuario_id
+            HAVING COALESCE(c.monto_pagado, 0) > COALESCE(SUM(a.monto_abono), 0)
+        ''')
+        compras = cursor.fetchall()
+
+        for row in compras:
+            id_compra = _row_value(row, 'id', 0)
+            monto_pagado = float(_row_value(row, 'monto_pagado', 1) or 0)
+            total_abonos = float(_row_value(row, 'total_abonos', 4) or 0)
+            diferencia = monto_pagado - total_abonos
+            if diferencia <= 0:
+                continue
+
+            usuario = 'Sistema'
+            usuario_id = _row_value(row, 'usuario_id', 3)
+            if usuario_id:
+                cursor.execute("SELECT username FROM usuarios WHERE id = ?", (usuario_id,))
+                usuario_row = cursor.fetchone()
+                if usuario_row:
+                    usuario = _row_value(usuario_row, 'username', 0, 'Sistema')
+
+            abono = Abono(
+                id_compra=id_compra,
+                monto_abono=diferencia,
+                fecha_abono=_normalizar_fecha_egreso(_row_value(row, 'fecha', 2)),
+                tipo_pago='Efectivo',
+                numero_comprobante=None,
+                usuario=usuario,
+                observaciones='Pago histórico registrado en compra'
+            )
+            registrar_abono_compra_en_transaccion(conn, cursor, abono)
+            creados['abonos'] += 1
+            creados['egresos'] += 1
+
+        conn.commit()
+        return creados
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 class AbonosaComprasRepository:
@@ -23,29 +260,10 @@ class AbonosaComprasRepository:
         cursor = conn.cursor()
         
         try:
-            cursor.execute('''
-                INSERT INTO abonos_compras 
-                (id_compra, monto_abono, fecha_abono, tipo_pago, 
-                 numero_comprobante, usuario, observaciones)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                abono.id_compra,
-                abono.monto_abono,
-                abono.fecha_abono,
-                abono.tipo_pago,
-                abono.numero_comprobante,
-                abono.usuario,
-                abono.observaciones
-            ))
-            
-            abono_id = cursor.lastrowid
-            
-            # Actualizar estado de la compra automáticamente
-            self._actualizar_estado_compra(cursor, abono.id_compra)
-            
+            abono_id = registrar_abono_compra_en_transaccion(conn, cursor, abono)
             conn.commit()
             return abono_id
-            
+
         except Exception as e:
             conn.rollback()
             raise e
@@ -117,8 +335,7 @@ class AbonosaComprasRepository:
             # Eliminar abono
             cursor.execute('DELETE FROM abonos_compras WHERE id = ?', (id_abono,))
             
-            # Actualizar estado de la compra
-            self._actualizar_estado_compra(cursor, id_compra)
+            _actualizar_estado_compra_en_cursor(cursor, id_compra)
             
             conn.commit()
             return True
@@ -128,46 +345,6 @@ class AbonosaComprasRepository:
             raise e
         finally:
             conn.close()
-    
-    def _actualizar_estado_compra(self, cursor, id_compra: int):
-        """
-        Actualiza el estado y saldo pendiente de una compra
-        basado en los abonos registrados (INTERNA)
-        """
-        # Obtener total abonado
-        cursor.execute('''
-            SELECT COALESCE(SUM(monto_abono), 0) FROM abonos_compras 
-            WHERE id_compra = ?
-        ''', (id_compra,))
-        total_abonado = cursor.fetchone()[0]
-        
-        # Obtener monto total de la factura
-        cursor.execute('''
-            SELECT total FROM compras WHERE id = ?
-        ''', (id_compra,))
-        resultado = cursor.fetchone()
-        
-        if not resultado:
-            return
-        
-        monto_total = resultado[0]
-        
-        # Determinar estado
-        if total_abonado >= monto_total:
-            estado = 'PAGADO'
-        elif total_abonado > 0:
-            estado = 'PARCIAL'
-        else:
-            estado = 'PENDIENTE'
-        
-        saldo = monto_total - total_abonado
-        
-        # Actualizar compra
-        cursor.execute('''
-            UPDATE compras 
-            SET estado_pago = ?, monto_pagado = ?, saldo_pendiente = ?
-            WHERE id = ?
-        ''', (estado, total_abonado, saldo, id_compra))
     
     def obtener_abonos_por_usuario(self, usuario: str, 
                                   fecha_inicio: str = None, 

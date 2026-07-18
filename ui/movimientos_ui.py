@@ -8,15 +8,17 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QDialog,
     QMessageBox, QFrame, QTextEdit, QGridLayout, QGroupBox, QCheckBox,
     QAbstractItemView, QSizePolicy, QTreeWidget, QTreeWidgetItem,
-    QScrollArea, QDialogButtonBox
+    QScrollArea, QDialogButtonBox, QDateEdit, QProgressBar
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QDate
 from PySide6.QtGui import QFont, QColor, QBrush
 
 from datetime import datetime
 from typing import Optional
 from collections import defaultdict
+import re
 from ui_config import COLORS, FONTS, ICONS, make_font
+from formato import formatear_stock
 
 
 class MovimientosUI(QWidget):
@@ -69,7 +71,7 @@ class MovimientosUI(QWidget):
         btn_entrada.setCursor(Qt.PointingHandCursor)
         btn_entrada.setStyleSheet(
             f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 16px; }}"
+            f"border-radius: 9px; padding: 9px 16px; font-weight: 500; }}"
             f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
         )
         btn_entrada.clicked.connect(self.abrir_nueva_entrada)
@@ -80,7 +82,7 @@ class MovimientosUI(QWidget):
         btn_salida.setCursor(Qt.PointingHandCursor)
         btn_salida.setStyleSheet(
             f"QPushButton {{ background: {COLORS['danger']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 16px; }}"
+            f"border-radius: 9px; padding: 9px 16px; font-weight: 500; }}"
             f"QPushButton:hover {{ background: {COLORS['danger_dark']}; }}"
         )
         btn_salida.clicked.connect(self.abrir_nueva_salida)
@@ -89,11 +91,8 @@ class MovimientosUI(QWidget):
         btn_refresh = QPushButton("🔄 Actualizar")
         btn_refresh.setFont(make_font(FONTS['body']))
         btn_refresh.setCursor(Qt.PointingHandCursor)
-        btn_refresh.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['info']}; color: white; border: none; "
-            f"border-radius: 6px; padding: 8px 16px; }}"
-            f"QPushButton:hover {{ background: #0891b2; }}"
-        )
+        btn_refresh.setObjectName("ghostBtn")
+        btn_refresh.setMinimumHeight(38)
         btn_refresh.clicked.connect(self.cargar_historial)
         header.addWidget(btn_refresh)
 
@@ -111,12 +110,46 @@ class MovimientosUI(QWidget):
         self.filtro_tipo.addItems([
             'TODOS', 'ENTRADA_COMPRA', 'ENTRADA_DEVOLUCION', 'ENTRADA_AJUSTE',
             'SALIDA_VENTA', 'SALIDA_DEVOLUCION', 'SALIDA_MERMA',
-            'SALIDA_DAÑADO', 'SALIDA_AJUSTE'
+            'SALIDA_DAÑADO', 'SALIDA_AJUSTE', 'EGRESO_CAJA',
+            'CRÉDITOS VENTA (activos)', 'CRÉDITOS COMPRA (activos)'
         ])
         self.filtro_tipo.setCurrentText('TODOS')
         self.filtro_tipo.setFixedWidth(220)
         self.filtro_tipo.currentIndexChanged.connect(lambda: self.cargar_historial())
         filtros_layout.addWidget(self.filtro_tipo)
+
+        # --- Filtro por rango de fechas ---
+        self.chk_fecha = QCheckBox("📅 Por fecha:")
+        self.chk_fecha.setFont(make_font(FONTS['body_bold']))
+        self.chk_fecha.setStyleSheet(
+            f"QCheckBox {{ background: transparent; color: {COLORS['primary']}; spacing: 6px; }}"
+        )
+        self.chk_fecha.stateChanged.connect(self._on_toggle_fecha)
+        filtros_layout.addWidget(self.chk_fecha)
+
+        hoy = QDate.currentDate()
+        self.fecha_desde = QDateEdit()
+        self.fecha_desde.setCalendarPopup(True)
+        self.fecha_desde.setDisplayFormat("dd/MM/yyyy")
+        self.fecha_desde.setDate(hoy.addDays(-30))
+        self.fecha_desde.setFont(make_font(FONTS['body']))
+        self.fecha_desde.setEnabled(False)
+        self.fecha_desde.dateChanged.connect(lambda: self.cargar_historial())
+        filtros_layout.addWidget(self.fecha_desde)
+
+        lbl_a = QLabel("a")
+        lbl_a.setFont(make_font(FONTS['body']))
+        lbl_a.setStyleSheet("background: transparent;")
+        filtros_layout.addWidget(lbl_a)
+
+        self.fecha_hasta = QDateEdit()
+        self.fecha_hasta.setCalendarPopup(True)
+        self.fecha_hasta.setDisplayFormat("dd/MM/yyyy")
+        self.fecha_hasta.setDate(hoy)
+        self.fecha_hasta.setFont(make_font(FONTS['body']))
+        self.fecha_hasta.setEnabled(False)
+        self.fecha_hasta.dateChanged.connect(lambda: self.cargar_historial())
+        filtros_layout.addWidget(self.fecha_hasta)
 
         self.chk_agrupar = QCheckBox("📋 Agrupar por Factura")
         self.chk_agrupar.setFont(make_font(FONTS['body_bold']))
@@ -133,20 +166,23 @@ class MovimientosUI(QWidget):
         # Tree widget (for grouped/hierarchical view and flat view)
         self.tree = QTreeWidget()
         self.tree.setStyleSheet(
-            "QTreeWidget { background: white; border: 1px solid #d1d5db; border-radius: 6px; gridline-color: #e5e7eb; }"
-            "QTreeWidget::item { padding: 4px; }"
-            "QTreeWidget::item:selected { background: #dbeafe; color: #1e3a5f; }"
-            "QHeaderView::section { background: #1a2332; color: white; padding: 6px; "
-            "border: none; font-weight: bold; }"
+            f"QTreeWidget {{ background: white; border: 1px solid {COLORS['border']};"
+            f" border-radius: 12px; gridline-color: transparent; }}"
+            "QTreeWidget::item { padding: 6px 4px; }"
+            f"QTreeWidget::item:selected {{ background: {COLORS['table_selection']};"
+            f" color: {COLORS['text_primary']}; }}"
+            f"QHeaderView::section {{ background: {COLORS['table_header']};"
+            f" color: {COLORS['table_header_fg']}; padding: 10px 8px;"
+            " border: none; font-weight: 500; }"
         )
         self.tree.setRootIsDecorated(True)
         self.tree.setAlternatingRowColors(False)
         self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tree.itemDoubleClicked.connect(self._on_tree_double_click)
 
-        columnas = ['ID', 'Fecha', 'Tipo', 'Producto', 'Proveedor', 'Cantidad', 'Precio Unit.', 'Total', 'Usuario']
+        columnas = ['Fecha', 'Movimiento', 'Referencia', 'Resumen', 'Total', 'Usuario']
         self.tree.setHeaderLabels(columnas)
-        anchos = [50, 130, 150, 200, 150, 80, 100, 100, 120]
+        anchos = [140, 150, 210, 360, 140, 140]
         for i, w in enumerate(anchos):
             self.tree.setColumnWidth(i, w)
         self.tree.header().setStretchLastSection(True)
@@ -159,15 +195,241 @@ class MovimientosUI(QWidget):
     # Data loading
     # ------------------------------------------------------------------
 
+    def _on_toggle_fecha(self):
+        """Habilita/deshabilita los selectores de fecha y recarga."""
+        activo = self.chk_fecha.isChecked()
+        self.fecha_desde.setEnabled(activo)
+        self.fecha_hasta.setEnabled(activo)
+        self.cargar_historial()
+
+    def _rango_fechas(self):
+        """Devuelve (fecha_inicio, fecha_fin) en 'yyyy-MM-dd' si el filtro está activo."""
+        if not self.chk_fecha.isChecked():
+            return None, None
+        fi = self.fecha_desde.date().toString('yyyy-MM-dd')
+        ff = self.fecha_hasta.date().toString('yyyy-MM-dd')
+        return fi, ff
+
+    def _egreso_a_mov(self, e):
+        """Convierte un egreso de caja en un dict con forma de movimiento."""
+        cat = (e.get('categoria') or 'Egreso')
+        desc = (e.get('descripcion') or '').strip()
+        nombre = f"{cat} - {desc}" if desc else cat
+        return {
+            'id': e.get('id'),
+            'fecha': e.get('fecha_egreso'),
+            'tipo': 'EGRESO_CAJA',
+            'producto_id': None,
+            'producto_nombre': nombre,
+            'categoria': cat,
+            'descripcion': desc,
+            'proveedor_id': None,
+            'proveedor_nombre': '-',
+            'cantidad': 0,
+            'precio_unitario': 0,
+            'costo_total': e.get('monto', 0) or 0,
+            'num_factura': None,
+            'usuario_nombre': e.get('usuario', 'Sistema'),
+            'es_egreso': True,
+        }
+
+    def _fmt_fecha_corta(self, fecha):
+        return str(fecha or 'N/A')[:16]
+
+    def _recortar(self, texto, limite=70):
+        texto = str(texto or '').strip()
+        if not texto:
+            return '-'
+        return texto if len(texto) <= limite else texto[:limite - 1].rstrip() + '…'
+
+    def _parse_ref_pago_proveedor(self, descripcion):
+        descripcion = descripcion or ''
+        proveedor = re.search(r'Pago a proveedor\s+(.+?)(?:\s+-\s+|$)', descripcion, re.IGNORECASE)
+        compra = re.search(r'Compra\s+#?([A-Za-z0-9\-]+)', descripcion, re.IGNORECASE)
+        factura = re.search(r'Factura\s+([A-Za-z0-9\-]+)', descripcion, re.IGNORECASE)
+        abono = re.search(r'Abono\s+#?([A-Za-z0-9\-]+)', descripcion, re.IGNORECASE)
+        return {
+            'proveedor': proveedor.group(1).strip() if proveedor else None,
+            'compra': compra.group(1).strip() if compra else None,
+            'factura': factura.group(1).strip() if factura else None,
+            'abono': abono.group(1).strip() if abono else None,
+        }
+
+    def _pago_compra_info(self, num_factura=None, compra_id=None):
+        cache_key = (num_factura or '', compra_id or '')
+        if not hasattr(self, '_pago_compra_cache'):
+            self._pago_compra_cache = {}
+        if cache_key in self._pago_compra_cache:
+            return self._pago_compra_cache[cache_key]
+
+        conn = self.db_manager.conectar()
+        cursor = conn.cursor()
+        try:
+            if compra_id:
+                cursor.execute('''
+                    SELECT c.id, c.numero_factura, c.estado_pago, c.total,
+                           c.monto_pagado, c.saldo_pendiente, p.nombre AS proveedor
+                    FROM compras c
+                    LEFT JOIN proveedores p ON p.id = c.proveedor_id
+                    WHERE c.id = ?
+                    LIMIT 1
+                ''', (compra_id,))
+            else:
+                cursor.execute('''
+                    SELECT c.id, c.numero_factura, c.estado_pago, c.total,
+                           c.monto_pagado, c.saldo_pendiente, p.nombre AS proveedor
+                    FROM compras c
+                    LEFT JOIN proveedores p ON p.id = c.proveedor_id
+                    WHERE c.numero_factura = ?
+                    LIMIT 1
+                ''', (num_factura,))
+            row = cursor.fetchone()
+            info = dict(row) if row else None
+        finally:
+            conn.close()
+        self._pago_compra_cache[cache_key] = info
+        return info
+
+    def _pago_venta_info(self, num_factura):
+        if not hasattr(self, '_pago_venta_cache'):
+            self._pago_venta_cache = {}
+        if num_factura in self._pago_venta_cache:
+            return self._pago_venta_cache[num_factura]
+
+        conn = self.db_manager.conectar()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                SELECT v.id, v.numero_factura, v.estado_pago, v.metodo_pago,
+                       v.total, v.monto_pagado, c.nombre AS cliente
+                FROM ventas v
+                LEFT JOIN clientes c ON c.id = v.cliente_id
+                WHERE v.numero_factura = ?
+                LIMIT 1
+            ''', (num_factura,))
+            row = cursor.fetchone()
+            info = dict(row) if row else None
+            if info:
+                total = info.get('total') or 0
+                pagado = info.get('monto_pagado') or 0
+                info['saldo_pendiente'] = max(total - pagado, 0)
+        finally:
+            conn.close()
+        self._pago_venta_cache[num_factura] = info
+        return info
+
+    def _tiene_credito_pendiente(self, info):
+        if not info:
+            return False
+        estado = (info.get('estado_pago') or '').upper()
+        saldo = info.get('saldo_pendiente')
+        if saldo is None:
+            total = info.get('total') or 0
+            pagado = info.get('monto_pagado') or 0
+            saldo = max(total - pagado, 0)
+        return saldo > 0 or estado in ('PENDIENTE', 'PARCIAL')
+
+    def _obtener_abonos_venta_visual(self, fecha_inicio=None, fecha_fin=None,
+                                     solo_creditos_activos=False):
+        conn = self.db_manager.conectar()
+        cursor = conn.cursor()
+        query = '''
+            SELECT a.id, a.id_venta, a.monto_abono, a.fecha_abono,
+                   a.tipo_pago, a.usuario, v.numero_factura, v.estado_pago,
+                   v.total, v.monto_pagado, c.nombre AS cliente
+            FROM abonos_ventas a
+            JOIN ventas v ON v.id = a.id_venta
+            LEFT JOIN clientes c ON c.id = v.cliente_id
+            WHERE 1=1
+        '''
+        params = []
+        if fecha_inicio:
+            query += " AND DATE(a.fecha_abono) >= DATE(?)"
+            params.append(fecha_inicio)
+        if fecha_fin:
+            query += " AND DATE(a.fecha_abono) <= DATE(?)"
+            params.append(fecha_fin)
+        query += " ORDER BY a.fecha_abono DESC LIMIT 300"
+
+        try:
+            cursor.execute(query, params)
+            rows = [dict(r) for r in cursor.fetchall()]
+        except Exception:
+            rows = []
+        finally:
+            conn.close()
+
+        movimientos = []
+        for row in rows:
+            total = row.get('total') or 0
+            pagado = row.get('monto_pagado') or 0
+            saldo = max(total - pagado, 0)
+            if solo_creditos_activos and saldo <= 0 and row.get('estado_pago') == 'PAGADO':
+                continue
+            movimientos.append({
+                'id': row.get('id'),
+                'fecha': row.get('fecha_abono'),
+                'tipo': 'ABONO_VENTA',
+                'producto_nombre': row.get('cliente') or 'Cliente General',
+                'proveedor_nombre': '-',
+                'cantidad': 0,
+                'precio_unitario': 0,
+                'costo_total': row.get('monto_abono') or 0,
+                'num_factura': row.get('numero_factura'),
+                'usuario_nombre': row.get('usuario') or 'Sistema',
+                'estado_pago': row.get('estado_pago'),
+                'saldo_pendiente': saldo,
+                'es_abono_venta': True,
+            })
+        return movimientos
+
+    def _fmt_cantidad_precio(self, mov):
+        """(cantidad_str, precio_str) — los egresos no tienen cantidad/precio unit."""
+        if mov.get('tipo') == 'EGRESO_CAJA':
+            return '—', '—'
+        return formatear_stock(mov['cantidad']), f"${mov['precio_unitario']:,.0f}"
+
     def cargar_historial(self):
-        """Carga el historial de movimientos"""
+        """Carga el historial de movimientos (con filtros de tipo y fecha)."""
         try:
             self.tree.clear()
+            self._pago_compra_cache = {}
+            self._pago_venta_cache = {}
 
             filtro = self.filtro_tipo.currentText()
-            tipo_filtro = None if filtro == 'TODOS' else filtro
+            fi, ff = self._rango_fechas()
 
-            movimientos = self.movimientos_service.obtener_historial(tipo=tipo_filtro, limite=500)
+            if filtro == 'EGRESO_CAJA':
+                egresos = self.movimientos_service.obtener_egresos(fi, ff, 500)
+                movimientos = [self._egreso_a_mov(e) for e in egresos]
+            elif filtro.startswith('CR') and 'VENTA' in filtro:
+                movs = self.movimientos_service.obtener_historial(
+                    tipo='SALIDA_VENTA', fecha_inicio=fi, fecha_fin=ff, limite=500)
+                movimientos = [m for m in movs
+                               if self._venta_es_credito_activo(m.get('num_factura'))]
+                movimientos += self._obtener_abonos_venta_visual(
+                    fi, ff, solo_creditos_activos=True)
+                movimientos.sort(key=lambda m: m.get('fecha') or '', reverse=True)
+            elif filtro.startswith('CR') and 'COMPRA' in filtro:
+                movs = self.movimientos_service.obtener_historial(
+                    tipo='ENTRADA_COMPRA', fecha_inicio=fi, fecha_fin=ff, limite=500)
+                movimientos = [m for m in movs
+                               if self._obtener_estado_pago_compra(m.get('num_factura'))
+                               in ('PENDIENTE', 'PARCIAL')]
+            else:
+                tipo_filtro = None if filtro == 'TODOS' else filtro
+                movimientos = self.movimientos_service.obtener_historial(
+                    tipo=tipo_filtro, fecha_inicio=fi, fecha_fin=ff, limite=500)
+                # En la vista "TODOS" también incluimos los egresos de caja.
+                if filtro == 'TODOS':
+                    egresos = self.movimientos_service.obtener_egresos(fi, ff, 500)
+                    abonos_venta = self._obtener_abonos_venta_visual(fi, ff)
+                    movimientos = (
+                        movimientos
+                        + [self._egreso_a_mov(e) for e in egresos]
+                        + abonos_venta
+                    )
+                    movimientos.sort(key=lambda m: m.get('fecha') or '', reverse=True)
 
             if self.chk_agrupar.isChecked():
                 self.mostrar_agrupado_por_factura(movimientos)
@@ -197,6 +459,71 @@ class MovimientosUI(QWidget):
             print(f"Error obteniendo estado de pago: {e}")
             return None
 
+    def _obtener_estado_pago_venta(self, num_factura):
+        """Obtiene el estado de pago de una venta por número de factura."""
+        try:
+            if not num_factura:
+                return None
+            conn = self.db_manager.conectar()
+            cursor = conn.cursor()
+            cursor.execute(
+                '''SELECT estado_pago, metodo_pago, total, monto_pagado
+                   FROM ventas WHERE numero_factura = ? LIMIT 1''',
+                (num_factura,))
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return None
+            if hasattr(row, 'keys'):
+                estado_pago = row['estado_pago']
+                metodo_pago = row['metodo_pago']
+                total = row['total'] or 0
+                monto_pagado = row['monto_pagado'] or 0
+            else:
+                estado_pago, metodo_pago, total, monto_pagado = row
+                total = total or 0
+                monto_pagado = monto_pagado or 0
+            if metodo_pago != 'CREDITO':
+                return 'PAGADO'
+            if monto_pagado >= total and total > 0:
+                return 'PAGADO'
+            return estado_pago or 'PENDIENTE'
+        except Exception as e:
+            print(f"Error obteniendo estado de pago de venta: {e}")
+            return None
+
+    def _venta_es_credito_activo(self, num_factura):
+        try:
+            if not num_factura:
+                return False
+            conn = self.db_manager.conectar()
+            cursor = conn.cursor()
+            cursor.execute(
+                '''SELECT estado_pago, metodo_pago, total, monto_pagado
+                   FROM ventas WHERE numero_factura = ? LIMIT 1''',
+                (num_factura,))
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return False
+            if hasattr(row, 'keys'):
+                metodo_pago = row['metodo_pago']
+                estado_pago = row['estado_pago']
+                total = row['total'] or 0
+                monto_pagado = row['monto_pagado'] or 0
+            else:
+                estado_pago, metodo_pago, total, monto_pagado = row
+                total = total or 0
+                monto_pagado = monto_pagado or 0
+            if metodo_pago != 'CREDITO':
+                return False
+            if total > 0 and monto_pagado >= total:
+                return False
+            return (estado_pago or 'PENDIENTE') in ('PENDIENTE', 'PARCIAL')
+        except Exception as e:
+            print(f"Error validando crédito de venta: {e}")
+            return False
+
     def _obtener_tag_por_estado(self, estado_pago):
         """Retorna el tag de color según el estado de pago"""
         if not estado_pago:
@@ -211,13 +538,15 @@ class MovimientosUI(QWidget):
     def _color_for_tag(self, tag):
         """Return (bg QColor, fg QColor) for a given tag name."""
         mapping = {
-            'entrada': (QColor('#d1fae5'), QColor('#065f46')),
-            'salida': (QColor('#fee2e2'), QColor('#991b1b')),
-            'estado_pendiente': (QColor('#fca5a5'), QColor('#ffffff')),
-            'estado_parcial': (QColor('#fcd34d'), QColor('#000000')),
-            'estado_pagado': (QColor('#a7f3d0'), QColor('#065f46')),
-            'factura': (QColor('#e0f2fe'), QColor('#000000')),
-            'detalle': (QColor('#ffffff'), QColor('#000000')),
+            'entrada': (QColor('#eafaf2'), QColor('#334155')),
+            'salida': (QColor('#fef6f6'), QColor('#334155')),
+            'estado_pendiente': (QColor('#fff7cc'), QColor('#5f4300')),
+            'estado_parcial': (QColor('#fff7cc'), QColor('#5f4300')),
+            'credito_pendiente': (QColor('#fff7cc'), QColor('#5f4300')),
+            'estado_pagado': (QColor('#eaf3de'), QColor('#3b6d11')),
+            'factura': (QColor('#e6f1fb'), QColor('#185fa5')),
+            'detalle': (QColor('#ffffff'), QColor('#334155')),
+            'egreso': (QColor('#fdeede'), QColor('#9a5b0a')),
         }
         return mapping.get(tag, (QColor('#ffffff'), QColor('#000000')))
 
@@ -232,6 +561,110 @@ class MovimientosUI(QWidget):
             item.setBackground(c, QBrush(bg))
             item.setForeground(c, QBrush(fg))
 
+    def _set_item_meta(self, item, **meta):
+        item.setData(0, Qt.UserRole, meta)
+
+    def _info_pago_mov(self, mov):
+        tipo = mov.get('tipo')
+        factura = mov.get('num_factura')
+        if tipo in ('SALIDA_VENTA', 'ABONO_VENTA') and factura:
+            return self._pago_venta_info(factura)
+        if tipo == 'ENTRADA_COMPRA' and factura:
+            return self._pago_compra_info(num_factura=factura)
+        if tipo == 'EGRESO_CAJA':
+            ref = self._parse_ref_pago_proveedor(mov.get('descripcion') or mov.get('producto_nombre'))
+            if ref.get('compra') or ref.get('factura'):
+                return self._pago_compra_info(ref.get('factura'), ref.get('compra'))
+        return None
+
+    def _movimiento_label(self, mov, pago_info=None):
+        tipo = mov.get('tipo')
+        if tipo == 'SALIDA_VENTA':
+            return 'Crédito venta' if self._tiene_credito_pendiente(pago_info) else 'Salida'
+        if tipo == 'ENTRADA_COMPRA':
+            return 'Crédito compra' if self._tiene_credito_pendiente(pago_info) else 'Entrada'
+        if tipo == 'ABONO_VENTA':
+            return 'Abono crédito' if self._tiene_credito_pendiente(pago_info) else 'Crédito liquidado'
+        if tipo == 'EGRESO_CAJA':
+            categoria = (mov.get('categoria') or '').lower()
+            descripcion = (mov.get('descripcion') or '').lower()
+            return 'Pago proveedor' if 'proveedor' in categoria or 'pago a proveedor' in descripcion else 'Egreso'
+        if 'ENTRADA' in str(tipo):
+            return 'Entrada'
+        if 'SALIDA' in str(tipo):
+            return 'Salida'
+        return 'Otro'
+
+    def _referencia_mov(self, mov):
+        tipo = mov.get('tipo')
+        factura = mov.get('num_factura')
+        if tipo in ('SALIDA_VENTA', 'ABONO_VENTA') and factura:
+            return f"Venta {factura}"
+        if tipo == 'ENTRADA_COMPRA' and factura:
+            info = self._pago_compra_info(num_factura=factura)
+            compra_id = info.get('id') if info else None
+            return f"Compra #{compra_id} / Factura {factura}" if compra_id else f"Compra {factura}"
+        if tipo == 'EGRESO_CAJA':
+            ref = self._parse_ref_pago_proveedor(mov.get('descripcion') or '')
+            if ref.get('compra') or ref.get('factura'):
+                partes = []
+                if ref.get('compra'):
+                    partes.append(f"Compra #{ref['compra']}")
+                if ref.get('factura'):
+                    partes.append(f"Factura {ref['factura']}")
+                if ref.get('abono'):
+                    partes.append(f"Abono #{ref['abono']}")
+                return ' / '.join(partes)
+            return f"Egreso #{mov.get('id')}"
+        return factura or '-'
+
+    def _resumen_mov(self, mov, cantidad_productos=1, pago_info=None):
+        tipo = mov.get('tipo')
+        if tipo == 'SALIDA_VENTA':
+            if self._tiene_credito_pendiente(pago_info):
+                return 'Venta a crédito pendiente'
+            cliente = (pago_info or {}).get('cliente')
+            return f"Venta a {cliente}" if cliente else f"Venta de {cantidad_productos} producto(s)"
+        if tipo == 'ENTRADA_COMPRA':
+            proveedor = (pago_info or {}).get('proveedor') or mov.get('proveedor_nombre')
+            if self._tiene_credito_pendiente(pago_info):
+                return 'Compra a crédito pendiente'
+            return f"Compra a proveedor {proveedor}" if proveedor else 'Entrada de inventario'
+        if tipo == 'ABONO_VENTA':
+            return ('Abono parcial recibido' if self._tiene_credito_pendiente(pago_info)
+                    else 'Venta pagada completamente')
+        if tipo == 'EGRESO_CAJA':
+            desc = mov.get('descripcion') or ''
+            ref = self._parse_ref_pago_proveedor(desc)
+            if ref.get('proveedor'):
+                return self._recortar(f"Abono a proveedor {ref['proveedor']}")
+            return self._recortar(mov.get('categoria') or desc or 'Egreso de caja')
+        return self._recortar(mov.get('producto_nombre') or str(tipo).replace('_', ' ').title())
+
+    def _tags_mov(self, mov, pago_info=None):
+        tipo = mov.get('tipo')
+        if self._tiene_credito_pendiente(pago_info):
+            return ['credito_pendiente']
+        if tipo == 'ABONO_VENTA' and pago_info and (pago_info.get('estado_pago') or '').upper() == 'PAGADO':
+            return ['estado_pagado']
+        if tipo == 'EGRESO_CAJA':
+            return ['egreso']
+        return ['entrada' if 'ENTRADA' in str(tipo) else 'salida']
+
+    def _valores_compactos(self, mov, cantidad_productos=1, total=None, fecha=None):
+        pago_info = self._info_pago_mov(mov)
+        monto = mov.get('costo_total') if total is None else total
+        if mov.get('tipo') == 'EGRESO_CAJA':
+            monto = -abs(monto or 0)
+        return [
+            self._fmt_fecha_corta(fecha or mov.get('fecha')),
+            self._movimiento_label(mov, pago_info),
+            self._referencia_mov(mov),
+            self._resumen_mov(mov, cantidad_productos, pago_info),
+            self._money_cop(monto or 0),
+            mov.get('usuario_nombre') or 'Sistema',
+        ], self._tags_mov(mov, pago_info)
+
     # ------------------------------------------------------------------
     # Flat list view
     # ------------------------------------------------------------------
@@ -241,37 +674,16 @@ class MovimientosUI(QWidget):
         self.tree.setRootIsDecorated(False)
 
         for mov in movimientos:
-            producto_nombre = mov.get('producto_nombre', 'N/A')
-            proveedor_nombre = mov.get('proveedor_nombre', 'N/A') if mov.get('proveedor_id') else '-'
-            usuario_nombre = mov.get('usuario_nombre', 'Sistema')
-            fecha_str = mov['fecha'][:16] if mov.get('fecha') else 'N/A'
-
-            tipo = mov['tipo']
-            base_tag = 'entrada' if 'ENTRADA' in tipo else 'salida'
-            tags = [base_tag]
-
-            if tipo == 'ENTRADA_COMPRA':
-                num_factura = mov.get('num_factura')
-                estado_pago = self._obtener_estado_pago_compra(num_factura)
-                if estado_pago:
-                    tags.append(self._obtener_tag_por_estado(estado_pago))
-
-            values = [
-                str(mov['id']),
-                fecha_str,
-                tipo.replace('_', ' '),
-                producto_nombre,
-                proveedor_nombre,
-                f"{mov['cantidad']}",
-                f"${mov['precio_unitario']:,.0f}",
-                f"${mov['costo_total']:,.0f}",
-                usuario_nombre,
-            ]
+            values, tags = self._valores_compactos(mov)
             tw_item = QTreeWidgetItem(values)
-            tw_item.setTextAlignment(0, Qt.AlignCenter)
-            tw_item.setTextAlignment(5, Qt.AlignCenter)
-            tw_item.setTextAlignment(6, Qt.AlignRight | Qt.AlignVCenter)
-            tw_item.setTextAlignment(7, Qt.AlignRight | Qt.AlignVCenter)
+            tw_item.setTextAlignment(4, Qt.AlignRight | Qt.AlignVCenter)
+            self._set_item_meta(
+                tw_item,
+                tipo=mov.get('tipo'),
+                mov_id=mov.get('id'),
+                num_factura=mov.get('num_factura'),
+                egreso_id=mov.get('id') if mov.get('tipo') == 'EGRESO_CAJA' else None,
+            )
             self._apply_row_colors(tw_item, tags)
             self.tree.addTopLevelItem(tw_item)
 
@@ -279,15 +691,36 @@ class MovimientosUI(QWidget):
     # Grouped (hierarchical) view
     # ------------------------------------------------------------------
 
+    def _agregar_egreso_como_factura(self, e):
+        """Renderiza un egreso de caja como una factura de salida de dinero,
+        con el mismo formato que una venta/compra (fila padre + detalle)."""
+        parent_values, tags = self._valores_compactos(e)
+        parent = QTreeWidgetItem(parent_values)
+        parent.setFont(1, make_font(FONTS['body_bold']))
+        parent.setTextAlignment(4, Qt.AlignRight | Qt.AlignVCenter)
+        self._set_item_meta(parent, tipo='EGRESO_CAJA', egreso_id=e.get('id'), mov_id=e.get('id'))
+        self._apply_row_colors(parent, tags)
+        self.tree.addTopLevelItem(parent)
+
+        child = QTreeWidgetItem(parent_values)
+        child.setTextAlignment(4, Qt.AlignRight | Qt.AlignVCenter)
+        self._set_item_meta(child, tipo='EGRESO_CAJA', egreso_id=e.get('id'), mov_id=e.get('id'))
+        self._apply_row_colors(child, tags)
+        parent.addChild(child)
+
     def mostrar_agrupado_por_factura(self, movimientos):
         """Muestra movimientos agrupados por número de factura usando QTreeWidget"""
         self.tree.setRootIsDecorated(True)
 
         por_factura = defaultdict(list)
         sin_factura = []
+        egresos_list = []
 
         for mov in movimientos:
             if mov.get('tipo') == 'COBRO_CREDITO':
+                continue
+            if mov.get('tipo') == 'EGRESO_CAJA':
+                egresos_list.append(mov)
                 continue
             num_factura = mov.get('num_factura')
             if num_factura:
@@ -295,63 +728,59 @@ class MovimientosUI(QWidget):
             else:
                 sin_factura.append(mov)
 
-        print(f"[DEBUG] Grouped into {len(por_factura)} facturas, {len(sin_factura)} without factura")
+        grupos_render = []
+        for e in egresos_list:
+            grupos_render.append(('egreso', e.get('fecha') or '', e))
+        for num_factura, items in por_factura.items():
+            fecha_grupo = max((item.get('fecha') or '' for item in items), default='')
+            grupos_render.append(('factura', fecha_grupo, (num_factura, items)))
 
-        # Facturas agrupadas
-        for num_factura, items in sorted(por_factura.items(), reverse=True):
+        # Egresos y facturas se ordenan juntos por fecha. Antes los egresos se
+        # pintaban primero y empujaban ventas/compras fuera del primer vistazo.
+        for tipo_grupo, _fecha_grupo, payload in sorted(
+            grupos_render, key=lambda item: item[1], reverse=True
+        ):
+            if tipo_grupo == 'egreso':
+                self._agregar_egreso_como_factura(payload)
+                continue
+
+            num_factura, items = payload
             if not items:
                 continue
 
-            total_factura = sum(item['costo_total'] for item in items)
-            cantidad_productos = len(items)
-            fecha_factura = items[0]['fecha'][:16] if items[0].get('fecha') else 'N/A'
-            tipo_principal = items[0]['tipo']
+            inventario_items = [item for item in items if item.get('tipo') != 'ABONO_VENTA']
+            total_factura = sum(item['costo_total'] for item in inventario_items)
+            cantidad_productos = len(inventario_items) or len(items)
+            latest_item = max(items, key=lambda item: item.get('fecha') or '')
+            fecha_factura = latest_item.get('fecha') or items[0].get('fecha')
+            tipo_principal = (inventario_items[0] if inventario_items else items[0])['tipo']
             base_tag = 'entrada' if 'ENTRADA' in tipo_principal else 'salida'
-
-            estado_pago = self._obtener_estado_pago_compra(num_factura)
-            pago_tag = self._obtener_tag_por_estado(estado_pago)
-            tags_factura = ['factura', base_tag]
-            if estado_pago:
-                tags_factura.append(pago_tag)
-
-            parent_values = [
-                f"📋 {num_factura}",
-                fecha_factura,
-                f"{cantidad_productos} producto(s)",
-                "---",
-                "---",
-                "---",
-                "---",
-                f"${total_factura:,.0f}",
-                items[0].get('usuario_nombre', 'Sistema'),
-            ]
+            total_mostrar = None if latest_item.get('tipo') == 'ABONO_VENTA' else total_factura
+            parent_values, tags_factura = self._valores_compactos(
+                latest_item,
+                cantidad_productos=cantidad_productos,
+                total=total_mostrar,
+                fecha=fecha_factura,
+            )
             parent_item = QTreeWidgetItem(parent_values)
-            parent_item.setFont(0, make_font(FONTS['body_bold']))
-            parent_item.setTextAlignment(7, Qt.AlignRight | Qt.AlignVCenter)
+            parent_item.setFont(1, make_font(FONTS['body_bold']))
+            parent_item.setTextAlignment(4, Qt.AlignRight | Qt.AlignVCenter)
+            self._set_item_meta(parent_item, tipo=tipo_principal, num_factura=num_factura)
             self._apply_row_colors(parent_item, tags_factura)
             self.tree.addTopLevelItem(parent_item)
+            parent_item.setExpanded(False)
 
             for mov in items:
-                producto_nombre = mov.get('producto_nombre', 'N/A')
-                proveedor_nombre = mov.get('proveedor_nombre', 'N/A') if mov.get('proveedor_id') else '-'
-
-                child_values = [
-                    str(mov['id']),
-                    "",
-                    mov['tipo'].replace('_', ' '),
-                    producto_nombre,
-                    proveedor_nombre,
-                    f"{mov['cantidad']}",
-                    f"${mov['precio_unitario']:,.0f}",
-                    f"${mov['costo_total']:,.0f}",
-                    "",
-                ]
+                child_values, child_tags = self._valores_compactos(mov)
                 child_item = QTreeWidgetItem(child_values)
-                child_item.setTextAlignment(0, Qt.AlignCenter)
-                child_item.setTextAlignment(5, Qt.AlignCenter)
-                child_item.setTextAlignment(6, Qt.AlignRight | Qt.AlignVCenter)
-                child_item.setTextAlignment(7, Qt.AlignRight | Qt.AlignVCenter)
-                self._apply_row_colors(child_item, ['detalle', base_tag])
+                child_item.setTextAlignment(4, Qt.AlignRight | Qt.AlignVCenter)
+                self._set_item_meta(
+                    child_item,
+                    tipo=mov.get('tipo'),
+                    mov_id=mov.get('id'),
+                    num_factura=mov.get('num_factura'),
+                )
+                self._apply_row_colors(child_item, child_tags)
                 parent_item.addChild(child_item)
 
         # Movimientos sin factura agrupados por tipo y minuto
@@ -367,51 +796,34 @@ class MovimientosUI(QWidget):
                 if not items:
                     continue
 
-                total_grupo = sum(item['costo_total'] for item in items)
                 cantidad_productos = len(items)
                 tipo_principal = items[0]['tipo']
-                tag = 'entrada' if 'ENTRADA' in tipo_principal else 'salida'
-                usuario_nombre = items[0].get('usuario_nombre', 'Sistema')
-
-                icono = "📥" if tag == 'entrada' else "📤"
-                parent_values = [
-                    f"{icono} {tipo_lbl}",
-                    fecha_min,
-                    f"{cantidad_productos} producto(s)",
-                    "---",
-                    "---",
-                    "---",
-                    "---",
-                    f"${total_grupo:,.0f}",
-                    usuario_nombre,
-                ]
+                total_grupo = sum(item.get('costo_total') or 0 for item in items)
+                parent_values, parent_tags = self._valores_compactos(
+                    items[0],
+                    cantidad_productos=cantidad_productos,
+                    total=total_grupo,
+                    fecha=fecha_min,
+                )
                 parent_item = QTreeWidgetItem(parent_values)
-                parent_item.setFont(0, make_font(FONTS['body_bold']))
-                parent_item.setTextAlignment(7, Qt.AlignRight | Qt.AlignVCenter)
-                self._apply_row_colors(parent_item, ['factura', tag])
+                parent_item.setFont(1, make_font(FONTS['body_bold']))
+                parent_item.setTextAlignment(4, Qt.AlignRight | Qt.AlignVCenter)
+                self._set_item_meta(parent_item, tipo=tipo_principal)
+                self._apply_row_colors(parent_item, parent_tags)
                 self.tree.addTopLevelItem(parent_item)
 
                 for mov in items:
-                    producto_nombre = mov.get('producto_nombre', 'N/A')
-                    proveedor_nombre = mov.get('proveedor_nombre', 'N/A') if mov.get('proveedor_id') else '-'
-
-                    child_values = [
-                        str(mov['id']),
-                        "",
-                        mov['tipo'].replace('_', ' '),
-                        producto_nombre,
-                        proveedor_nombre,
-                        f"{mov['cantidad']}",
-                        f"${mov['precio_unitario']:,.0f}",
-                        f"${mov['costo_total']:,.0f}",
-                        "",
-                    ]
+                    child_values, child_tags = self._valores_compactos(mov)
                     child_item = QTreeWidgetItem(child_values)
-                    child_item.setTextAlignment(0, Qt.AlignCenter)
-                    child_item.setTextAlignment(5, Qt.AlignCenter)
-                    child_item.setTextAlignment(6, Qt.AlignRight | Qt.AlignVCenter)
-                    child_item.setTextAlignment(7, Qt.AlignRight | Qt.AlignVCenter)
-                    self._apply_row_colors(child_item, ['detalle', tag])
+                    child_item.setTextAlignment(4, Qt.AlignRight | Qt.AlignVCenter)
+                    self._set_item_meta(
+                        child_item,
+                        tipo=mov.get('tipo'),
+                        mov_id=mov.get('id'),
+                        num_factura=mov.get('num_factura'),
+                        egreso_id=mov.get('id') if mov.get('tipo') == 'EGRESO_CAJA' else None,
+                    )
+                    self._apply_row_colors(child_item, child_tags)
                     parent_item.addChild(child_item)
 
     # ------------------------------------------------------------------
@@ -714,6 +1126,8 @@ class MovimientosUI(QWidget):
         btn_h.addWidget(btn_cancelar, 1)
 
         dlg_layout.addWidget(btn_frame)
+        from ui.widgets import hacer_dialogo_responsivo
+        hacer_dialogo_responsivo(dialog, 600, 700)
         dialog.exec()
 
     def _lbl(self, text):
@@ -771,7 +1185,7 @@ class MovimientosUI(QWidget):
         table.setColumnCount(6)
         table.setHorizontalHeaderLabels(['ID', 'Código', 'Nombre', 'Stock', 'P. Compra', 'P. Venta'])
         table.horizontalHeader().setStyleSheet(
-            "QHeaderView::section { background: #1a2332; color: white; padding: 6px; border: none; font-weight: bold; }"
+            f"QHeaderView::section {{ background: {COLORS['table_header']}; color: {COLORS['table_header_fg']}; padding: 9px 8px; border: none; font-weight: 500; }}"
         )
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -799,7 +1213,7 @@ class MovimientosUI(QWidget):
                     table.setItem(row, 0, QTableWidgetItem(str(p['id'])))
                     table.setItem(row, 1, QTableWidgetItem(p['codigo_barras'] or 'N/A'))
                     table.setItem(row, 2, QTableWidgetItem(p['nombre']))
-                    table.setItem(row, 3, QTableWidgetItem(str(p['stock'])))
+                    table.setItem(row, 3, QTableWidgetItem(formatear_stock(p['stock'], p.get('permite_decimales'))))
                     table.setItem(row, 4, QTableWidgetItem(f"${p.get('precio_compra', 0):,.0f}"))
                     table.setItem(row, 5, QTableWidgetItem(f"${p['precio_venta']:,.0f}"))
             except Exception as e:
@@ -837,7 +1251,7 @@ class MovimientosUI(QWidget):
                 precio_entry.setText(str(precio_compra))
                 precio_entry.setReadOnly(True)
             else:
-                stock_label.setText(f"📦 Stock disponible: {stock} unidades")
+                stock_label.setText(f"📦 Stock disponible: {formatear_stock(stock)} unidades")
                 if stock <= 0:
                     stock_label.setStyleSheet(f"color: {COLORS['danger']}; background: transparent;")
                 else:
@@ -888,7 +1302,7 @@ class MovimientosUI(QWidget):
         table.setColumnCount(4)
         table.setHorizontalHeaderLabels(['ID', 'NIT', 'Nombre', 'Teléfono'])
         table.horizontalHeader().setStyleSheet(
-            "QHeaderView::section { background: #1a2332; color: white; padding: 6px; border: none; font-weight: bold; }"
+            f"QHeaderView::section {{ background: {COLORS['table_header']}; color: {COLORS['table_header_fg']}; padding: 9px 8px; border: none; font-weight: 500; }}"
         )
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -1146,13 +1560,701 @@ class MovimientosUI(QWidget):
     # Detail views
     # ------------------------------------------------------------------
 
+    def _extraer_factura_desde_fila(self, texto):
+        valor = (texto or '').strip()
+        for prefijo in ('Venta ', 'Compra '):
+            idx = valor.find(prefijo)
+            if idx >= 0:
+                return valor[idx + len(prefijo):].strip()
+        return valor.replace('📋', '').strip()
+
+    def _money_cop(self, valor):
+        try:
+            numero = int(round(float(valor or 0)))
+        except (TypeError, ValueError):
+            numero = 0
+        signo = "-" if numero < 0 else ""
+        return f"{signo}${abs(numero):,.0f}".replace(",", ".") + " COP"
+
+    def _marca_producto(self, item):
+        marca = (item.get('producto_marca') or item.get('marca') or '').strip()
+        return marca or 'Sin marca'
+
+    def _estado_pago_visual(self, estado, saldo=0, pagado=0, total=0):
+        estado_norm = (estado or '').upper()
+        if estado_norm == 'PAGADO' or (total and pagado >= total) or saldo <= 0:
+            return 'PAGADO', COLORS['success'], COLORS['success_dark'], "Operación completamente liquidada."
+        if estado_norm == 'PARCIAL' or pagado > 0:
+            return 'PARCIAL', COLORS['warning'], COLORS['warning_dark'], "Quedan abonos por aplicar."
+        return estado_norm or 'PENDIENTE', COLORS['danger'], COLORS['danger_dark'], "No se registran pagos aplicados."
+
+    def _crear_dialogo_detalle(self, titulo, encabezado, color=None, ancho=1120,
+                               alto=700, print_callback=None):
+        dialog = QDialog(self.window())
+        dialog.setWindowTitle(titulo)
+        dialog.resize(ancho, alto)
+        dialog.setStyleSheet(
+            f"QDialog {{ background: {COLORS['bg_secondary']}; }}"
+            f"QScrollArea {{ border: none; background: {COLORS['bg_secondary']}; }}"
+            "QScrollBar:vertical { width: 8px; background: transparent; }"
+            f"QScrollBar::handle:vertical {{ background: {COLORS['border_input']}; border-radius: 4px; }}"
+        )
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QFrame()
+        header.setFixedHeight(58)
+        header.setStyleSheet(f"background: {COLORS['primary_dark']}; border: none;")
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(22, 0, 22, 0)
+        title = QLabel(encabezado)
+        title.setFont(make_font(FONTS['heading']))
+        title.setStyleSheet("color: white; background: transparent; font-weight: 600;")
+        hl.addWidget(title)
+        hl.addStretch()
+        layout.addWidget(header)
+
+        accent = QFrame()
+        accent.setFixedHeight(3)
+        accent.setStyleSheet(f"background: {COLORS['warning']};")
+        layout.addWidget(accent)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        body.setStyleSheet(f"background: {COLORS['bg_secondary']};")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(18, 14, 18, 14)
+        body_layout.setSpacing(10)
+        scroll.setWidget(body)
+        layout.addWidget(scroll, 1)
+
+        footer = QFrame()
+        footer.setStyleSheet(f"background: white; border-top: 1px solid {COLORS['border']};")
+        footer_l = QHBoxLayout(footer)
+        footer_l.setContentsMargins(0, 8, 0, 8)
+        footer_l.addStretch()
+
+        if print_callback:
+            btn_print = QPushButton("🖨️ Imprimir")
+            btn_print.setFont(make_font(FONTS['body_bold']))
+            btn_print.setCursor(Qt.PointingHandCursor)
+            btn_print.setStyleSheet(
+                f"QPushButton {{ background: white; color: {COLORS['primary']}; "
+                f"border: 1px solid {COLORS['border_input']}; border-radius: 8px; "
+                "padding: 9px 32px; }}"
+                f"QPushButton:hover {{ background: {COLORS['bg_secondary']}; }}"
+            )
+            btn_print.clicked.connect(lambda: print_callback(dialog))
+            footer_l.addWidget(btn_print)
+            footer_l.addSpacing(10)
+
+        btn_close = QPushButton("Cerrar")
+        btn_close.setFont(make_font(FONTS['body_bold']))
+        btn_close.setCursor(Qt.PointingHandCursor)
+        btn_close.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
+            f"border-radius: 8px; padding: 9px 44px; }}"
+            f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
+        )
+        btn_close.clicked.connect(dialog.accept)
+        footer_l.addWidget(btn_close)
+        footer_l.addStretch()
+        layout.addWidget(footer)
+        return dialog, body_layout
+
+    def _card_frame(self):
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background: white; border: 1px solid {COLORS['border']}; "
+            "border-radius: 8px; }}"
+        )
+        return frame
+
+    def _add_info_grid(self, layout, campos, columns=4):
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        for idx, (label, value) in enumerate(campos):
+            card = self._card_frame()
+            card_l = QVBoxLayout(card)
+            card_l.setContentsMargins(12, 9, 12, 9)
+            card_l.setSpacing(2)
+            title = QLabel(label)
+            title.setFont(make_font(FONTS['small']))
+            title.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none;")
+            val = QLabel(str(value if value not in (None, '') else 'No registrado'))
+            val.setFont(make_font(FONTS['body_bold']))
+            val.setWordWrap(True)
+            val.setStyleSheet(f"color: {COLORS['text_primary']}; background: transparent; border: none;")
+            card_l.addWidget(title)
+            card_l.addWidget(val)
+            grid.addWidget(card, idx // columns, idx % columns)
+        layout.addLayout(grid)
+
+    def _add_section_title(self, layout, texto):
+        lbl = QLabel(texto)
+        lbl.setFont(make_font(FONTS['heading']))
+        lbl.setStyleSheet(f"color: {COLORS['text_primary']}; background: transparent; margin-top: 2px;")
+        layout.addWidget(lbl)
+
+    def _add_payment_summary(self, layout, total_label, total, paid_label, paid,
+                             saldo, estado, is_sale=False):
+        pct = int(round((float(paid or 0) / float(total or 1)) * 100)) if total else 0
+        pct = max(0, min(100, pct))
+        estado_txt, color, color_dark, hint = self._estado_pago_visual(estado, saldo, paid, total)
+        frame = self._card_frame()
+        frame.setStyleSheet(
+            f"QFrame {{ background: white; border: 1px solid {color}; border-radius: 10px; }}"
+        )
+        outer = QHBoxLayout(frame)
+        outer.setContentsMargins(18, 12, 18, 12)
+        outer.setSpacing(16)
+
+        pct_box = QFrame()
+        pct_box.setFixedWidth(100)
+        pct_box.setStyleSheet("background: transparent; border: none;")
+        pct_l = QVBoxLayout(pct_box)
+        pct_l.setAlignment(Qt.AlignCenter)
+        pct_big = QLabel(f"{pct}%")
+        pct_big.setFont(make_font(FONTS['large']))
+        pct_big.setAlignment(Qt.AlignCenter)
+        pct_big.setStyleSheet(f"color: {color_dark}; background: transparent; border: none;")
+        pct_caption = QLabel("Pagado")
+        pct_caption.setFont(make_font(FONTS['body']))
+        pct_caption.setAlignment(Qt.AlignCenter)
+        pct_caption.setStyleSheet(f"color: {color_dark}; background: transparent; border: none;")
+        pct_l.addWidget(pct_big)
+        pct_l.addWidget(pct_caption)
+        outer.addWidget(pct_box)
+
+        mid = QVBoxLayout()
+        metrics = QHBoxLayout()
+        for label, value, vcolor in [
+            (total_label, total, COLORS['text_primary']),
+            (paid_label, paid, COLORS['success']),
+            ("Saldo pendiente", saldo, COLORS['danger'] if saldo > 0 else COLORS['success']),
+        ]:
+            box = QVBoxLayout()
+            l = QLabel(label)
+            l.setFont(make_font(FONTS['small']))
+            l.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none;")
+            v = QLabel(self._money_cop(value))
+            v.setFont(make_font(FONTS['body_bold']))
+            v.setStyleSheet(f"color: {vcolor}; background: transparent; border: none;")
+            box.addWidget(l)
+            box.addWidget(v)
+            metrics.addLayout(box)
+        mid.addLayout(metrics)
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(pct)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(10)
+        bar.setStyleSheet(
+            f"QProgressBar {{ background: {COLORS['border_light']}; border: none; border-radius: 7px; }}"
+            f"QProgressBar::chunk {{ background: {color}; border-radius: 7px; }}"
+        )
+        mid.addWidget(bar)
+        caption = QLabel(f"{pct}% del total pagado")
+        caption.setFont(make_font(FONTS['body']))
+        caption.setAlignment(Qt.AlignCenter)
+        caption.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none;")
+        mid.addWidget(caption)
+        outer.addLayout(mid, 1)
+
+        status = QFrame()
+        status.setFixedWidth(180)
+        status.setStyleSheet(
+            f"background: {COLORS['bg_primary']}; border: 1px solid {COLORS['border']}; border-radius: 10px;"
+        )
+        st_l = QVBoxLayout(status)
+        st_l.setContentsMargins(12, 9, 12, 9)
+        st_l.setSpacing(6)
+        st_title = QLabel("Estado de pago")
+        st_title.setFont(make_font(FONTS['body_bold']))
+        st_title.setStyleSheet(f"color: {COLORS['text_primary']}; background: transparent; border: none;")
+        st_badge = QLabel(estado_txt)
+        st_badge.setFont(make_font(FONTS['body_bold']))
+        st_badge.setAlignment(Qt.AlignCenter)
+        st_badge.setStyleSheet(
+            f"background: {color}; color: white; border: none; border-radius: 13px; padding: 5px 14px;"
+        )
+        st_hint = QLabel(hint)
+        st_hint.setFont(make_font(FONTS['small']))
+        st_hint.setWordWrap(True)
+        st_hint.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none;")
+        st_l.addWidget(st_title)
+        st_l.addWidget(st_badge)
+        st_l.addWidget(st_hint)
+        outer.addWidget(status)
+        layout.addWidget(frame)
+
+    def _add_note_card(self, layout, titulo, texto):
+        if not texto:
+            return
+        frame = self._card_frame()
+        frame.setStyleSheet(
+            f"QFrame {{ background: #fffaf2; border: 1px solid {COLORS['warning_border']}; border-radius: 8px; }}"
+        )
+        fl = QVBoxLayout(frame)
+        fl.setContentsMargins(12, 9, 12, 9)
+        fl.setSpacing(4)
+        title = QLabel(titulo)
+        title.setFont(make_font(FONTS['body_bold']))
+        title.setStyleSheet(f"color: {COLORS['warning_dark']}; background: transparent; border: none;")
+        body = QLabel(str(texto))
+        body.setFont(make_font(FONTS['body']))
+        body.setWordWrap(True)
+        body.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none;")
+        fl.addWidget(title)
+        fl.addWidget(body)
+        layout.addWidget(frame)
+
+    def _add_abonos_timeline(self, layout, abonos, total):
+        if not abonos:
+            lbl = QLabel("Sin abonos registrados")
+            lbl.setFont(make_font(FONTS['body']))
+            lbl.setStyleSheet(
+                f"background: white; border: 1px solid {COLORS['border']}; "
+                f"border-radius: 8px; padding: 12px; color: {COLORS['text_secondary']};"
+            )
+            layout.addWidget(lbl)
+            return
+
+        saldo_restante = total
+        for abono in abonos:
+            valor = abono.get('monto_abono') or 0
+            saldo_restante = max(saldo_restante - valor, 0)
+            card = self._card_frame()
+            cl = QGridLayout(card)
+            cl.setContentsMargins(12, 8, 12, 8)
+            cl.setHorizontalSpacing(10)
+            cl.setVerticalSpacing(3)
+            fecha = QLabel(str(abono.get('fecha_abono', ''))[:16] or 'No registrado')
+            fecha.setFont(make_font(FONTS['body_bold']))
+            fecha.setStyleSheet(f"color: {COLORS['text_primary']}; background: transparent; border: none;")
+            monto = QLabel(self._money_cop(valor))
+            monto.setFont(make_font(FONTS['body_bold']))
+            monto.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            monto.setStyleSheet(f"color: {COLORS['success']}; background: transparent; border: none;")
+            meta = QLabel(
+                f"Método: {abono.get('tipo_pago') or 'No registrado'}    "
+                f"Comprobante: {abono.get('numero_comprobante') or '-'}    "
+                f"Usuario: {abono.get('usuario') or 'Sistema'}"
+            )
+            meta.setFont(make_font(FONTS['small']))
+            meta.setWordWrap(True)
+            meta.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none;")
+            saldo = QLabel(f"Saldo restante: {self._money_cop(saldo_restante)}")
+            saldo.setFont(make_font(FONTS['small']))
+            saldo.setStyleSheet(f"color: {COLORS['warning_dark']}; background: transparent; border: none;")
+            cl.addWidget(fecha, 0, 0)
+            cl.addWidget(monto, 0, 1)
+            cl.addWidget(meta, 1, 0, 1, 2)
+            cl.addWidget(saldo, 2, 0, 1, 2)
+            layout.addWidget(card)
+
+    def _add_table(self, layout, headers, rows, min_height=120, max_height=320,
+                   right_align_columns=None):
+        if right_align_columns is None:
+            right_align_columns = set(range(1, len(headers)))
+        else:
+            right_align_columns = set(right_align_columns)
+        table = QTableWidget()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.horizontalHeader().setStyleSheet(
+            f"QHeaderView::section {{ background: {COLORS['table_header']}; "
+            f"color: {COLORS['table_header_fg']}; padding: 8px 7px; border: none; font-weight: 500; }}"
+        )
+        table.setStyleSheet(
+            f"QTableWidget {{ background: white; border: 1px solid {COLORS['border']}; "
+            "border-radius: 10px; gridline-color: #EEF1F6; }}"
+            f"QTableWidget::item {{ padding: 5px 7px; color: {COLORS['text_primary']}; }}"
+        )
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.setShowGrid(False)
+
+        for row_values in rows:
+            row = table.rowCount()
+            table.insertRow(row)
+            for col, value in enumerate(row_values):
+                item = QTableWidgetItem(str(value if value not in (None, '') else '-'))
+                if col in right_align_columns:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                table.setItem(row, col, item)
+
+        for col in range(len(headers)):
+            mode = QHeaderView.Stretch if col == 0 else QHeaderView.ResizeToContents
+            table.horizontalHeader().setSectionResizeMode(col, mode)
+        row_h = table.verticalHeader().defaultSectionSize()
+        head_h = table.horizontalHeader().sizeHint().height()
+        height = max(min_height, min(head_h + max(1, len(rows)) * row_h + 16, max_height))
+        table.setMinimumHeight(height)
+        table.setMaximumHeight(height)
+        layout.addWidget(table)
+        return table
+
+    def _obtener_venta_detalle(self, num_factura):
+        conn = self.db_manager.conectar()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                SELECT v.*, c.nombre as cliente_nombre, u.nombre_completo as usuario_nombre
+                FROM ventas v
+                LEFT JOIN clientes c ON v.cliente_id = c.id
+                LEFT JOIN usuarios u ON v.usuario_id = u.id
+                WHERE v.numero_factura = ?
+                LIMIT 1
+            ''', (num_factura,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            venta = dict(row)
+            cursor.execute('''
+                SELECT dv.*, p.nombre as producto_nombre, p.marca as producto_marca
+                FROM detalle_ventas dv
+                LEFT JOIN productos p ON p.id = dv.producto_id
+                WHERE dv.venta_id = ?
+                ORDER BY dv.id
+            ''', (venta['id'],))
+            venta['detalles'] = [dict(r) for r in cursor.fetchall()]
+            return venta
+        finally:
+            conn.close()
+
+    def _obtener_compra_detalle(self, num_factura):
+        conn = self.db_manager.conectar()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                SELECT c.*, p.nombre as proveedor_nombre, u.nombre_completo as usuario_nombre
+                FROM compras c
+                LEFT JOIN proveedores p ON c.proveedor_id = p.id
+                LEFT JOIN usuarios u ON c.usuario_id = u.id
+                WHERE c.numero_factura = ?
+                LIMIT 1
+            ''', (num_factura,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            compra = dict(row)
+            cursor.execute('''
+                SELECT dc.*, p.nombre as producto_nombre, p.marca as producto_marca
+                FROM detalle_compras dc
+                LEFT JOIN productos p ON p.id = dc.producto_id
+                WHERE dc.compra_id = ?
+                ORDER BY dc.id
+            ''', (compra['id'],))
+            compra['productos'] = [dict(r) for r in cursor.fetchall()]
+            cursor.execute('''
+                SELECT id, monto_abono, fecha_abono, tipo_pago,
+                       numero_comprobante, usuario, observaciones
+                FROM abonos_compras
+                WHERE id_compra = ?
+                ORDER BY fecha_abono ASC, id ASC
+            ''', (compra['id'],))
+            compra['abonos'] = [dict(r) for r in cursor.fetchall()]
+            return compra
+        finally:
+            conn.close()
+
+    def _obtener_egreso_detalle(self, egreso_id):
+        conn = self.db_manager.conectar()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT * FROM egresos_caja WHERE id = ? LIMIT 1', (egreso_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def _imprimir_factura_desde_detalle(self, ventana_padre, num_factura):
+        try:
+            movimientos = self.movimientos_service.obtener_historial(limite=1000)
+            items_factura = [
+                m for m in movimientos
+                if m.get('num_factura') == num_factura
+                and m.get('tipo') != 'COBRO_CREDITO'
+            ]
+            if not items_factura:
+                QMessageBox.warning(
+                    ventana_padre,
+                    "Sin datos",
+                    f"No se encontraron productos para imprimir la factura {num_factura}"
+                )
+                return
+            total_factura = sum(item.get('costo_total') or 0 for item in items_factura)
+            self._imprimir_factura_movimiento(
+                ventana_padre, num_factura, items_factura, total_factura
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                ventana_padre,
+                "Error",
+                f"No se pudo imprimir la factura:\n{str(e)}"
+            )
+
+    def _parse_egreso_referencia_pago(self, egreso):
+        descripcion = egreso.get('descripcion') or ''
+        ref = {}
+        proveedor = re.search(r'Pago a proveedor\s+(.+?)(?:\s+-\s+|$)', descripcion, re.IGNORECASE)
+        compra = re.search(r'Compra\s+#?([A-Za-z0-9\-]+)', descripcion, re.IGNORECASE)
+        factura = re.search(r'Factura\s+([A-Za-z0-9\-]+)', descripcion, re.IGNORECASE)
+        abono = re.search(r'Abono\s+#?([A-Za-z0-9\-]+)', descripcion, re.IGNORECASE)
+        if proveedor:
+            ref['Proveedor'] = proveedor.group(1).strip()
+        if compra:
+            ref['Compra asociada'] = compra.group(1).strip()
+        if factura:
+            ref['Factura'] = factura.group(1).strip()
+        if abono:
+            ref['Abono relacionado'] = abono.group(1).strip()
+        if ref:
+            ref['Valor pagado'] = self._money_cop(egreso.get('monto') or 0)
+            ref['Fecha del abono'] = str(egreso.get('fecha_egreso', ''))[:16] or 'No registrado'
+            ref['Método de pago'] = egreso.get('metodo_pago') or 'No registrado'
+        return ref
+
+    def _add_egreso_main_card(self, layout, egreso):
+        frame = self._card_frame()
+        fl = QGridLayout(frame)
+        fl.setContentsMargins(16, 12, 16, 12)
+        fl.setHorizontalSpacing(16)
+        fl.setVerticalSpacing(7)
+
+        valor = QLabel(self._money_cop(egreso.get('monto') or 0))
+        valor.setFont(make_font(FONTS['large']))
+        valor.setStyleSheet(f"color: {COLORS['warning_dark']}; background: transparent; border: none;")
+        desc = QLabel(egreso.get('descripcion') or 'No registrado')
+        desc.setFont(make_font(FONTS['body']))
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color: {COLORS['text_primary']}; background: transparent; border: none;")
+
+        fl.addWidget(QLabel("Valor"), 0, 0)
+        fl.addWidget(valor, 0, 1)
+        fl.addWidget(QLabel("Descripción"), 1, 0)
+        fl.addWidget(desc, 1, 1)
+        for row in range(2):
+            label = fl.itemAtPosition(row, 0).widget()
+            label.setFont(make_font(FONTS['small']))
+            label.setStyleSheet(f"color: {COLORS['text_secondary']}; background: transparent; border: none;")
+        layout.addWidget(frame)
+
+    def _add_reference_grid(self, layout, titulo, campos):
+        frame = self._card_frame()
+        fl = QVBoxLayout(frame)
+        fl.setContentsMargins(12, 10, 12, 10)
+        fl.setSpacing(8)
+        title = QLabel(titulo)
+        title.setFont(make_font(FONTS['body_bold']))
+        title.setStyleSheet(f"color: {COLORS['text_primary']}; background: transparent; border: none;")
+        fl.addWidget(title)
+        self._add_info_grid(fl, list(campos.items()) if campos else [("Referencia", "No registrado")], columns=3)
+        layout.addWidget(frame)
+
+    def ver_detalle_venta_factura(self, num_factura):
+        venta = self._obtener_venta_detalle(num_factura)
+        if not venta:
+            QMessageBox.warning(self, "Sin datos", f"No se encontró la venta {num_factura}")
+            return
+
+        total = venta.get('total') or 0
+        pagado = venta.get('monto_pagado') or 0
+        saldo = max(total - pagado, 0)
+        dialog, body = self._crear_dialogo_detalle(
+            f"Detalle Venta: {num_factura}",
+            f"📦 Salida de inventario #{num_factura}",
+            COLORS['danger'],
+            print_callback=lambda dlg: self._imprimir_factura_desde_detalle(dlg, num_factura)
+        )
+        self._add_info_grid(body, [
+            ("Factura", num_factura),
+            ("Fecha", str(venta.get('fecha', ''))[:16]),
+            ("Cliente", venta.get('cliente_nombre') or 'Cliente General'),
+            ("Usuario", venta.get('usuario_nombre') or venta.get('vendedor') or 'Sistema'),
+        ])
+        self._add_payment_summary(
+            body,
+            "Total venta",
+            total,
+            "Monto pagado",
+            pagado,
+            saldo,
+            venta.get('estado_pago'),
+            is_sale=True
+        )
+
+        content = QHBoxLayout()
+        content.setSpacing(12)
+        left = self._card_frame()
+        left_l = QVBoxLayout(left)
+        left_l.setContentsMargins(10, 10, 10, 10)
+        right = self._card_frame()
+        right.setFixedWidth(330)
+        right_l = QVBoxLayout(right)
+        right_l.setContentsMargins(12, 10, 12, 10)
+        right_l.setSpacing(8)
+
+        self._add_table(left_l, ['Producto', 'Marca', 'Cantidad', 'Precio unit.', 'Subtotal'], [
+            [
+                det.get('producto_nombre', 'Producto'),
+                self._marca_producto(det),
+                formatear_stock(det.get('cantidad', 0)),
+                self._money_cop(det.get('precio_unitario') or 0),
+                self._money_cop(det.get('subtotal') or 0),
+            ]
+            for det in venta.get('detalles', [])
+        ], min_height=220, max_height=360, right_align_columns={2, 3, 4})
+
+        self._add_section_title(right_l, "Resumen de cobro")
+        self._add_info_grid(right_l, [
+            ("Método de pago", venta.get('metodo_pago') or 'No registrado'),
+            ("Estado", venta.get('estado_pago') or 'No registrado'),
+            ("Caja", venta.get('caja_nombre') or 'Caja principal'),
+            ("Cajero", venta.get('usuario_nombre') or venta.get('vendedor') or 'Sistema'),
+            ("Total recibido", self._money_cop(pagado)),
+        ], columns=1)
+        self._add_note_card(right_l, "Observaciones", venta.get('observaciones'))
+        right_l.addStretch()
+        content.addWidget(left, 1)
+        content.addWidget(right)
+        body.addLayout(content)
+        dialog.exec()
+
+    def ver_detalle_compra_factura(self, num_factura):
+        compra = self._obtener_compra_detalle(num_factura)
+        if not compra:
+            QMessageBox.warning(self, "Sin datos", f"No se encontró la compra {num_factura}")
+            return
+
+        total = compra.get('total') or 0
+        abonos = compra.get('abonos', [])
+        total_abonos = sum((a.get('monto_abono') or 0) for a in abonos)
+        monto_pagado = compra.get('monto_pagado')
+        if monto_pagado is None:
+            monto_pagado = total_abonos
+        saldo = compra.get('saldo_pendiente')
+        if saldo is None:
+            saldo = max(total - monto_pagado, 0)
+
+        dialog, body = self._crear_dialogo_detalle(
+            f"Detalle Compra: {num_factura}",
+            f"📦 Entrada de inventario #{num_factura}",
+            COLORS['success'],
+            print_callback=lambda dlg: self._imprimir_factura_desde_detalle(dlg, num_factura)
+        )
+        self._add_info_grid(body, [
+            ("Factura", num_factura),
+            ("Fecha compra", str(compra.get('fecha', ''))[:16]),
+            ("Proveedor", compra.get('proveedor_nombre')),
+            ("Usuario", compra.get('usuario_nombre') or 'Sistema'),
+        ])
+        self._add_payment_summary(
+            body,
+            "Total compra",
+            total,
+            "Pagado acumulado",
+            monto_pagado,
+            saldo,
+            compra.get('estado_pago')
+        )
+
+        content = QHBoxLayout()
+        content.setSpacing(12)
+        left = self._card_frame()
+        left_l = QVBoxLayout(left)
+        left_l.setContentsMargins(10, 10, 10, 10)
+        right = self._card_frame()
+        right.setFixedWidth(380)
+        right_l = QVBoxLayout(right)
+        right_l.setContentsMargins(12, 10, 12, 10)
+        right_l.setSpacing(8)
+
+        self._add_table(left_l, ['Producto', 'Marca', 'Cantidad', 'Precio unit.', 'Subtotal'], [
+            [
+                prod.get('producto_nombre', 'Producto'),
+                self._marca_producto(prod),
+                formatear_stock(prod.get('cantidad', 0)),
+                self._money_cop(prod.get('precio_unitario') or 0),
+                self._money_cop(prod.get('subtotal') or 0),
+            ]
+            for prod in compra.get('productos', [])
+        ], min_height=220, max_height=360, right_align_columns={2, 3, 4})
+        self._add_note_card(left_l, "Observaciones", compra.get('observaciones'))
+
+        self._add_section_title(right_l, "Historial de abonos")
+        self._add_abonos_timeline(right_l, abonos, total)
+        right_l.addStretch()
+        content.addWidget(left, 1)
+        content.addWidget(right)
+        body.addLayout(content)
+        dialog.exec()
+
+    def ver_detalle_egreso(self, egreso_id):
+        egreso = self._obtener_egreso_detalle(egreso_id)
+        if not egreso:
+            QMessageBox.warning(self, "Sin datos", f"No se encontró el egreso #{egreso_id}")
+            return
+
+        dialog, body = self._crear_dialogo_detalle(
+            f"Detalle Egreso: {egreso_id}",
+            f"💸 Egreso de caja #{egreso_id}",
+            COLORS['warning'] if 'warning' in COLORS else COLORS['danger'],
+            ancho=980,
+            alto=600
+        )
+        self._add_info_grid(body, [
+            ("Fecha", str(egreso.get('fecha_egreso', ''))[:16]),
+            ("Categoría", egreso.get('categoria')),
+            ("Valor", self._money_cop(egreso.get('monto') or 0)),
+            ("Método pago", egreso.get('metodo_pago')),
+            ("Usuario", egreso.get('usuario')),
+            ("Comprobante", egreso.get('numero_comprobante') or egreso.get('comprobante') or '-'),
+        ], columns=3)
+        self._add_egreso_main_card(body, egreso)
+        self._add_reference_grid(body, "Referencia del pago", self._parse_egreso_referencia_pago(egreso))
+        dialog.exec()
+
     def _on_tree_double_click(self, item, column):
         """Handle double-click on tree item, dispatch to proper detail view."""
+        meta = item.data(0, Qt.UserRole) or {}
+        tipo_meta = (meta.get('tipo') or '').upper()
+        if meta.get('egreso_id'):
+            self.ver_detalle_egreso(meta['egreso_id'])
+            return
+        if meta.get('num_factura'):
+            self.ver_detalle_factura(meta['num_factura'])
+            return
+        if meta.get('mov_id') and tipo_meta == 'EGRESO_CAJA':
+            self.ver_detalle_egreso(meta['mov_id'])
+            return
+        if meta.get('mov_id') and tipo_meta != 'ABONO_VENTA':
+            self.ver_detalle_movimiento(meta['mov_id'])
+            return
+
         primer_valor = item.text(0).strip()
+        tipo_texto = item.text(2).strip().upper()
 
         if primer_valor.startswith('📋'):
-            num_factura = primer_valor.replace('📋', '').strip()
+            num_factura = self._extraer_factura_desde_fila(primer_valor)
             self.ver_detalle_factura(num_factura)
+            return
+
+        if primer_valor.startswith('💸'):
+            try:
+                egreso_id = int(primer_valor.replace('💸', '').replace('EGRESO-', '').strip())
+                self.ver_detalle_egreso(egreso_id)
+            except (ValueError, TypeError):
+                pass
             return
 
         if primer_valor.startswith('📥') or primer_valor.startswith('📤'):
@@ -1164,6 +2266,16 @@ class MovimientosUI(QWidget):
         try:
             mov_id = int(primer_valor)
         except (ValueError, TypeError):
+            return
+
+        if 'EGRESO CAJA' in tipo_texto or 'EGRESO DE CAJA' in tipo_texto:
+            self.ver_detalle_egreso(mov_id)
+            return
+
+        parent = item.parent()
+        if parent and parent.text(0).strip().startswith('📋'):
+            num_factura = self._extraer_factura_desde_fila(parent.text(0).strip())
+            self.ver_detalle_factura(num_factura)
             return
 
         self.ver_detalle_movimiento(mov_id)
@@ -1259,6 +2371,8 @@ class MovimientosUI(QWidget):
             layout.addWidget(btn_cerrar, alignment=Qt.AlignCenter)
             layout.addSpacing(15)
 
+            from ui.widgets import hacer_dialogo_responsivo
+            hacer_dialogo_responsivo(dialog, 500, 600)
             dialog.exec()
 
         except Exception as e:
@@ -1277,6 +2391,14 @@ class MovimientosUI(QWidget):
             if not items_factura:
                 QMessageBox.warning(self, "Sin datos",
                                     f"No se encontraron productos para la factura {num_factura}")
+                return
+
+            tipo_factura = items_factura[0].get('tipo')
+            if tipo_factura == 'SALIDA_VENTA':
+                self.ver_detalle_venta_factura(num_factura)
+                return
+            if tipo_factura == 'ENTRADA_COMPRA':
+                self.ver_detalle_compra_factura(num_factura)
                 return
 
             dialog = QDialog(self.window())
@@ -1386,7 +2508,7 @@ class MovimientosUI(QWidget):
                                 abonos_tbl.setColumnCount(4)
                                 abonos_tbl.setHorizontalHeaderLabels(['Fecha', 'Monto', 'Tipo Pago', 'Usuario'])
                                 abonos_tbl.horizontalHeader().setStyleSheet(
-                                    "QHeaderView::section { background: #e3f2fd; color: black; padding: 4px; border: none; font-weight: bold; font-size: 8pt; }"
+                                    "QHeaderView::section { background: #e3f2fd; color: black; padding: 4px; border: none; font-weight: 500; font-size: 8pt; }"
                                 )
                                 abonos_tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
                                 abonos_tbl.setSelectionMode(QAbstractItemView.NoSelection)
@@ -1492,7 +2614,7 @@ class MovimientosUI(QWidget):
                                     abonos_table.setColumnCount(4)
                                     abonos_table.setHorizontalHeaderLabels(['Fecha', 'Monto', 'Tipo', 'Usuario'])
                                     abonos_table.horizontalHeader().setStyleSheet(
-                                        "QHeaderView::section { background: #e3f2fd; color: black; padding: 4px; border: none; font-weight: bold; font-size: 8pt; }"
+                                        "QHeaderView::section { background: #e3f2fd; color: black; padding: 4px; border: none; font-weight: 500; font-size: 8pt; }"
                                     )
                                     abonos_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
                                     abonos_table.setSelectionMode(QAbstractItemView.NoSelection)
@@ -1622,7 +2744,7 @@ class MovimientosUI(QWidget):
             table.setColumnCount(7)
             table.setHorizontalHeaderLabels(['ID', 'Producto', 'Tipo Movimiento', 'Cantidad', 'Precio Unitario', 'Total', 'Proveedor'])
             table.horizontalHeader().setStyleSheet(
-                "QHeaderView::section { background: #1a2332; color: white; padding: 6px; border: none; font-weight: bold; }"
+                f"QHeaderView::section {{ background: {COLORS['table_header']}; color: {COLORS['table_header_fg']}; padding: 9px 8px; border: none; font-weight: 500; }}"
             )
             table.setSelectionBehavior(QAbstractItemView.SelectRows)
             table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1847,7 +2969,7 @@ class MovimientosUI(QWidget):
             table.setColumnCount(7)
             table.setHorizontalHeaderLabels(['ID', 'Producto', 'Tipo Movimiento', 'Cantidad', 'Precio Unitario', 'Total', 'Proveedor'])
             table.horizontalHeader().setStyleSheet(
-                "QHeaderView::section { background: #1a2332; color: white; padding: 6px; border: none; font-weight: bold; }"
+                f"QHeaderView::section {{ background: {COLORS['table_header']}; color: {COLORS['table_header_fg']}; padding: 9px 8px; border: none; font-weight: 500; }}"
             )
             table.setSelectionBehavior(QAbstractItemView.SelectRows)
             table.setEditTriggers(QAbstractItemView.NoEditTriggers)
