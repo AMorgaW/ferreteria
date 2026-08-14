@@ -19,7 +19,9 @@ Fuentes de verdad (no mezclar):
   y **solo** se ejecuta contra Postgres en
   ``SupabaseSyncService._ensure_remote_schema``. El ledger de inventario
   (Fase 1C) vive en ``supabase_inventory_ledger.sql`` y se aplica después,
-  nunca contra SQLite. No es un script SQLite.
+  nunca contra SQLite. El coordinador (Fase 1D) vive en
+  ``supabase_inventory_coordinator.sql`` y se aplica después del ledger.
+  Ninguno es un script SQLite. No copian ``productos.stock`` al arrancar.
 
 Por qué ``INTEGER PRIMARY KEY`` y no ``AUTOINCREMENT`` en tablas de negocio:
 SQLite trata ``INTEGER PRIMARY KEY`` (el tipo debe ser exactamente INTEGER)
@@ -141,6 +143,7 @@ POSTGRES_ONLY_STATEMENTS: Tuple[str, ...] = (
 REMOTE_MIGRATION_FILENAME = "supabase_local_first_migration.sql"
 REMOTE_IDENTITY_MIGRATION_FILENAME = "supabase_sync_identity.sql"
 REMOTE_LEDGER_MIGRATION_FILENAME = "supabase_inventory_ledger.sql"
+REMOTE_COORDINATOR_MIGRATION_FILENAME = "supabase_inventory_coordinator.sql"
 
 
 def _quote_ident(name: str) -> str:
@@ -357,6 +360,28 @@ def apply_postgres_ledger_sql(conn, sql: str) -> None:
     except Exception as exc:
         raise SchemaBootstrapError(
             f"Fallo aplicando ledger PostgreSQL: {exc}"
+        ) from exc
+
+
+def apply_postgres_coordinator_sql(conn, sql: str) -> None:
+    """Aplica el DDL/RPC del coordinador de inventario en PostgreSQL.
+
+    Nunca debe llamarse con una conexión SQLite. No modifica productos.stock.
+    No ejecuta el corte legacy. El bootstrap SQLite no referencia este SQL.
+    """
+    if is_sqlite_connection(conn):
+        raise SchemaBootstrapError(
+            "Migración del coordinador PostgreSQL no debe ejecutarse contra SQLite"
+        )
+    if not (sql or "").strip():
+        raise SchemaBootstrapError("SQL del coordinador PostgreSQL vacío")
+    try:
+        _cursor(conn).execute(sql)
+    except SchemaBootstrapError:
+        raise
+    except Exception as exc:
+        raise SchemaBootstrapError(
+            f"Fallo aplicando coordinador PostgreSQL: {exc}"
         ) from exc
 
 

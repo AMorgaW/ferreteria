@@ -35,17 +35,21 @@ El compañero `ferrepro-recepcion-qa` es QA adversarial. No eres QA. Tras implem
 - **Líneas no inventariables:** FLETE, DESCUENTO, SERVICIO, REDONDEO, IMPUESTO, OTRO.
 - Fencing/split-brain está especificado en `docs/fase0/ADR-0003-fencing-y-device-id.md`. No improvisar otro modelo.
 
-## Fase 0 (cerrada), Fase 1A (bootstrap SQLite, cerrada), Fase 1B (autorizada)
+## Fase 0 (cerrada), Fase 1A–1C (cerradas), Fase 1D (autorizada)
 
 Fase 0: documentación, ADRs, harness, tests de ruptura. Producción de inventario no se tocó ahí.
 
 **Fase 1A:** bootstrap SQLite canónico en `schema_bootstrap.py` + DDL por motor. No reabrir SERIAL vs INTEGER.
 
-**Fase 1B (esta subfase):** identidad UUID (`local_id`) y registry canónico de sync en `sync_registry.py`. Device id persistente básico. No reabrir el registry como listas paralelas.
+**Fase 1B:** identidad UUID (`local_id`) y registry canónico de sync en `sync_registry.py`. Device id persistente básico.
 
-**Prohibido en 1B y aún no autorizado (1C+):** coordinador de inventario, ledger `InventoryOperation`, exclusión autoritativa de `productos.stock`, barcodes múltiples, recepción, OCR, fencing/leases/`OFFLINE_INVENTORY_AUTHORITY`, UI nueva, autoridad global de ventas/compras.
+**Fase 1C:** ledger `inventory_commands` / `inventory_operations` e idempotencia. No aplica stock.
 
-Contrato canónico: `docs/fase0/`. Schema: `schema_bootstrap.py`. Registry: `sync_registry.py`.
+**Fase 1D (esta subfase):** coordinador PostgreSQL `apply_inventory_command` + `inventory_balances`. No reabrir el ledger 1C. No migrar writers productivos.
+
+**Prohibido en 1D y aún no autorizado (1E+):** conectar POS/compras/devoluciones/mezclas/ajustes al coordinador, `APPLY_AUTHORITATIVE_EXCLUDE = True`, barcodes múltiples, recepción, OCR, fencing/leases/`OFFLINE_INVENTORY_AUTHORITY`, UI nueva.
+
+Contrato canónico: `docs/fase0/`. Schema: `schema_bootstrap.py`. Registry: `sync_registry.py`. Coordinador: `inventory_coordinator.py`.
 
 ## Verificación contra código
 

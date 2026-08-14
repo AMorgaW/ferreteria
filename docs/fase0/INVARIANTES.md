@@ -8,7 +8,7 @@ Cada invariante tiene un test en `tests/fase0/`.
 
 | ID | Invariante deseado | Hoy | Test |
 |---|---|---|---|
-| INV-01 | Dos dispositivos no confirman ambos el último stock | Dos SQLite con stock=50 venden 50 cada una; ambas aprueban | CAR `test_carrera_dos_sqlite_venden_el_ultimo_stock` + XFAIL `test_contrato_coordinador_inventario_existe`. El xfail `test_contrato_unicidad_global_ultimo_stock` es un **centinela local** (`applied==1` sobre el mismo UPDATE); hay que reescribirlo cuando exista el coordinador. |
+| INV-01 | Dos dispositivos no confirman ambos el último stock | Dos SQLite con stock=50 venden 50 cada una; ambas aprueban. El coordinador 1D serializa esto en PostgreSQL (`tests/fase1d` integración). | CAR `test_carrera_dos_sqlite_venden_el_ultimo_stock` + XFAIL `test_contrato_coordinador_inventario_existe` (nombre histórico `apply_inventory_operation`; 1D expone `apply_inventory_command`). El xfail `test_contrato_unicidad_global_ultimo_stock` es un **centinela local** de dos SQLite; **no se elimina** hasta retirar ese flujo. |
 | INV-02 | `productos.stock` no es snapshot LWW autoritativo | `enqueue_entity` + UPSERT `stock=EXCLUDED.stock` pisan valores | CAR `test_snapshot_lww_pisa_stock` + XFAIL `test_contrato_payload_productos_sin_stock_autoritativo` |
 | INV-03 | Un solo writer de ingreso por factura de proveedor | `crear_compra`, `MovimientosService` y `InventarioRepository` incrementan con `ENTRADA_COMPRA` | CAR `test_tres_caminos_entrada_compra` + XFAIL `test_contrato_entrada_compra_unica` |
 | INV-04 | Extracción/borrador no muta stock | No hay tablas de recepción; las compras sí mutan | XFAIL `test_contrato_tablas_recepcion_existen` |

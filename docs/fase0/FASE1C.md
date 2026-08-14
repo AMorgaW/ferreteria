@@ -1,7 +1,8 @@
 # Fase 1C — Inventory command, operaciones e idempotencia
 
 **Estado:** implementada. Autorizada tras GO de QA de Fase 1B.2 y GO humano.
-**Prohibido avanzar a Fase 1D** (coordinador PostgreSQL de stock) sin GO humano.
+Fase 1D (coordinador PostgreSQL) se implementó después, con GO humano;
+ver [FASE1D.md](FASE1D.md). Este documento no autoriza migrar writers.
 
 ## Qué es Fase 1C
 
@@ -127,6 +128,7 @@ python -m unittest discover -s tests/fase1c -v
 ```
 
 INV-06 e INV-07 (existencia del ledger y centinela `operation_id`+`resultado`)
-pasan. INV-01, INV-02 y el coordinador siguen xfail.
+pasan. INV-01, INV-02 y el coordinador de stock en SQLite siguen xfail.
+El coordinador PostgreSQL es Fase 1D.
 
-**STOP — no avanzar a Fase 1D.**
+**STOP — no migrar writers productivos (eso es 1E).**

@@ -26,10 +26,12 @@ Eres QA adversarial de FERREPRO. Tu trabajo es **demostrar que el entregable est
 
 - Fase 0: no debía tocar producción. Ya cerrada.
 - Fase 1A (bootstrap SQLite): cerrada con GO.
-- Fase 1B (identidad + registry de sync): **autorizada**. Auditar el registry único, UUID estable, migración segura. No rechazarla por haber unificado listas de sync.
-- Fase 1C+ (coordinador, ledger, barcodes, recepción, fencing): **no autorizar**. Decisión humana.
+- Fase 1B / 1B.1 / 1B.2: cerradas con GO.
+- Fase 1C (ledger): cerrada con GO.
+- Fase 1D (coordinador PostgreSQL): **autorizada**. Auditar RPC atómica, locking real vs contract, idempotencia remota, separación de `inventory_balances` vs `productos.stock`, REVOKE PUBLIC, ausencia de LWW. No rechazarla por no haber migrado POS.
+- Fase 1E+ (writers productivos, barcodes, recepción, fencing): **no autorizar**. Decisión humana.
 
-Al auditar 1B: una sola fuente de sync; listas derivadas no divergen; `productos.local_id` es el UUID global; BD vieja recibe identidades sin perder datos; `APPLY_AUTHORITATIVE_EXCLUDE` sigue False; xfail de stock/overselling/operation_id/barcodes/recepción/autoridad offline siguen xfail; no se adelantó 1C.
+Al auditar 1D: concurrencia PostgreSQL solo es certificable si los tests de integración se ejecutaron contra PostgreSQL real. UNIT/CONTRACT no equivalen a locking. `APPLY_AUTHORITATIVE_EXCLUDE` sigue False. El xfail de dos SQLite de INV-01 sigue xfail. No se adelantó 1E.
 
 ## Veredicto
 

@@ -252,9 +252,14 @@ class SupabaseSyncService:
             return
         with remote.cursor() as cursor:
             cursor.execute(script_path.read_text(encoding='utf-8'))
+        from inventory_coordinator import postgres_coordinator_sql
         from inventory_ledger import postgres_ledger_sql
-        from schema_bootstrap import apply_postgres_ledger_sql
+        from schema_bootstrap import (
+            apply_postgres_coordinator_sql,
+            apply_postgres_ledger_sql,
+        )
         apply_postgres_ledger_sql(remote, postgres_ledger_sql())
+        apply_postgres_coordinator_sql(remote, postgres_coordinator_sql())
         self._schema_ensured = True
 
     def test_connection(self):

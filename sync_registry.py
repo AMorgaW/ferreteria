@@ -17,9 +17,9 @@ class SyncRegistryError(Exception):
     """Registry inválido: ciclo, padre ausente o identificador desconocido."""
 
 
-# False en 1B–1C: declara el contrato de stock-como-proyección sin cambiar el
-# UPSERT productivo. Pasar a True corresponde al coordinador (fase posterior),
-# no a persistir el ledger.
+# False en 1B–1D: declara el contrato de stock-como-proyección sin cambiar el
+# UPSERT productivo. El coordinador 1D usa inventory_balances, no productos.stock.
+# Pasar a True corresponde a retirar el flujo LWW de writers legacy (fase posterior).
 APPLY_AUTHORITATIVE_EXCLUDE = False
 
 # Prefijo canónico del UNIQUE(local_id) en PostgreSQL. El runtime histórico
@@ -178,11 +178,23 @@ NON_SYNC_TABLES: Dict[str, str] = {
     "sync_conflicts": "cola local",
     "sync_state": "watermark local",
     "inventory_commands": (
-        "ledger append-only/idempotente; no LWW. Transporte especial futuro. "
-        "1C no activa push/pull."
+        "ledger append-only/idempotente; no LWW. El resultado remoto lo escribe "
+        "solo el coordinador 1D. No push/pull genérico."
     ),
     "inventory_operations": (
-        "líneas del ledger; FK al comando. No LWW. Transporte especial futuro."
+        "líneas del ledger; FK al comando. No LWW. No push/pull genérico."
+    ),
+}
+
+# Tablas PostgreSQL del coordinador 1D. No existen en SQLite. Nunca LWW.
+COORDINATOR_REMOTE_TABLES: Dict[str, str] = {
+    "inventory_balances": (
+        "autoridad online de cantidad (BIGINT escala 1000). "
+        "Solo el RPC apply_inventory_command / seed_inventory_balance escribe."
+    ),
+    "inventory_balance_init": (
+        "registro one-shot de inicialización. ON CONFLICT DO NOTHING; "
+        "no pisa un balance más nuevo."
     ),
 }
 
