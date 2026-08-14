@@ -1,16 +1,23 @@
 # Writers actuales de `productos.stock`
 
-Re-inventario **Fase 1E.0** (verificado contra código, no solo este archivo).
-La lista canónica ejecutable está en `tests/fase0/stock_writers.py`.
+Re-inventario **Fase 1E.0** (verificado contra código). Writers negativos
+**preparados en 1E.1** (código listo, cutover OFF). La lista canónica
+ejecutable está en `tests/fase0/stock_writers.py`.
 El scanner (`tests/fase0/test_stock_writers.py` y `tests/fase1e`) falla si
-aparece un `UPDATE`/`INSERT` directo de `productos.stock` que no esté listado.
+aparece un `UPDATE`/`INSERT` directo de `productos.stock` que no esté
+listado, ahora a **nivel función + SQL**.
+
+Cutover OFF: el SQL legacy de writers inventariados es
+`LEGACY_ALLOWED_PRE_CUTOVER`. Un UPDATE en una función no inventariada es
+`UNTRACKED_DIRECT_WRITER`.
 
 **Ninguna de estas rutas es la autoridad futura.** Todas mutan la
 proyección local y (casi todas) encolan un snapshot LWW.
 `inventory_balances.quantity_scaled` es la autoridad online diseñada.
 `productos.stock` sigue legacy/LWW hasta el cutover único (1E.3).
 `APPLY_AUTHORITATIVE_EXCLUDE = False` (no cambiar en 1E.0).
-`INVENTORY_CUTOVER_ENABLED = False` (gateway creado; writers no lo llaman).
+`INVENTORY_CUTOVER_ENABLED = False` (gateway creado; writers negativos
+preparados en 1E.1, **no** activados). Ver [FASE1E1.md](FASE1E1.md).
 
 Clasificación:
 
@@ -36,11 +43,11 @@ Directos (W01–W18) = 18. Derivados (D01–D04) = 4.
 | ID | Archivo | Función | Tipo | Signo | TX | `productos.stock` | Movimiento | Outbox | Offline | Callers | Riesgo |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | W01 | `repositories/compras_repo.py` | `ComprasRepository.crear_compra` | POSITIVO | + | sí | `stock = stock + ?` | `movimientos.ENTRADA_COMPRA` | sí | sí | `ui/compras_ui.py` | Tercer camino de ingreso (INV-03). |
-| W02 | `repositories/compras_repo.py` | `ComprasRepository.eliminar_compra` | NEGATIVO | − | sí | `stock = stock - ?` sin `stock>=` | `SALIDA_AJUSTE` (asiento nuevo) | sí | sí | *ninguno en UI* | Puede ir negativo. Código vivo sin caller. |
-| W03 | `services/ventas_service.py` | `VentasService.registrar_venta` | NEGATIVO | − | sí | `stock = stock - ? WHERE stock >= ?` | `SALIDA_VENTA` | sí | sí | `ui/ventas_ui_modern.py` | Guard local; no serializa dos SQLite. Mezclas descuentan por aquí. |
+| W02 | `repositories/compras_repo.py` | `ComprasRepository.eliminar_compra` | NEGATIVO | − | sí | `stock = stock - ?` sin `stock>=` | `SALIDA_AJUSTE` (asiento nuevo) | sí | sí | *ninguno en UI* | 1E.1: preparado. Semántica = CANCELADA + AJUSTE compensatorio, no DELETE. Default legacy. |
+| W03 | `services/ventas_service.py` | `VentasService.registrar_venta` | NEGATIVO | − | sí | `stock = stock - ? WHERE stock >= ?` | `SALIDA_VENTA` | sí | sí | `ui/ventas_ui_modern.py` | 1E.1: preparado. Un command VENTA multilínea. Default legacy. Mezclas descuentan por aquí. |
 | W04 | `services/ventas_service.py` | `VentasService.cancelar_venta` | POSITIVO | + | sí | `stock = stock + ?` | `ENTRADA_DEVOLUCION` | sí | sí | *ninguno* | `ui/ventas_ui_modern.cancelar_venta` solo vacía el carrito. |
 | W05 | `services/ventas_service.py` | `VentasService.registrar_devolucion` | POSITIVO | + | sí | `stock = stock + ?` | `ENTRADA_DEVOLUCION` | sí | sí | *ninguno en UI* | `devoluciones` fuera de SYNC. |
-| W06 | `services/ventas_service.py` | `VentasService.agregar_productos_a_factura` | NEGATIVO | − | sí | `stock = stock - ?` **sin** `stock>=` | `SALIDA_VENTA` | sí | sí | `ventas_ui_modern`, `dashboard_ui` | Check previo no atómico; puede ir negativo. |
+| W06 | `services/ventas_service.py` | `VentasService.agregar_productos_a_factura` | NEGATIVO | − | sí | `stock = stock - ?` **sin** `stock>=` | `SALIDA_VENTA` | sí | sí | `ventas_ui_modern`, `dashboard_ui` | 1E.1: preparado. Legacy puede ir negativo (no se “arregló”). Autoritativo: coordinador decide. |
 | W07 | `repositories/productos_repo.py` | `ProductosRepository.actualizar_stock` | MIXTO | ± | sí | `SET stock = ?` | ninguno | sí | sí | *ninguno* | Sin kardex. Writer genérico. |
 | W08 | `repositories/productos_repo.py` | `ProductosRepository.actualizar_producto` | MIXTO | ± (ficha) | sí | `SET stock = ?` | ninguno | sí | sí | `ui/productos_ui.py` | Editar ficha publica LWW de stock. |
 | W09 | `repositories/productos_repo.py` | `ProductosRepository.crear_producto` | POSITIVO | + INSERT | sí | `INSERT … stock` | `ENTRADA_AJUSTE` si stock>0 | sí | sí | `ui/productos_ui.py` | SKU nuevo puede nacer con stock>0. |
@@ -49,8 +56,8 @@ Directos (W01–W18) = 18. Derivados (D01–D04) = 4.
 | W12 | `repositories/inventario_repository.py` | `InventarioRepository.registrar_movimiento` | MIXTO | ± | sí | `SET stock = ?` | `movimientos_inventario` | sí | sí | `ui/entrada_inventario_ui.py` | Segundo kardex; incluye `ENTRADA_COMPRA`. |
 | W13 | `repositories/inventario_repository.py` | `InventarioRepository.ajustar_stock_directo` | MIXTO | ± | sí | `SET stock = ?` | `movimientos_inventario` ajuste | sí | sí | *ninguno en UI* | Pisa a un entero arbitrario. |
 | W14 | `repositories/inventario_repository.py` | `InventarioRepository.eliminar_movimiento` | MIXTO | ± inverso | sí | `SET stock = ?` | DELETE `movimientos_inventario` | sí | sí | *ninguno en UI* | Piso `<0` en Python. |
-| W15 | `services/mezclas_service.py` | `MezclasService.descontar_stock_mezcla` | NEGATIVO | − | sí | `stock = stock - ?` **sin** guard SQL | `SALIDA_VENTA` reutilizado | sí | sí | *ninguno* | UI de mezclas usa W03. Writer huérfano. |
-| W16 | `local_server.py` | `LocalFerreteriaAPI.create_sale` | NEGATIVO | − | sí | `stock = stock - ?` **sin** `stock>=` | `SALIDA_VENTA` | sí | sí | `local_api_client`, `remote_adapters` | POS LAN. Check previo no atómico. |
+| W15 | `services/mezclas_service.py` | `MezclasService.descontar_stock_mezcla` | NEGATIVO | − | sí | `stock = stock - ?` **sin** guard SQL | `SALIDA_VENTA` reutilizado | sí | sí | *ninguno* | 1E.1: DEPRECATED/DEAD + gateway. UI usa W03. No borrar. |
+| W16 | `local_server.py` | `LocalFerreteriaAPI.create_sale` | NEGATIVO | − | sí | `stock = stock - ?` **sin** `stock>=` | `SALIDA_VENTA` | sí | sí | `local_api_client`, `remote_adapters` | 1E.1: preparado. Mismo contrato que W03. Default legacy. |
 | W17 | `ui/dashboard_ui.py` | `editar_producto_factura` | MIXTO | ± `dif_cant` | sí | `stock = stock - ?` | no | no | sí | self | Writer en UI. Sin kardex/outbox. |
 | W18 | `ui/dashboard_ui.py` | `eliminar_producto_factura` | POSITIVO | + | sí | `stock = stock + ?` | DELETE `movimientos` | no | sí | self | Writer en UI. Sin outbox. |
 
@@ -82,13 +89,14 @@ Métodos **sin caller de UI/producción** (siguen siendo writers; no se borran):
 - W14 `eliminar_movimiento`
 - W15 `descontar_stock_mezcla` (la venta de mezcla usa W03)
 
-## Dual authority — cómo se evita en 1E.0
+## Dual authority — cómo se evita en 1E.1
 
-Mientras exista un writer que altere inventario solo vía `productos.stock`,
-**ningún** writer migrado puede entrar en modo autoritativo real de forma
-aislada. El gateway existe con cutover **OFF**. No hay dual-write
-(PostgreSQL APPLY + `UPDATE productos.stock` independiente). No hay shadow
-mutante. La activación será un **cutover único** en 1E.3.
+Writers negativos tienen código autoritativo **inyectable**, no activado.
+El default es legacy. No hay dual-write (APPLY + `UPDATE productos.stock`
+independiente) en el camino autoritativo. Cutover OFF. La activación
+sigue siendo un **cutover único** en 1E.3.
+
+Commands `LEGACY_OBSERVED` no pueden aplicarse tras el seed.
 
 Tras APPLIED futuro, `productos.stock` sería proyección/caché reconstruible.
 Eso **no** está implementado en writers en 1E.0.

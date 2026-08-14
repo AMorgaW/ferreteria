@@ -456,3 +456,19 @@ CLASSIFICATION_COUNTS = {
     "DERIVADO": sum(1 for w in STOCK_WRITERS if w["classification"] == "DERIVADO"),
     "UNKNOWN": sum(1 for w in STOCK_WRITERS if w["classification"] == "UNKNOWN"),
 }
+
+# 1E.1: writers negativos preparados para gateway. SQL legacy sigue permitido
+# mientras el cutover esté OFF. Cualquier UPDATE/INSERT de stock en una
+# función no inventariada es UNTRACKED_DIRECT_WRITER.
+NEGATIVE_WRITER_IDS = ("W03", "W16", "W06", "W02", "W15")
+GATEWAY_PREPARED_IDS = frozenset(NEGATIVE_WRITER_IDS)
+PRE_CUTOVER_SQL_ALLOWED = "LEGACY_ALLOWED_PRE_CUTOVER"
+UNTRACKED_DIRECT_WRITER = "UNTRACKED_DIRECT_WRITER"
+
+AUTHORITATIVE_TIPO_BY_WRITER = {
+    "W03": "VENTA",
+    "W16": "VENTA",
+    "W06": "VENTA",
+    "W02": "AJUSTE",
+    "W15": "VENTA",
+}

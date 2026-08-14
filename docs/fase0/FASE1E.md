@@ -1,7 +1,7 @@
 # Fase 1E — Migración de writers al coordinador
 
-**Estado 1E.0:** implementada (gateway + inventario). Cutover **OFF**.
-**No autoriza 1E.1+.** No conecta POS/compras. No activa autoridad.
+**Estado 1E.1:** implementada (writers negativos preparados). Cutover **OFF**.
+**No autoriza 1E.2+.** No activa autoridad. No seed.
 **No declara INV-01 resuelto en SQLite.** **No declara INV-02 resuelto.**
 `APPLY_AUTHORITATIVE_EXCLUDE` sigue `False`.
 
@@ -9,9 +9,9 @@
 
 | Subfase | Qué es | Estado |
 |---|---|---|
-| **1E.0** | Inventario definitivo de writers + `InventoryGateway`. Cutover default OFF. Writers productivos **no** llaman al gateway ni al coordinador. | **Esta fase. Implementada.** |
-| **1E.1** | Migrar writers **negativos** (uno a uno) para que *puedan* usar el gateway, **sin activar autoridad**. Cutover sigue OFF. | **No autorizada.** STOP. |
-| **1E.2** | Migrar writers **positivos y mixtos**, mismo régimen: código listo, autoridad apagada. | **No autorizada.** |
+| **1E.0** | Inventario definitivo de writers + `InventoryGateway`. Cutover default OFF. Writers productivos **no** llaman al gateway ni al coordinador. | **Cerrada.** |
+| **1E.1** | Migrar writers **negativos** (uno a uno) para que *puedan* usar el gateway, **sin activar autoridad**. Cutover sigue OFF. | **Esta fase. Implementada.** Ver [FASE1E1.md](FASE1E1.md). |
+| **1E.2** | Migrar writers **positivos y mixtos**, mismo régimen: código listo, autoridad apagada. | **No autorizada.** STOP. |
 | **1E.3** | **Cutover único.** Activar `INVENTORY_CUTOVER_ENABLED`. Semilla. Retirar writers legacy. Decisión sobre `productos.stock` / LWW. | **No autorizada.** Ver precondiciones abajo. |
 | **1E.4** | Certificación final (PostgreSQL real, no dual authority, scanners, rollback operativo documentado). | **No autorizada.** |
 
@@ -88,8 +88,10 @@ UNKNOWN no es REJECTED. UNKNOWN no es APPLIED. El ledger local permanece
 SQLite no es autoridad online. Una conexión SQLite pasada al transporte
 falla (el coordinador ya lo hace; el gateway también lo rechaza).
 
-Cuando cutover está OFF: `submit` persiste el intent y devuelve
-`PENDING_CUTOVER`. No finge `APPLIED`. No llama al coordinador.
+Cuando cutover está OFF: `submit` persiste el intent como
+`LEGACY_OBSERVED` (no `AUTHORITATIVE`) y devuelve `LEGACY_OBSERVED`.
+No finge `APPLIED`. No llama al coordinador. Esos comandos **nunca**
+se transmiten, ni después del cutover. Ver [FASE1E1.md](FASE1E1.md).
 
 Tras APPLIED futuro (1E.3): `productos.stock` sería **proyección/caché**
 reconstruible desde `inventory_balances`. No implementado en writers en 1E.0.
@@ -97,9 +99,10 @@ reconstruible desde `inventory_balances`. No implementado en writers en 1E.0.
 ## Dual authority — cómo se evita
 
 - Cutover default OFF.
-- Writers productivos no importan `inventory_gateway` ni llaman
-  `apply_inventory_command`.
-- No hay dual-write permanente.
+- Writers negativos importan el gateway para el camino inyectable, pero el
+  default **no** llama `submit()` ni `apply_inventory_command`.
+- No hay dual-write permanente. En camino autoritativo de tests no hay
+  `UPDATE productos.stock`.
 - `APPLY_AUTHORITATIVE_EXCLUDE` sigue False: LWW de `productos.stock` sigue
   vigente a propósito, hasta 1E.3.
 - `inventory_balances` está en `COORDINATOR_REMOTE_TABLES`, no en
@@ -135,24 +138,15 @@ Riesgo de dual authority: si un writer migrado aplicara en PostgreSQL
 **y** otro siguiera haciendo `UPDATE productos.stock`, el pull LWW
 pisaría o divergería. Por eso el cutover es único y 1E.0 no activa nada.
 
-## Deuda de 1E.0 a cerrar antes de 1E.1 (no BLOCKER)
+## Deuda de 1E.0 — estado en 1E.1
 
-Hallazgos QA (MEDIUM). No activan autoridad. Cerrarlos al empezar 1E.1,
-no como cutover:
-
-1. Scanner a **nivel archivo**: un `UPDATE productos … stock` nuevo dentro
-   de un archivo ya listado no rompe INV-19. Endurecer a función/SQL.
-2. `test_unknown_reconnect_usa_factory` inyecta `transport=` y no pasa por
-   `apply_inventory_command`. El camino real está en
-   `test_connection_factory_se_pasa_en_cutover_on`.
-3. Caracterización W17/W18 (dashboard) usa SQL equivalente, no las closures
-   PySide.
-4. `InventoryGateway.submit` solo mapea `CoordinatorUnknownOutcomeError` a
-   `UNKNOWN`. Timeout/deadlock/CoordinatorError se propagan con el ledger
-   en `PERSISTED`. Un writer futuro que genere otro `command_id` ante
-   cualquier excepción doble-contaría. Mapear incertidumbre post-persist a
-   `UNKNOWN` (mismo `command_id`) **antes** de cablear writers.
+1. Scanner a nivel función/SQL: **cerrada** en 1E.1.
+2. Reconnect test sin `transport=` inyectado: **cerrada** (pasa por
+   `apply_inventory_command`).
+3. Caracterización W17/W18 con closures PySide: **aplazada a 1E.2**.
+4. Timeout/deadlock post-persist → UNKNOWN: **cerrada** en 1E.1.
 
 ## STOP
 
-**STOP — no implementar 1E.1.** No migrar writers negativos. No conectar POS.
+**STOP — no implementar 1E.2.** No cutover. No seed. No migrar positivos/mixtos.
+El detalle de 1E.1 está en [FASE1E1.md](FASE1E1.md).

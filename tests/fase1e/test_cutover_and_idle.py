@@ -15,16 +15,13 @@ from tests.fase0.harness import REPO_ROOT as HARNESS_ROOT
 from tests.fase0.stock_writers import PRODUCTIVE_WRITER_FILES
 
 FORBIDDEN_TOKENS = (
-    "inventory_gateway",
-    "InventoryGateway",
     "apply_inventory_command",
     "InventoryCoordinatorClient",
-    "INVENTORY_CUTOVER_ENABLED",
 )
 
 
 class WritersIdleAndContractTest(unittest.TestCase):
-    def test_ningun_writer_productivo_importa_gateway_ni_coordinador(self):
+    def test_ningun_writer_productivo_llama_coordinador_directo(self):
         for rel in PRODUCTIVE_WRITER_FILES:
             path = HARNESS_ROOT / rel
             text = path.read_text(encoding="utf-8")
@@ -32,7 +29,7 @@ class WritersIdleAndContractTest(unittest.TestCase):
                 self.assertNotIn(
                     token,
                     text,
-                    msg=f"{rel} no debe mencionar {token} en 1E.0",
+                    msg=f"{rel} no debe mencionar {token} en 1E.1",
                 )
             tree = ast.parse(text)
             imported = set()
@@ -49,11 +46,16 @@ class WritersIdleAndContractTest(unittest.TestCase):
                         called.add(func.id)
                     elif isinstance(func, ast.Attribute):
                         called.add(func.attr)
-            self.assertNotIn("inventory_gateway", imported)
             self.assertNotIn("inventory_coordinator", imported)
             self.assertNotIn("apply_inventory_command", called)
-            self.assertNotIn("InventoryGateway", called)
             self.assertNotIn("InventoryCoordinatorClient", called)
+
+    def test_cutover_global_sigue_off(self):
+        from inventory_gateway import INVENTORY_CUTOVER_ENABLED
+
+        src = (HARNESS_ROOT / "inventory_gateway.py").read_text(encoding="utf-8")
+        self.assertFalse(INVENTORY_CUTOVER_ENABLED)
+        self.assertIn("INVENTORY_CUTOVER_ENABLED = False", src)
 
     def test_inventory_balances_no_entra_en_lww(self):
         from local_sync import build_remote_upsert_sql

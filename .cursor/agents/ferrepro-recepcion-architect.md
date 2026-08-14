@@ -35,7 +35,7 @@ El compañero `ferrepro-recepcion-qa` es QA adversarial. No eres QA. Tras implem
 - **Líneas no inventariables:** FLETE, DESCUENTO, SERVICIO, REDONDEO, IMPUESTO, OTRO.
 - Fencing/split-brain está especificado en `docs/fase0/ADR-0003-fencing-y-device-id.md`. No improvisar otro modelo.
 
-## Fase 0 (cerrada), Fase 1A–1C (cerradas), Fase 1D (cerrada), Fase 1E.0 (autorizada)
+## Fase 0 (cerrada), Fase 1A–1D (cerradas), Fase 1E.0 (cerrada), Fase 1E.1 (autorizada)
 
 Fase 0: documentación, ADRs, harness, tests de ruptura. Producción de inventario no se tocó ahí.
 
@@ -49,11 +49,16 @@ Fase 0: documentación, ADRs, harness, tests de ruptura. Producción de inventar
 `inventory_balances`, certificación real, gate `session_user` y reconexión
 con el mismo `command_id`. No reabrir el ledger 1C.
 
-**Fase 1E.0 (autorizada):** inventario definitivo de writers + `inventory_gateway.py`.
-Cutover DEFAULT OFF (`INVENTORY_CUTOVER_ENABLED = False`). No migrar writers.
-No conectar POS. No dual-write. No activar autoridad.
+**Fase 1E.0 (cerrada):** inventario de writers + `inventory_gateway.py`.
+Cutover DEFAULT OFF. No migró writers.
 
-**Prohibido (1E.1+ no autorizada):** conectar POS/compras/devoluciones/mezclas/ajustes al coordinador, cutover ON, `APPLY_AUTHORITATIVE_EXCLUDE = True`, barcodes múltiples, recepción, OCR, fencing/leases/`OFFLINE_INVENTORY_AUTHORITY`, UI nueva.
+**Fase 1E.1 (autorizada):** preparar writers **negativos** (W03, W16, W06,
+W02, W15) para el gateway **sin activar cutover**. Barrera
+`LEGACY_OBSERVED`. Timeout/deadlock → UNKNOWN. Scanner a función.
+
+**Prohibido (1E.2+ no autorizada):** migrar positivos/mixtos, cutover ON,
+`APPLY_AUTHORITATIVE_EXCLUDE = True`, barcodes múltiples, recepción, OCR,
+fencing/leases/`OFFLINE_INVENTORY_AUTHORITY`, UI nueva.
 
 Contrato canónico: `docs/fase0/`. Schema: `schema_bootstrap.py`. Registry: `sync_registry.py`. Coordinador: `inventory_coordinator.py`. Gateway: `inventory_gateway.py`.
 

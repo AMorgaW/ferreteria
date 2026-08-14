@@ -11,7 +11,9 @@ try:
         CLASSIFICATION_COUNTS,
         DIRECT_STOCK_WRITER_FILES,
         INSERT_STOCK_FILES,
+        PRE_CUTOVER_SQL_ALLOWED,
         STOCK_WRITERS,
+        UNTRACKED_DIRECT_WRITER,
         UPDATE_STOCK_FILES,
     )
 except ImportError:
@@ -20,7 +22,9 @@ except ImportError:
         CLASSIFICATION_COUNTS,
         DIRECT_STOCK_WRITER_FILES,
         INSERT_STOCK_FILES,
+        PRE_CUTOVER_SQL_ALLOWED,
         STOCK_WRITERS,
+        UNTRACKED_DIRECT_WRITER,
         UPDATE_STOCK_FILES,
     )
 
@@ -70,6 +74,109 @@ def _scan_direct_stock_files():
         ) and UPDATE_STOCK_RE.search(text):
             set_stock_files.add(rel)
     return update_files, insert_files, set_stock_files
+
+
+def _function_parent_map(tree):
+    parent = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+    return parent
+
+
+def _qualified_name(node, parent):
+    parts = [node.name]
+    current = parent.get(node)
+    while current is not None:
+        if isinstance(current, ast.ClassDef):
+            parts.append(current.name)
+        elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            parts.append(current.name)
+        current = parent.get(current)
+    return ".".join(reversed(parts))
+
+
+def scan_stock_writes_by_function():
+    """Asocia cada UPDATE/INSERT de productos.stock a archivo+función+SQL.
+
+    Distingue LEGACY_ALLOWED_PRE_CUTOVER (writer inventariado) de
+    UNTRACKED_DIRECT_WRITER (SQL directo fuera del inventario).
+    """
+    declared = []
+    for writer in STOCK_WRITERS:
+        if writer["kind"] == "derived":
+            continue
+        declared.append(
+            (
+                writer["id"],
+                writer["file"],
+                writer["function"].split("(")[0].strip(),
+            )
+        )
+
+    hits = []
+    for path, rel in _iter_production_py():
+        source = path.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        lines = source.splitlines()
+        parent = _function_parent_map(tree)
+        functions = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                end = getattr(node, "end_lineno", node.lineno)
+                functions.append(
+                    (node.lineno, end, _qualified_name(node, parent), node.name)
+                )
+        functions.sort()
+        nested_by_parent = {i: [] for i in range(len(functions))}
+        for i, (lineno, end, qual, name) in enumerate(functions):
+            for j, (olineno, oend, _oqual, _oname) in enumerate(functions):
+                if i == j:
+                    continue
+                if olineno > lineno and oend <= end:
+                    nested_by_parent[i].append((olineno, oend))
+        for i, (lineno, end, qual, name) in enumerate(functions):
+            own = []
+            nested = nested_by_parent[i]
+            for idx in range(lineno, end + 1):
+                if any(nstart <= idx <= nend for nstart, nend in nested):
+                    continue
+                own.append(lines[idx - 1])
+            body = "\n".join(own)
+            update_match = UPDATE_STOCK_RE.search(body)
+            insert_match = INSERT_STOCK_RE.search(body)
+            if not update_match and not insert_match:
+                continue
+            sql = (update_match.group(0) if update_match else insert_match.group(0))
+            sql = " ".join(sql.split())
+            writer_id = None
+            for wid, wfile, wfunc in declared:
+                if wfile != rel:
+                    continue
+                token = wfunc.split(".")[-1]
+                if token == name or wfunc == qual or qual.endswith("." + wfunc):
+                    writer_id = wid
+                    break
+            status = (
+                PRE_CUTOVER_SQL_ALLOWED
+                if writer_id
+                else UNTRACKED_DIRECT_WRITER
+            )
+            hits.append(
+                {
+                    "file": rel,
+                    "function": qual,
+                    "name": name,
+                    "sql": sql[:240],
+                    "writer_id": writer_id,
+                    "status": status,
+                    "kind": "update" if update_match else "insert",
+                }
+            )
+    return hits
 
 
 class StockWritersStaticTest(unittest.TestCase):
@@ -177,3 +284,39 @@ class StockWritersStaticTest(unittest.TestCase):
             )
         self.assertIn("UNKNOWN", docs)
         self.assertIn("0", docs)
+
+    def test_scanner_asocia_writer_a_funcion_y_sql(self):
+        hits = scan_stock_writes_by_function()
+        self.assertTrue(hits, msg="el scanner de función no encontró SQL de stock")
+        untracked = [h for h in hits if h["status"] == UNTRACKED_DIRECT_WRITER]
+        self.assertFalse(
+            untracked,
+            msg="UNTRACKED_DIRECT_WRITER: " + repr(untracked),
+        )
+        by_id = {h["writer_id"]: h for h in hits if h["writer_id"]}
+        for writer in STOCK_WRITERS:
+            if writer["kind"] not in ("direct", "insert"):
+                continue
+            self.assertIn(
+                writer["id"],
+                by_id,
+                msg=f"{writer['id']} {writer['function']} no tiene SQL de stock "
+                    f"a nivel de función",
+            )
+            hit = by_id[writer["id"]]
+            self.assertEqual(hit["status"], PRE_CUTOVER_SQL_ALLOWED)
+            self.assertIn("stock", hit["sql"].lower())
+            self.assertEqual(hit["file"], writer["file"])
+
+    def test_negativos_preparados_siguen_legacy_sql_pre_cutover(self):
+        from tests.fase0.stock_writers import GATEWAY_PREPARED_IDS, NEGATIVE_WRITER_IDS
+
+        self.assertEqual(set(NEGATIVE_WRITER_IDS), GATEWAY_PREPARED_IDS)
+        hits = scan_stock_writes_by_function()
+        negative_hits = [h for h in hits if h["writer_id"] in GATEWAY_PREPARED_IDS]
+        self.assertEqual(
+            {h["writer_id"] for h in negative_hits},
+            set(NEGATIVE_WRITER_IDS),
+        )
+        for hit in negative_hits:
+            self.assertEqual(hit["status"], PRE_CUTOVER_SQL_ALLOWED)

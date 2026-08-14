@@ -398,14 +398,34 @@ class ComprasRepository:
                 'promedio_compra': 0
             }
 
-    def eliminar_compra(self, compra_id: int) -> Tuple[bool, str]:
+    def eliminar_compra(self, compra_id: int,
+                        inventory_mode: Optional[str] = None,
+                        inventory_command_id: Optional[str] = None,
+                        inventory_gateway=None,
+                        inventory_transport=None,
+                        inventory_connection_factory=None) -> Tuple[bool, str]:
         """
         Elimina una compra (marca como cancelada y revierte el inventario)
         IMPORTANTE: Esto es una operación delicada
 
+        Semántica (1E.1): NO borra la fila. Marca CANCELADA y registra
+        movimientos compensatorios SALIDA_AJUSTE. El ledger usa tipo AJUSTE
+        (ya existe); no se inventa un tipo de negocio nuevo.
+
         Returns:
             (éxito, mensaje)
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._eliminar_compra_authoritative(
+                compra_id,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+
         conn = self.db.conectar()
         cursor = conn.cursor()
 
@@ -467,3 +487,130 @@ class ComprasRepository:
             conn.rollback()
             conn.close()
             return False, f"Error al cancelar compra: {str(e)}"
+
+    def _eliminar_compra_authoritative(
+        self,
+        compra_id: int,
+        *,
+        inventory_command_id,
+        inventory_gateway,
+        inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_COMPRA,
+            MissingProductLocalIdError,
+            bind_inventory_gateway,
+            build_negative_operations,
+            command_already_applied,
+            unknown_writer_message,
+        )
+        from local_first_db import ensure_local_id
+        from repositories._outbox import encolar
+
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            already = command_already_applied(conn, command_id)
+            if already is not None:
+                conn.close()
+                return True, "Compra cancelada y stock revertido exitosamente"
+
+            cursor.execute('SELECT estado, local_id FROM compras WHERE id = ?', (compra_id,))
+            fila = cursor.fetchone()
+            if not fila:
+                conn.close()
+                return False, "Compra no encontrada"
+            if str(fila['estado']).upper() == 'CANCELADA':
+                conn.close()
+                return False, "La compra ya estaba cancelada"
+
+            cursor.execute('''
+                SELECT producto_id, cantidad
+                FROM detalle_compras
+                WHERE compra_id = ?
+            ''', (compra_id,))
+            detalles = [dict(row) for row in cursor.fetchall()]
+            if not detalles:
+                conn.close()
+                return False, "La compra no tiene detalles de inventario"
+
+            try:
+                operations = build_negative_operations(
+                    conn, detalles, command_id=command_id
+                )
+            except MissingProductLocalIdError as exc:
+                conn.close()
+                return False, str(exc)
+            except (QuantityScaleError, UnknownProductError) as exc:
+                conn.close()
+                return False, str(exc)
+
+            gw = bind_inventory_gateway(
+                conn,
+                gateway=inventory_gateway,
+                transport=inventory_transport,
+                connection_factory=inventory_connection_factory,
+                cutover_enabled=True,
+            )
+            try:
+                result = gw.submit(
+                    tipo="AJUSTE",
+                    operations=operations,
+                    command_id=command_id,
+                    documento_tipo=DOCUMENTO_TIPO_COMPRA,
+                    documento_local_id=fila["local_id"],
+                    device_id=None,
+                    usuario_id=None,
+                )
+            except Exception as exc:
+                conn.close()
+                return False, unknown_writer_message(command_id, str(exc))
+
+            self.last_gateway_result = result
+            if result.outcome == OUTCOME_REJECTED:
+                conn.close()
+                return False, result.error or "Inventario rechazado por el coordinador"
+            if result.outcome != OUTCOME_APPLIED:
+                conn.close()
+                return False, unknown_writer_message(
+                    result.command_id, result.error or result.outcome
+                )
+
+            for detalle in detalles:
+                cursor.execute('''
+                    INSERT INTO movimientos (
+                        tipo, producto_id, cantidad, precio_unitario, costo_total,
+                        motivo, fecha
+                    ) VALUES ('SALIDA_AJUSTE', ?, ?, 0, 0, ?, ?)
+                ''', (detalle['producto_id'], detalle['cantidad'],
+                      f'Cancelación de compra #{compra_id}', obtener_fecha_actual()))
+                ensure_local_id(conn, "movimientos", cursor.lastrowid)
+                encolar(conn, "inventory_movement", cursor.lastrowid, "create", "movimientos")
+
+            cursor.execute('''
+                UPDATE compras
+                SET estado = 'CANCELADA'
+                WHERE id = ?
+            ''', (compra_id,))
+            encolar(conn, "purchase", compra_id, "update", "compras")
+
+            conn.commit()
+            conn.close()
+            return True, "Compra cancelada y stock revertido exitosamente"
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))

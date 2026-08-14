@@ -30,10 +30,20 @@ Eres QA adversarial de FERREPRO. Tu trabajo es **demostrar que el entregable est
 - Fase 1C (ledger): cerrada con GO.
 - Fase 1D (coordinador PostgreSQL): cerrada con GO.
 - Fase 1D.3 (gate + reconexión): cerrada con GO.
-- Fase 1E.0 (gateway + inventario de writers): **autorizada**. Auditar: cutover DEFAULT OFF; command_id persistido antes de red; UNKNOWN ≠ REJECTED/APPLIED; no-owner DSN sin fallback a `SUPABASE_URI`; writers productivos no importan el gateway ni llaman `apply_inventory_command`; scanner UPDATE+INSERT vs inventario; `APPLY_AUTHORITATIVE_EXCLUDE` sigue False; `inventory_balances` fuera de LWW. No rechazarla por no haber migrado POS (eso es 1E.1+, no autorizada).
-- Fase 1E.1+ (writers negativos, cutover, barcodes, recepción, fencing): **no autorizar**. Decisión humana. No conectar POS.
+- Fase 1E.0 (gateway + inventario de writers): cerrada con GO.
+- Fase 1E.1 (writers negativos, cutover OFF): **autorizada**. Auditar:
+  5 negativos preparados; default cutover OFF; 0 APPLY remoto accidental;
+  backlog `LEGACY_OBSERVED` no atraviesa cutover; timeout/deadlock/UNKNOWN
+  no generan nueva identidad; scanner por función;
+  `APPLY_AUTHORITATIVE_EXCLUDE` False; PostgreSQL real verde; 0 dual-write
+  en camino autoritativo. No rechazarla por no haber migrado positivos/mixtos
+  (eso es 1E.2, no autorizada).
+- Fase 1E.2+ (positivos/mixtos, cutover, barcodes, recepción, fencing):
+  **no autorizar**. Decisión humana.
 
-Al auditar 1E.0: no hay dual-write ni shadow mutante. El xfail de dos SQLite de INV-01 sigue xfail. INV-02 sigue xfail. No se adelantó 1E.1.
+Al auditar 1E.1: cutover DEFAULT OFF; writers negativos preparados pero no
+activados; `LEGACY_OBSERVED` no es transmissible; UNKNOWN conserva command_id;
+INV-01 xfail de dos SQLite sigue; INV-02 sigue xfail. No se adelantó 1E.2 ni cutover.
 
 ## Veredicto
 

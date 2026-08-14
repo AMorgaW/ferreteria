@@ -82,9 +82,18 @@ class VentasService:
 
     def registrar_venta(self, items: List[dict], cliente_id: Optional[int] = None,
                        metodo_pago: str = 'EFECTIVO', descuento_general: float = 0,
-                       observaciones: str = None) -> Tuple[bool, str, Optional[Venta]]:
+                       observaciones: str = None,
+                       inventory_mode: Optional[str] = None,
+                       inventory_command_id: Optional[str] = None,
+                       inventory_gateway=None,
+                       inventory_transport=None,
+                       inventory_connection_factory=None) -> Tuple[bool, str, Optional[Venta]]:
         """
         Registra una venta con una sola conexion y una sola transaccion.
+
+        Default (cutover OFF): camino LEGACY — productos.stock sigue siendo
+        la ruta efectiva. No persiste un InventoryCommand autoritativo.
+        Camino autoritativo: un solo command por venta, inyectable en tests.
         """
         if not items:
             return False, "No hay productos en la venta", None
@@ -109,6 +118,21 @@ class VentasService:
         usuario_id = self.auth.usuario_actual.id if self.auth.usuario_actual else None
         if not usuario_id:
             return False, "Error: Usuario no autenticado. No se puede registrar venta", None
+
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._registrar_venta_authoritative(
+                items,
+                cliente_id=cliente_id,
+                metodo_pago=metodo_pago,
+                descuento_general=descuento_general,
+                observaciones=observaciones,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
 
         conn = self.db.conectar()
         cursor = conn.cursor()
@@ -305,6 +329,297 @@ class VentasService:
             conn.rollback()
             conn.close()
             return False, f"Error procesando venta: {str(e)}", None
+
+    def _registrar_venta_authoritative(
+        self,
+        items: List[dict],
+        *,
+        cliente_id,
+        metodo_pago,
+        descuento_general,
+        observaciones,
+        inventory_command_id,
+        inventory_gateway,
+        inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str, Optional[Venta]]:
+        """Camino futuro: un InventoryCommand por venta. Sin UPDATE productos.stock."""
+        import uuid as _uuid
+
+        from inventory_gateway import (
+            OUTCOME_APPLIED,
+            OUTCOME_REJECTED,
+            OUTCOME_UNKNOWN,
+        )
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_VENTA,
+            MissingProductLocalIdError,
+            bind_inventory_gateway,
+            build_negative_operations,
+            unknown_writer_message,
+        )
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+
+        usuario_id = self.auth.usuario_actual.id if self.auth.usuario_actual else None
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            producto_ids = sorted({item['producto_id'] for item in items})
+            placeholders = ",".join("?" for _ in producto_ids)
+            cursor.execute(
+                f"SELECT id, nombre, stock, local_id FROM productos "
+                f"WHERE id IN ({placeholders})",
+                producto_ids,
+            )
+            productos = {row['id']: dict(row) for row in cursor.fetchall()}
+
+            for item in items:
+                producto = productos.get(item['producto_id'])
+                if not producto:
+                    conn.close()
+                    return False, f"Producto ID {item['producto_id']} no encontrado", None
+
+            detalles = []
+            for item in items:
+                cantidad = item['cantidad']
+                precio_unitario = item['precio_unitario']
+                descuento_item = item.get('descuento', 0)
+                subtotal_item = (precio_unitario * cantidad) - descuento_item
+                detalles.append({
+                    'producto_id': item['producto_id'],
+                    'cantidad': cantidad,
+                    'precio_unitario': precio_unitario,
+                    'descuento': descuento_item,
+                    'subtotal': subtotal_item,
+                })
+
+            subtotal = sum(d['subtotal'] for d in detalles)
+            if descuento_general > subtotal:
+                conn.close()
+                return False, "El descuento general no puede superar el subtotal de la venta", None
+            total = subtotal - descuento_general
+
+            iva_monto = 0.0
+            iva_cfg = self._config_iva()
+            if iva_cfg['activo'] and iva_cfg['tasa'] > 0:
+                if iva_cfg['incluido']:
+                    iva_monto = round(total - total / (1 + iva_cfg['tasa']), 2)
+                else:
+                    iva_monto = round(total * iva_cfg['tasa'], 2)
+                    total = round(total + iva_monto, 2)
+
+            try:
+                operations = build_negative_operations(
+                    conn, items, command_id=command_id
+                )
+            except MissingProductLocalIdError as exc:
+                conn.close()
+                return False, str(exc), None
+            except (QuantityScaleError, UnknownProductError) as exc:
+                conn.close()
+                return False, str(exc), None
+
+            gw = bind_inventory_gateway(
+                conn,
+                gateway=inventory_gateway,
+                transport=inventory_transport,
+                connection_factory=inventory_connection_factory,
+                cutover_enabled=True,
+            )
+            try:
+                result = gw.submit(
+                    tipo="VENTA",
+                    operations=operations,
+                    command_id=command_id,
+                    documento_tipo=DOCUMENTO_TIPO_VENTA,
+                    device_id=None,
+                    usuario_id=usuario_id,
+                )
+            except Exception as exc:
+                conn.close()
+                return False, unknown_writer_message(command_id, str(exc)), None
+
+            self.last_gateway_result = result
+            if result.outcome == OUTCOME_REJECTED:
+                conn.close()
+                return False, (
+                    result.error or "Inventario rechazado por el coordinador"
+                ), None
+            if result.outcome != OUTCOME_APPLIED:
+                conn.close()
+                return False, unknown_writer_message(
+                    result.command_id, result.error or result.outcome
+                ), None
+            if result.command_id != command_id:
+                conn.close()
+                return False, unknown_writer_message(
+                    command_id, "command_id divergente"
+                ), None
+
+            bound_id = (
+                result.record.documento_local_id if result.record else None
+            )
+            if bound_id:
+                row = cursor.execute(
+                    "SELECT * FROM ventas WHERE local_id = ?",
+                    (bound_id,),
+                ).fetchone()
+                if row:
+                    conn.close()
+                    venta = Venta(
+                        id=row["id"],
+                        numero_factura=row["numero_factura"],
+                        fecha=row["fecha"] if "fecha" in row.keys() else obtener_fecha_actual(),
+                        cliente_id=row["cliente_id"],
+                        usuario_id=row["usuario_id"],
+                        subtotal=row["subtotal"],
+                        descuento=row["descuento"],
+                        iva=row["iva"],
+                        total=row["total"],
+                        metodo_pago=row["metodo_pago"],
+                        estado=row["estado"] if "estado" in row.keys() else "COMPLETADA",
+                        observaciones=row["observaciones"],
+                    )
+                    return True, (
+                        f"Venta {row['numero_factura']} registrada exitosamente"
+                    ), venta
+
+            estado_pago = 'PENDIENTE' if metodo_pago == 'CREDITO' else 'PAGADO'
+            monto_pagado = 0 if metodo_pago == 'CREDITO' else total
+            fecha = datetime.now().strftime("%Y%m%d")
+            num_factura = self._siguiente_numero_factura(cursor, fecha)
+
+            cursor.execute('''
+                INSERT INTO ventas
+                (numero_factura, cliente_id, usuario_id, subtotal, descuento,
+                 iva, total, metodo_pago, estado_pago, monto_pagado,
+                 observaciones, fecha, estado)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'COMPLETADA')
+            ''', (num_factura, cliente_id, usuario_id, subtotal, descuento_general,
+                  iva_monto, total, metodo_pago, estado_pago, monto_pagado,
+                  observaciones))
+            venta_id = cursor.lastrowid
+            ensure_local_id(conn, "ventas", venta_id)
+            venta_local = cursor.execute(
+                "SELECT local_id FROM ventas WHERE id = ?",
+                (venta_id,),
+            ).fetchone()["local_id"]
+            from inventory_ledger import bind_inventory_command_documento
+
+            bind_inventory_command_documento(conn, command_id, venta_local)
+
+            for detalle in detalles:
+                cursor.execute('''
+                    INSERT INTO detalle_ventas
+                    (venta_id, producto_id, cantidad, precio_unitario, descuento, subtotal, iva)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (venta_id, detalle['producto_id'], detalle['cantidad'],
+                      detalle['precio_unitario'], detalle['descuento'],
+                      detalle['subtotal'], 0))
+                detalle_id = cursor.lastrowid
+                ensure_local_id(conn, "detalle_ventas", detalle_id)
+
+                cursor.execute('''
+                    INSERT INTO movimientos (
+                        tipo, producto_id, usuario_id, cantidad,
+                        precio_unitario, costo_total, motivo, num_factura, fecha
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    'SALIDA_VENTA',
+                    detalle['producto_id'],
+                    usuario_id,
+                    detalle['cantidad'],
+                    detalle['precio_unitario'],
+                    detalle['subtotal'],
+                    f'Venta {num_factura}',
+                    num_factura,
+                    obtener_fecha_actual()
+                ))
+                movimiento_id = cursor.lastrowid
+                ensure_local_id(conn, "movimientos", movimiento_id)
+
+            cuenta_id = None
+            if metodo_pago == 'CREDITO' and cliente_id:
+                fecha_vencimiento = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+                cursor.execute('''
+                    INSERT INTO cuentas_por_cobrar
+                    (venta_id, cliente_id, monto_total, saldo_pendiente, fecha_vencimiento)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (venta_id, cliente_id, total, total, fecha_vencimiento))
+                cuenta_id = cursor.lastrowid
+                ensure_local_id(conn, "cuentas_por_cobrar", cuenta_id)
+
+                cursor.execute('''
+                    UPDATE clientes
+                    SET saldo_pendiente = saldo_pendiente + ?
+                    WHERE id = ?
+                ''', (total, cliente_id))
+
+            cursor.execute('''
+                INSERT INTO auditoria (usuario_id, accion, modulo, descripcion, ip_address)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (usuario_id, "VENTA", "Ventas", f"Venta {num_factura} por ${total:,.0f}", None))
+            from local_first_db import enqueue_entity as _eq
+            _eq(conn, "audit_log", cursor.lastrowid, "create", "auditoria")
+
+            venta_payload = dict(cursor.execute("SELECT * FROM ventas WHERE id = ?", (venta_id,)).fetchone())
+            enqueue_sync(conn, "sale", venta_id, "create", venta_payload, "ventas")
+
+            for row in cursor.execute("SELECT * FROM detalle_ventas WHERE venta_id = ?", (venta_id,)).fetchall():
+                enqueue_sync(conn, "sale_detail", row['id'], "create", dict(row), "detalle_ventas")
+
+            for row in cursor.execute("SELECT * FROM movimientos WHERE num_factura = ?", (num_factura,)).fetchall():
+                enqueue_sync(conn, "inventory_movement", row['id'], "create", dict(row), "movimientos")
+
+            if cuenta_id is not None:
+                cuenta_payload = dict(cursor.execute(
+                    "SELECT * FROM cuentas_por_cobrar WHERE id = ?", (cuenta_id,)).fetchone())
+                enqueue_sync(conn, "receivable", cuenta_id, "create",
+                             cuenta_payload, "cuentas_por_cobrar")
+                ensure_local_id(conn, "clientes", cliente_id)
+                cliente_payload = dict(cursor.execute(
+                    "SELECT * FROM clientes WHERE id = ?", (cliente_id,)).fetchone())
+                enqueue_sync(conn, "customer", cliente_id, "update",
+                             cliente_payload, "clientes")
+
+            conn.commit()
+            conn.close()
+
+            if hasattr(self.productos_repo, 'invalidar_cache'):
+                self.productos_repo.invalidar_cache()
+            if cliente_id and hasattr(self.clientes_repo, 'invalidar_cache'):
+                self.clientes_repo.invalidar_cache()
+
+            venta = Venta(
+                id=venta_id,
+                numero_factura=num_factura,
+                fecha=obtener_fecha_actual(),
+                cliente_id=cliente_id,
+                usuario_id=usuario_id,
+                subtotal=subtotal,
+                descuento=descuento_general,
+                iva=iva_monto,
+                total=total,
+                metodo_pago=metodo_pago,
+                estado='COMPLETADA',
+                observaciones=observaciones
+            )
+            return True, f"Venta {num_factura} registrada exitosamente", venta
+
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e)), None
 
     def obtener_venta(self, venta_id: int) -> Optional[dict]:
         """Obtiene una venta con sus detalles"""
@@ -682,16 +997,37 @@ class VentasService:
             conn.close()
             return False, f"Error al registrar devolución: {str(e)}", None
 
-    def agregar_productos_a_factura(self, venta_id: int, nuevos_items: List[dict]) -> Tuple[bool, str]:
+    def agregar_productos_a_factura(self, venta_id: int, nuevos_items: List[dict],
+                                    inventory_mode: Optional[str] = None,
+                                    inventory_command_id: Optional[str] = None,
+                                    inventory_gateway=None,
+                                    inventory_transport=None,
+                                    inventory_connection_factory=None) -> Tuple[bool, str]:
         """
         Agrega productos a una factura de crédito existente
         Args:
             venta_id: ID de la venta existente
             nuevos_items: Lista de dicts con {producto_id, cantidad, precio_unitario, descuento}
         Returns: (éxito, mensaje)
+
+        Legacy: check de stock previo no atómico; UPDATE sin stock>= (puede ir
+        negativo). No se "arregla" en 1E.1.
+        Autoritativo: el coordinador decide insuficiencia; sin dual-write.
         """
         if not nuevos_items:
             return False, "No hay productos para agregar"
+
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._agregar_productos_a_factura_authoritative(
+                venta_id,
+                nuevos_items,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
         
         conn = self.db.conectar()
         cursor = conn.cursor()
@@ -862,3 +1198,206 @@ class VentasService:
             conn.rollback()
             conn.close()
             return False, f"Error al agregar productos: {str(e)}"
+
+    def _agregar_productos_a_factura_authoritative(
+        self,
+        venta_id: int,
+        nuevos_items: List[dict],
+        *,
+        inventory_command_id,
+        inventory_gateway,
+        inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_VENTA,
+            MissingProductLocalIdError,
+            bind_inventory_gateway,
+            build_negative_operations,
+            command_already_applied,
+            unknown_writer_message,
+        )
+
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            already = command_already_applied(conn, command_id)
+            if already is not None:
+                conn.close()
+                return True, "Productos agregados exitosamente (comando ya APPLIED)"
+
+            cursor.execute('''
+                SELECT id, numero_factura, metodo_pago, total, estado_pago, cliente_id, local_id
+                FROM ventas WHERE id = ?
+            ''', (venta_id,))
+            venta = cursor.fetchone()
+            if not venta:
+                conn.close()
+                return False, "Venta no encontrada"
+            if venta['metodo_pago'] != 'CREDITO':
+                conn.close()
+                return False, "Solo se pueden agregar productos a ventas a crédito"
+            if venta['estado_pago'] == 'PAGADO':
+                conn.close()
+                return False, "No se pueden agregar productos a una venta ya pagada"
+
+            nuevos_detalles = []
+            total_nuevo = 0
+            for item in nuevos_items:
+                producto_dict = self.productos_repo.obtener_por_id(item['producto_id'])
+                if not producto_dict:
+                    conn.close()
+                    return False, f"Producto ID {item['producto_id']} no encontrado"
+                precio = item['precio_unitario']
+                cantidad = item['cantidad']
+                descuento = item.get('descuento', 0)
+                subtotal = (precio * cantidad) - descuento
+                nuevos_detalles.append({
+                    'producto_id': item['producto_id'],
+                    'cantidad': cantidad,
+                    'precio_unitario': precio,
+                    'descuento': descuento,
+                    'subtotal': subtotal,
+                    'iva': 0,
+                    'nombre_producto': producto_dict['nombre'],
+                    'tipo_unidad': item.get('tipo_unidad', 'Unidad'),
+                })
+                total_nuevo += subtotal
+
+            try:
+                operations = build_negative_operations(
+                    conn, nuevos_items, command_id=command_id
+                )
+            except MissingProductLocalIdError as exc:
+                conn.close()
+                return False, str(exc)
+            except (QuantityScaleError, UnknownProductError) as exc:
+                conn.close()
+                return False, str(exc)
+
+            gw = bind_inventory_gateway(
+                conn,
+                gateway=inventory_gateway,
+                transport=inventory_transport,
+                connection_factory=inventory_connection_factory,
+                cutover_enabled=True,
+            )
+            try:
+                result = gw.submit(
+                    tipo="VENTA",
+                    operations=operations,
+                    command_id=command_id,
+                    documento_tipo=DOCUMENTO_TIPO_VENTA,
+                    documento_local_id=venta["local_id"],
+                    device_id=None,
+                    usuario_id=(
+                        self.auth.usuario_actual.id if self.auth.usuario_actual else None
+                    ),
+                )
+            except Exception as exc:
+                conn.close()
+                return False, unknown_writer_message(command_id, str(exc))
+
+            self.last_gateway_result = result
+            if result.outcome == OUTCOME_REJECTED:
+                conn.close()
+                return False, result.error or "Inventario rechazado por el coordinador"
+            if result.outcome != OUTCOME_APPLIED:
+                conn.close()
+                return False, unknown_writer_message(
+                    result.command_id, result.error or result.outcome
+                )
+
+            _nuevos_detalle_ids = []
+            _nuevos_mov_ids = []
+            usuario_id = self.auth.usuario_actual.id if self.auth.usuario_actual else None
+            for detalle in nuevos_detalles:
+                cursor.execute('''
+                    INSERT INTO detalle_ventas (
+                        venta_id, producto_id, cantidad, precio_unitario,
+                        descuento, subtotal, iva, tipo_unidad
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    venta_id,
+                    detalle['producto_id'],
+                    detalle['cantidad'],
+                    detalle['precio_unitario'],
+                    detalle['descuento'],
+                    detalle['subtotal'],
+                    detalle['iva'],
+                    detalle.get('tipo_unidad', 'Unidad'),
+                ))
+                _did = cursor.lastrowid
+                ensure_local_id(conn, "detalle_ventas", _did)
+                _nuevos_detalle_ids.append(_did)
+
+                cursor.execute('''
+                    INSERT INTO movimientos (
+                        tipo, producto_id, usuario_id, cantidad,
+                        precio_unitario, costo_total, motivo, num_factura, fecha
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    'SALIDA_VENTA',
+                    detalle['producto_id'],
+                    usuario_id,
+                    detalle['cantidad'],
+                    detalle['precio_unitario'],
+                    detalle['subtotal'],
+                    f'Adición a factura {venta["numero_factura"]}',
+                    venta['numero_factura'],
+                    obtener_fecha_actual()
+                ))
+                _mid = cursor.lastrowid
+                ensure_local_id(conn, "movimientos", _mid)
+                _nuevos_mov_ids.append(_mid)
+
+            nuevo_total = venta['total'] + total_nuevo
+            cursor.execute('''
+                UPDATE ventas 
+                SET total = ?, subtotal = subtotal + ?
+                WHERE id = ?
+            ''', (
+                nuevo_total,
+                sum(d['subtotal'] for d in nuevos_detalles),
+                venta_id
+            ))
+
+            _vrow = cursor.execute("SELECT * FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+            if _vrow:
+                enqueue_sync(conn, "sale", venta_id, "update", dict(_vrow), "ventas")
+            for _did in _nuevos_detalle_ids:
+                _dr = cursor.execute("SELECT * FROM detalle_ventas WHERE id = ?", (_did,)).fetchone()
+                if _dr:
+                    enqueue_sync(conn, "sale_detail", _did, "create", dict(_dr), "detalle_ventas")
+            for _mid in _nuevos_mov_ids:
+                _mr = cursor.execute("SELECT * FROM movimientos WHERE id = ?", (_mid,)).fetchone()
+                if _mr:
+                    enqueue_sync(conn, "inventory_movement", _mid, "create", dict(_mr), "movimientos")
+
+            conn.commit()
+            if self.auth.usuario_actual:
+                self.auth.registrar_auditoria(
+                    self.auth.usuario_actual.id,
+                    "AGREGAR_PRODUCTOS_FACTURA",
+                    "Ventas",
+                    f"Se agregaron {len(nuevos_items)} productos a factura {venta['numero_factura']} por ${total_nuevo:,.0f}"
+                )
+            conn.close()
+            return True, f"Productos agregados exitosamente. Nuevo total: ${nuevo_total:,.0f}"
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))

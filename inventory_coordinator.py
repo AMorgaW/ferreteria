@@ -25,6 +25,7 @@ from psycopg2.errors import DeadlockDetected, QueryCanceled
 import schema_bootstrap
 from inventory_ledger import (
     DuplicateOperationError,
+    INTENT_CLASS_AUTHORITATIVE,
     IdempotencyConflictError,
     InventoryCommandRecord,
     InventoryLedgerError,
@@ -199,6 +200,7 @@ def _record_from_rpc(payload: Mapping[str, Any]) -> InventoryCommandRecord:
         updated_at=str(payload["updated_at"]),
         operations=operations,
         replayed=bool(payload.get("replayed")),
+        intent_class=INTENT_CLASS_AUTHORITATIVE,
     )
 
 

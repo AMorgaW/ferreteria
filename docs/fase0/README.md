@@ -3,9 +3,9 @@
 **Estado:** ejecutada. **Producción (Fase 0): no modificada.**  
 Fase 1A (bootstrap SQLite) se implementó después, con GO humano, en
 `schema_bootstrap.py` + DDL por motor. No reabre este contrato.
-**Siguiente paso de inventario/recepción:** Fase 1E.0 (gateway + inventario
-de writers) está **implementada**; ver [FASE1E.md](FASE1E.md). Cutover
-**OFF**. **No autoriza 1E.1, cutover, ni migrar POS/compras.** Fase 1D
+**Siguiente paso de inventario/recepción:** Fase 1E.1 (writers negativos
+preparados) está **implementada**; ver [FASE1E1.md](FASE1E1.md). Cutover
+**OFF**. **No autoriza 1E.2, cutover, ni migrar positivos/mixtos.** Fase 1D
 (coordinador PostgreSQL de stock) está hecha. La certificación PostgreSQL
 real de laboratorio está en [FASE1D1.md](FASE1D1.md). El gate de
 autorización y la reconexión post-desconexión están en
@@ -52,7 +52,8 @@ Prohibido (y no se hizo):
 | [FASE1D.md](FASE1D.md) | Coordinador PostgreSQL / inventory_balances (implementada; no migra writers) |
 | [FASE1D1.md](FASE1D1.md) | Certificación PostgreSQL real en Docker local (no migra writers) |
 | [FASE1D3.md](FASE1D3.md) | Gate `session_user` + reconexión post-desconexión (no migra writers) |
-| [FASE1E.md](FASE1E.md) | 1E.0 implementada: gateway + inventario. Cutover OFF. No autoriza 1E.1 ni cutover. |
+| [FASE1E.md](FASE1E.md) | 1E.0 implementada: gateway + inventario. Cutover OFF. |
+| [FASE1E1.md](FASE1E1.md) | 1E.1 implementada: writers negativos preparados. Cutover OFF. No autoriza 1E.2. |
 
 Código de ruptura: `tests/fase0/`.
 

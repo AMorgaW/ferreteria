@@ -423,11 +423,30 @@ class LocalFerreteriaAPI(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def create_sale(self, user):
+    def create_sale(self, user, inventory_mode=None, inventory_command_id=None,
+                    inventory_gateway=None, inventory_transport=None,
+                    inventory_connection_factory=None):
         data = read_json(self)
         items = data.get("items") or []
         if not items:
             return json_response(self, 400, {"error": "La venta no tiene productos"})
+
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        command_id = inventory_command_id or data.get("inventory_command_id")
+        # inventory_mode solo por inyección de test/kwargs. El body HTTP no
+        # puede activar autoridad writer-por-writer (cutover único = 1E.3).
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return LocalFerreteriaAPI._create_sale_authoritative(
+                self,
+                user,
+                data=data,
+                items=items,
+                inventory_command_id=command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
 
         metodo_pago = data.get("metodo_pago") or "EFECTIVO"
         cliente_id = data.get("cliente_id")
@@ -589,6 +608,288 @@ class LocalFerreteriaAPI(BaseHTTPRequestHandler):
         except Exception as exc:
             conn.rollback()
             return json_response(self, 500, {"error": str(exc)})
+        finally:
+            conn.close()
+
+    def _create_sale_authoritative(
+        self,
+        user,
+        *,
+        data,
+        items,
+        inventory_command_id,
+        inventory_gateway,
+        inventory_transport,
+        inventory_connection_factory,
+    ):
+        import uuid as _uuid
+
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_VENTA,
+            MissingProductLocalIdError,
+            bind_inventory_gateway,
+            build_negative_operations,
+            unknown_writer_message,
+        )
+
+        metodo_pago = data.get("metodo_pago") or "EFECTIVO"
+        cliente_id = data.get("cliente_id")
+        descuento = float(data.get("descuento") or 0)
+        observaciones = data.get("observaciones")
+        if descuento < 0:
+            return json_response(self, 400, {"error": "El descuento no puede ser negativo"})
+
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        conn = connect(self.db_path)
+        try:
+            product_ids = sorted({int(item["producto_id"]) for item in items})
+            placeholders = ",".join("?" for _ in product_ids)
+            products = {
+                row["id"]: row_to_dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT id, nombre, stock, precio_venta, local_id
+                    FROM productos
+                    WHERE id IN ({placeholders})
+                      AND activo = 1
+                      AND COALESCE(is_deleted, 0) = 0
+                    """,
+                    product_ids,
+                ).fetchall()
+            }
+
+            for item in items:
+                pid = int(item["producto_id"])
+                qty = float(item["cantidad"])
+                product = products.get(pid)
+                if qty <= 0:
+                    conn.rollback()
+                    return json_response(self, 400, {"error": "La cantidad debe ser mayor a cero"})
+                if not product:
+                    conn.rollback()
+                    return json_response(self, 400, {"error": f"Producto {pid} no existe"})
+                item_discount = float(item.get("descuento") or 0)
+                if item_discount < 0 or item_discount > float(product["precio_venta"]) * qty:
+                    conn.rollback()
+                    return json_response(self, 400, {"error": f"Descuento invalido para {product['nombre']}"})
+
+            subtotal = sum(
+                float(products[int(i["producto_id"])]["precio_venta"]) * float(i["cantidad"])
+                - float(i.get("descuento") or 0)
+                for i in items
+            )
+            total = subtotal - descuento
+            if total < 0:
+                return json_response(self, 400, {"error": "El descuento supera el total de la venta"})
+
+            try:
+                operations = build_negative_operations(
+                    conn, items, command_id=command_id
+                )
+            except MissingProductLocalIdError as exc:
+                return json_response(self, 409, {"error": str(exc), "command_id": command_id})
+            except (QuantityScaleError, UnknownProductError) as exc:
+                return json_response(self, 409, {"error": str(exc), "command_id": command_id})
+
+            gw = bind_inventory_gateway(
+                conn,
+                gateway=inventory_gateway,
+                transport=inventory_transport,
+                connection_factory=inventory_connection_factory,
+                cutover_enabled=True,
+            )
+            try:
+                result = gw.submit(
+                    tipo="VENTA",
+                    operations=operations,
+                    command_id=command_id,
+                    documento_tipo=DOCUMENTO_TIPO_VENTA,
+                    device_id=None,
+                    usuario_id=user.get("usuario_id"),
+                )
+            except Exception as exc:
+                return json_response(
+                    self,
+                    503,
+                    {
+                        "error": unknown_writer_message(command_id, str(exc)),
+                        "command_id": command_id,
+                        "retryable": True,
+                    },
+                )
+
+            if result.outcome == OUTCOME_REJECTED:
+                return json_response(
+                    self,
+                    409,
+                    {
+                        "error": result.error or "Inventario rechazado por el coordinador",
+                        "command_id": result.command_id,
+                    },
+                )
+            if result.outcome != OUTCOME_APPLIED:
+                return json_response(
+                    self,
+                    503,
+                    {
+                        "error": unknown_writer_message(
+                            result.command_id, result.error or result.outcome
+                        ),
+                        "command_id": result.command_id,
+                        "retryable": True,
+                    },
+                )
+
+            bound_id = result.record.documento_local_id if result.record else None
+            if bound_id:
+                existing = conn.execute(
+                    "SELECT * FROM ventas WHERE local_id = ?",
+                    (bound_id,),
+                ).fetchone()
+                if existing:
+                    venta_payload = row_to_dict(existing)
+                    details = [
+                        row_to_dict(row)
+                        for row in conn.execute(
+                            "SELECT * FROM detalle_ventas WHERE venta_id = ?",
+                            (venta_payload["id"],),
+                        ).fetchall()
+                    ]
+                    movements = [
+                        row_to_dict(row)
+                        for row in conn.execute(
+                            "SELECT * FROM movimientos WHERE num_factura = ?",
+                            (venta_payload["numero_factura"],),
+                        ).fetchall()
+                    ]
+                    return json_response(
+                        self,
+                        201,
+                        {
+                            "venta": venta_payload,
+                            "detalles": details,
+                            "movimientos": movements,
+                            "sync_status": venta_payload.get("sync_status"),
+                            "command_id": result.command_id,
+                            "replayed": True,
+                        },
+                    )
+
+            conn.execute("BEGIN IMMEDIATE")
+
+            fecha_key = datetime.now().strftime("%Y%m%d")
+            prefijo = fecha_key + "-"
+            base_row = conn.execute(
+                "SELECT MAX(CAST(SUBSTR(numero_factura, 10) AS INTEGER)) AS ultimo FROM ventas WHERE numero_factura LIKE ?",
+                (prefijo + "%",),
+            ).fetchone()
+            base = (base_row["ultimo"] or 0)
+            conn.execute(
+                "INSERT INTO consecutivos (clave, valor) VALUES (?, ?) "
+                "ON CONFLICT(clave) DO UPDATE SET valor = CASE WHEN valor < ? THEN ? ELSE valor + 1 END",
+                (fecha_key, base + 1, base, base + 1),
+            )
+            consec = conn.execute(
+                "SELECT valor FROM consecutivos WHERE clave = ?", (fecha_key,)
+            ).fetchone()["valor"]
+            numero_factura = f"{prefijo}{consec:04d}"
+
+            venta_cur = conn.execute(
+                """
+                INSERT INTO ventas
+                    (numero_factura, cliente_id, usuario_id, subtotal, descuento, iva, total,
+                     metodo_pago, estado, observaciones, fecha, sync_status, updated_at, created_by, updated_by)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'COMPLETADA', ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    numero_factura,
+                    cliente_id,
+                    user["usuario_id"],
+                    subtotal,
+                    descuento,
+                    total,
+                    metodo_pago,
+                    observaciones,
+                    now_iso(),
+                    now_iso(),
+                    user["usuario_id"],
+                    user["usuario_id"],
+                ),
+            )
+            venta_id = venta_cur.lastrowid
+            ensure_local_id(conn, "ventas", venta_id)
+            venta_local = conn.execute(
+                "SELECT local_id FROM ventas WHERE id=?", (venta_id,)
+            ).fetchone()["local_id"]
+            from inventory_ledger import bind_inventory_command_documento
+
+            bind_inventory_command_documento(conn, command_id, venta_local)
+            venta_payload = row_to_dict(conn.execute("SELECT * FROM ventas WHERE id=?", (venta_id,)).fetchone())
+            enqueue_sync(conn, "sale", venta_id, "create", venta_payload, "ventas")
+
+            details = []
+            movements = []
+            for item in items:
+                pid = int(item["producto_id"])
+                qty = float(item["cantidad"])
+                price = float(products[pid]["precio_venta"])
+                item_discount = float(item.get("descuento") or 0)
+                item_subtotal = price * qty - item_discount
+                detail_cur = conn.execute(
+                    """
+                    INSERT INTO detalle_ventas
+                        (venta_id, producto_id, cantidad, precio_unitario, descuento, subtotal, iva,
+                         sync_status, updated_at, created_by, updated_by)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?)
+                    """,
+                    (venta_id, pid, qty, price, item_discount, item_subtotal, now_iso(), user["usuario_id"], user["usuario_id"]),
+                )
+                detail_id = detail_cur.lastrowid
+                ensure_local_id(conn, "detalle_ventas", detail_id)
+                detail_payload = row_to_dict(conn.execute("SELECT * FROM detalle_ventas WHERE id=?", (detail_id,)).fetchone())
+                enqueue_sync(conn, "sale_detail", detail_id, "create", detail_payload, "detalle_ventas")
+                details.append(detail_payload)
+
+                mov_cur = conn.execute(
+                    """
+                    INSERT INTO movimientos
+                        (tipo, producto_id, usuario_id, cantidad, precio_unitario, costo_total,
+                         motivo, num_factura, fecha, sync_status, updated_at, created_by, updated_by)
+                    VALUES ('SALIDA_VENTA', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (pid, user["usuario_id"], qty, price, item_subtotal, f"Venta {numero_factura}", numero_factura, now_iso(), now_iso(), user["usuario_id"], user["usuario_id"]),
+                )
+                mov_id = mov_cur.lastrowid
+                ensure_local_id(conn, "movimientos", mov_id)
+                mov_payload = row_to_dict(conn.execute("SELECT * FROM movimientos WHERE id=?", (mov_id,)).fetchone())
+                enqueue_sync(conn, "inventory_movement", mov_id, "create", mov_payload, "movimientos")
+                movements.append(mov_payload)
+
+            conn.commit()
+            return json_response(
+                self,
+                201,
+                {
+                    "venta": venta_payload,
+                    "detalles": details,
+                    "movimientos": movements,
+                    "sync_status": "pending",
+                    "command_id": result.command_id,
+                },
+            )
+        except Exception as exc:
+            conn.rollback()
+            return json_response(
+                self,
+                503,
+                {
+                    "error": unknown_writer_message(command_id, str(exc)),
+                    "command_id": command_id,
+                    "retryable": True,
+                },
+            )
         finally:
             conn.close()
 

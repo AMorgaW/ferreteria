@@ -7,6 +7,14 @@ from typing import Optional, List, Tuple
 from database import obtener_fecha_actual
 
 
+W15_DEPRECATED = True
+W15_DEAD_REASON = (
+    "Writer huérfano: la UI de mezclas descuenta componentes vía "
+    "VentasService.registrar_venta (W03). No borrar; no usar como writer "
+    "directo. Camino autoritativo exige InventoryGateway."
+)
+
+
 class MezclasService:
     """Servicio para gestionar mezclas de pinturas"""
 
@@ -129,12 +137,32 @@ class MezclasService:
         return self.db.ejecutar_query(query, (param, param))
 
     def descontar_stock_mezcla(self, componentes: List[dict],
-                                num_factura: str = '') -> Tuple[bool, str]:
+                                num_factura: str = '',
+                                inventory_mode: Optional[str] = None,
+                                inventory_command_id: Optional[str] = None,
+                                inventory_gateway=None,
+                                inventory_transport=None,
+                                inventory_connection_factory=None) -> Tuple[bool, str]:
         """
-        Descuenta stock de cada componente de la mezcla.
-        Se llama al procesar la venta.
-        componentes: [{'producto_id': int, 'cantidad': float}, ...]
+        DEPRECATED/DEAD. Descuenta stock de cada componente de la mezcla.
+
+        No hay callers de producción. La venta de mezcla usa W03.
+        No se borra. Legacy conserva SQL directo. Autoritativo usa gateway
+        (tipo VENTA: solo consumo negativo; MEZCLA del ledger exige signos
+        mixtos y no aplica a este writer).
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._descontar_stock_mezcla_authoritative(
+                componentes,
+                num_factura=num_factura,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+
         # Validar stock primero
         valido, msg = self.validar_stock_componentes(componentes)
         if not valido:
@@ -188,6 +216,110 @@ class MezclasService:
         except Exception as e:
             conn.rollback()
             return False, f"Error al descontar stock: {str(e)}"
+        finally:
+            conn.close()
+
+    def _descontar_stock_mezcla_authoritative(
+        self,
+        componentes: List[dict],
+        *,
+        num_factura: str,
+        inventory_command_id,
+        inventory_gateway,
+        inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_MEZCLA,
+            MissingProductLocalIdError,
+            bind_inventory_gateway,
+            build_negative_operations,
+            command_already_applied,
+            unknown_writer_message,
+        )
+        from repositories._outbox import encolar
+
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            already = command_already_applied(conn, command_id)
+            if already is not None:
+                return True, "Stock descontado exitosamente"
+
+            try:
+                operations = build_negative_operations(
+                    conn, componentes, command_id=command_id
+                )
+            except MissingProductLocalIdError as exc:
+                return False, str(exc)
+            except (QuantityScaleError, UnknownProductError) as exc:
+                return False, str(exc)
+
+            gw = bind_inventory_gateway(
+                conn,
+                gateway=inventory_gateway,
+                transport=inventory_transport,
+                connection_factory=inventory_connection_factory,
+                cutover_enabled=True,
+            )
+            usuario_id = self.auth.usuario_actual.id if self.auth.usuario_actual else None
+            try:
+                result = gw.submit(
+                    tipo="VENTA",
+                    operations=operations,
+                    command_id=command_id,
+                    documento_tipo=DOCUMENTO_TIPO_MEZCLA,
+                    device_id=None,
+                    usuario_id=usuario_id,
+                )
+            except Exception as exc:
+                return False, unknown_writer_message(command_id, str(exc))
+
+            self.last_gateway_result = result
+            if result.outcome == OUTCOME_REJECTED:
+                return False, result.error or "Inventario rechazado por el coordinador"
+            if result.outcome != OUTCOME_APPLIED:
+                return False, unknown_writer_message(
+                    result.command_id, result.error or result.outcome
+                )
+
+            for comp in componentes:
+                producto = self.productos_repo.obtener_por_id(comp['producto_id'])
+                precio_unit = producto.get('precio_venta', 0) if producto else 0
+                cursor.execute('''
+                    INSERT INTO movimientos (
+                        tipo, producto_id, usuario_id, cantidad,
+                        precio_unitario, costo_total, motivo, num_factura, fecha
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    'SALIDA_VENTA',
+                    comp['producto_id'],
+                    usuario_id,
+                    comp['cantidad'],
+                    precio_unit,
+                    comp['cantidad'] * precio_unit,
+                    f'Mezcla pintura - {num_factura}' if num_factura else 'Mezcla pintura',
+                    num_factura,
+                    obtener_fecha_actual()
+                ))
+                _mz_mov_id = cursor.lastrowid
+                encolar(conn, "inventory_movement", _mz_mov_id, "create", "movimientos")
+
+            conn.commit()
+            return True, "Stock descontado exitosamente"
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))
         finally:
             conn.close()
 

@@ -1,22 +1,24 @@
 # -*- coding: utf-8 -*-
-"""Gateway de aplicación para comandos de inventario (Fase 1E.0).
+"""Gateway de aplicación para comandos de inventario (Fase 1E.0 / 1E.1).
 
 Separa persistencia local del intent (ledger 1C) del envío al coordinador
-PostgreSQL (1D). No es autoridad. No migra writers. No aplica
-``productos.stock``.
+PostgreSQL (1D). No es autoridad. No aplica ``productos.stock``.
 
-Orden obligatorio:
+Orden obligatorio (camino AUTHORITATIVE, cutover ON):
 
 1. persistir ``create_inventory_command`` en SQLite (obtiene command_id)
 2. conservar command_id / request_hash / payload
-3. si el cutover está ON, enviar al coordinador
+3. si el cutover está ON **y** intent_class=AUTHORITATIVE, enviar
 4. resolver APPLIED / REJECTED / UNKNOWN
 
 UNKNOWN es conocimiento del cliente: el ledger local permanece PERSISTED.
 No se añade UNKNOWN al CHECK de ``inventory_commands.estado``.
 
-Cutover DEFAULT OFF: el gateway puede persistir el intent y **no** envía
-APPLY remoto. Los writers productivos no deben llamarlo todavía.
+Cutover DEFAULT OFF: el gateway persiste el intent como
+``LEGACY_OBSERVED`` y **no** envía APPLY remoto. Esos comandos **nunca**
+se transmiten, ni si el cutover se enciende después. No hay cola
+PERSISTED autoritativa que pueda atravesar el seed de 1E.3.
+
 Tras un APPLIED futuro, ``productos.stock`` sería proyección/caché
 reconstruible; este módulo no escribe stock ni hace dual-write.
 """
@@ -30,11 +32,16 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 import schema_bootstrap
 from inventory_coordinator import (
     ConnectionFactory,
+    CoordinatorDeadlockError,
+    CoordinatorError,
+    CoordinatorTimeoutError,
     CoordinatorUnknownOutcomeError,
     InventoryCoordinatorClient,
     apply_inventory_command,
 )
 from inventory_ledger import (
+    INTENT_CLASS_AUTHORITATIVE,
+    INTENT_CLASS_LEGACY_OBSERVED,
     InventoryCommandRecord,
     InventoryLedgerError,
     create_inventory_command,
@@ -48,12 +55,14 @@ INVENTORY_CUTOVER_ENABLED = False
 INVENTORY_DSN_ENV = "FERREPRO_INVENTORY_DSN"
 
 OUTCOME_PENDING_CUTOVER = "PENDING_CUTOVER"
+OUTCOME_LEGACY_OBSERVED = "LEGACY_OBSERVED"
 OUTCOME_APPLIED = "APPLIED"
 OUTCOME_REJECTED = "REJECTED"
 OUTCOME_UNKNOWN = "UNKNOWN"
 
 GATEWAY_OUTCOMES = (
     OUTCOME_PENDING_CUTOVER,
+    OUTCOME_LEGACY_OBSERVED,
     OUTCOME_APPLIED,
     OUTCOME_REJECTED,
     OUTCOME_UNKNOWN,
@@ -72,6 +81,18 @@ class InventoryGatewayError(InventoryLedgerError):
 
 class InventoryGatewayConfigError(InventoryGatewayError):
     """DSN / factory mal configurados. Nunca hay fallback a SUPABASE_URI."""
+
+
+class GatewayPreCutoverBacklogError(InventoryGatewayError):
+    """Un command LEGACY_OBSERVED no puede aplicarse tras el cutover.
+
+    Garantiza: una venta observada en pre-cutover (cuando productos.stock
+    ya descontó) no se reenvía a inventory_balances después del seed.
+    """
+
+
+class MissingProductLocalIdError(InventoryGatewayError):
+    """Producto activo sin local_id: el camino autoritativo falla cerrado."""
 
 
 @dataclass(frozen=True)
@@ -157,6 +178,64 @@ def _prepare_operations(
     return tuple(prepared)
 
 
+def command_is_transmittable(record: InventoryCommandRecord) -> bool:
+    """Solo AUTHORITATIVE + PERSISTED/APPLIED puede ir al coordinador."""
+    intent = getattr(record, "intent_class", INTENT_CLASS_AUTHORITATIVE)
+    return intent == INTENT_CLASS_AUTHORITATIVE
+
+
+def assert_command_transmittable(record: InventoryCommandRecord) -> None:
+    if command_is_transmittable(record):
+        return
+    raise GatewayPreCutoverBacklogError(
+        f"command_id {record.command_id} es {record.intent_class}; "
+        "un command pre-cutover/LEGACY_OBSERVED no se transmite nunca"
+    )
+
+
+def list_transmittable_command_ids(conn) -> Tuple[str, ...]:
+    """Comandos locales que un drain post-cutover podría enviar.
+
+    Excluye LEGACY_OBSERVED. Un seed 1E.3 + replay de esta lista no incluye
+    ventas que ya descontaron productos.stock en legacy.
+    """
+    rows = conn.execute(
+        """
+        SELECT command_id
+          FROM inventory_commands
+         WHERE estado = ?
+           AND COALESCE(intent_class, ?) = ?
+         ORDER BY created_at, command_id
+        """,
+        (LEDGER_STATE_PERSISTED, INTENT_CLASS_LEGACY_OBSERVED, INTENT_CLASS_AUTHORITATIVE),
+    ).fetchall()
+    ids = []
+    for row in rows:
+        ids.append(row["command_id"] if hasattr(row, "keys") else row[0])
+    return tuple(ids)
+
+
+def _is_ambiguous_transport_error(exc: BaseException) -> bool:
+    """Tras persistir, el caller no puede saber si el COMMIT remoto ocurrió."""
+    if isinstance(
+        exc,
+        (
+            CoordinatorUnknownOutcomeError,
+            CoordinatorTimeoutError,
+            CoordinatorDeadlockError,
+        ),
+    ):
+        return True
+    try:
+        import psycopg2
+
+        if isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
 class InventoryGateway:
     """Orquesta persistencia local + transporte al coordinador.
 
@@ -192,6 +271,19 @@ class InventoryGateway:
         self._pg_conn = pg_conn
         if pg_conn is not None:
             self._assert_not_sqlite_authority(pg_conn)
+
+    def _unknown_result(
+        self, record: InventoryCommandRecord, exc: BaseException
+    ) -> GatewaySubmitResult:
+        local = get_inventory_command(self.sqlite_conn, record.command_id)
+        return GatewaySubmitResult(
+            command_id=local.command_id,
+            request_hash=local.request_hash,
+            estado_local=local.estado,
+            outcome=OUTCOME_UNKNOWN,
+            record=local,
+            error=str(exc),
+        )
 
     @property
     def cutover_is_on(self) -> bool:
@@ -237,6 +329,7 @@ class InventoryGateway:
         device_id: str,
         usuario_id: Optional[int],
     ) -> InventoryCommandRecord:
+        assert_command_transmittable(record)
         payload = dict(
             command_id=record.command_id,
             tipo=record.tipo,
@@ -289,18 +382,44 @@ class InventoryGateway:
 
         Retry: el caller reutiliza el mismo command_id / operaciones.
         El gateway no genera IDs en retry.
+
+        Cutover OFF: persiste como LEGACY_OBSERVED y no transmite.
+        Un retry posterior con cutover ON **tampoco** transmite ese id.
         """
         generate_ids = True
+        existing_record = None
         if command_id:
             command_id = _require_uuid(command_id, "command_id")
-            generate_ids = not _command_exists(self.sqlite_conn, command_id)
+            if _command_exists(self.sqlite_conn, command_id):
+                generate_ids = False
+                existing_record = get_inventory_command(self.sqlite_conn, command_id)
         else:
             command_id = str(uuid.uuid4())
             generate_ids = True
 
+        if existing_record is not None and not command_is_transmittable(
+            existing_record
+        ):
+            return GatewaySubmitResult(
+                command_id=existing_record.command_id,
+                request_hash=existing_record.request_hash,
+                estado_local=existing_record.estado,
+                outcome=OUTCOME_LEGACY_OBSERVED,
+                record=existing_record,
+                error="LEGACY_OBSERVED: no transmissible tras cutover",
+            )
+
         prepared_ops = _prepare_operations(
             operations, generate_missing_ids=generate_ids
         )
+        persist_class = (
+            INTENT_CLASS_AUTHORITATIVE
+            if self.cutover_enabled
+            else INTENT_CLASS_LEGACY_OBSERVED
+        )
+        if existing_record is not None:
+            persist_class = existing_record.intent_class
+
         record = create_inventory_command(
             self.sqlite_conn,
             command_id=command_id,
@@ -310,14 +429,25 @@ class InventoryGateway:
             documento_local_id=documento_local_id,
             device_id=device_id,
             usuario_id=usuario_id,
+            intent_class=persist_class,
         )
+
+        if not command_is_transmittable(record):
+            return GatewaySubmitResult(
+                command_id=record.command_id,
+                request_hash=record.request_hash,
+                estado_local=record.estado,
+                outcome=OUTCOME_LEGACY_OBSERVED,
+                record=record,
+                error=None,
+            )
 
         if not self.cutover_enabled:
             return GatewaySubmitResult(
                 command_id=record.command_id,
                 request_hash=record.request_hash,
                 estado_local=record.estado,
-                outcome=OUTCOME_PENDING_CUTOVER,
+                outcome=OUTCOME_LEGACY_OBSERVED,
                 record=record,
                 error=None,
             )
@@ -331,16 +461,14 @@ class InventoryGateway:
                 device_id=record.device_id,
                 usuario_id=usuario_id,
             )
-        except CoordinatorUnknownOutcomeError as exc:
-            local = get_inventory_command(self.sqlite_conn, record.command_id)
-            return GatewaySubmitResult(
-                command_id=local.command_id,
-                request_hash=local.request_hash,
-                estado_local=local.estado,
-                outcome=OUTCOME_UNKNOWN,
-                record=local,
-                error=str(exc),
-            )
+        except GatewayPreCutoverBacklogError:
+            raise
+        except InventoryGatewayError:
+            raise
+        except Exception as exc:
+            if _is_ambiguous_transport_error(exc) or isinstance(exc, CoordinatorError):
+                return self._unknown_result(record, exc)
+            raise
 
         if remote.estado == LEDGER_STATE_APPLIED:
             local = self._mark_local_outcome(

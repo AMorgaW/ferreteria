@@ -40,6 +40,16 @@ COMMAND_TYPES = (
 )
 COMMAND_STATES = ("PERSISTED", "APPLIED", "REJECTED")
 LEDGER_STATE_PERSISTED = "PERSISTED"
+LEDGER_STATE_APPLIED = "APPLIED"
+
+# Clase de intención local (SQLite). No es un estado de CHECK.
+# AUTHORITATIVE: puede enviarse al coordinador cuando el cutover está ON.
+# LEGACY_OBSERVED: observación pre-cutover; NUNCA se transmite, ni después
+# del cutover. Evita que un backlog de ventas legacy se aplique dos veces
+# tras sembrar inventory_balances desde el stock actual (1E.3).
+INTENT_CLASS_AUTHORITATIVE = "AUTHORITATIVE"
+INTENT_CLASS_LEGACY_OBSERVED = "LEGACY_OBSERVED"
+INTENT_CLASSES = (INTENT_CLASS_AUTHORITATIVE, INTENT_CLASS_LEGACY_OBSERVED)
 
 # Mapa documental comando → kardex legado. 1C no aplica el signo; solo lo
 # documenta. delta_scaled == 0 se rechaza: no hay línea de inventario vacía.
@@ -107,6 +117,7 @@ class InventoryCommandRecord:
     updated_at: str
     operations: Tuple[InventoryOperationRecord, ...]
     replayed: bool
+    intent_class: str = INTENT_CLASS_AUTHORITATIVE
 
 
 def quantity_to_scaled(value: QuantityInput) -> int:
@@ -307,7 +318,10 @@ def sqlite_ledger_statements() -> Tuple[str, ...]:
             ),
             motivo TEXT,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            intent_class TEXT NOT NULL DEFAULT 'AUTHORITATIVE' CHECK (
+                intent_class IN ('AUTHORITATIVE', 'LEGACY_OBSERVED')
+            )
         )
         """,
         """
@@ -327,6 +341,8 @@ def sqlite_ledger_statements() -> Tuple[str, ...]:
         "ON inventory_operations(producto_local_id)",
         "CREATE INDEX IF NOT EXISTS idx_inventory_commands_hash "
         "ON inventory_commands(request_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_inventory_commands_intent "
+        "ON inventory_commands(intent_class)",
     )
 
 
@@ -452,7 +468,39 @@ def ensure_inventory_ledger_schema(conn) -> None:
             "ensure_inventory_ledger_schema solo aplica a SQLite"
         )
     for statement in sqlite_ledger_statements():
+        if "inventory_commands(intent_class)" in statement:
+            continue
         conn.execute(statement)
+    _ensure_intent_class_column(conn)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_inventory_commands_intent "
+        "ON inventory_commands(intent_class)"
+    )
+
+
+def _ensure_intent_class_column(conn) -> None:
+    """Migración idempotente 1E.1: columna local que no viaja a PostgreSQL."""
+    rows = conn.execute("PRAGMA table_info(inventory_commands)").fetchall()
+    cols = {
+        (row["name"] if hasattr(row, "keys") else row[1])
+        for row in rows
+    }
+    if "intent_class" in cols:
+        return
+    conn.execute(
+        "ALTER TABLE inventory_commands "
+        "ADD COLUMN intent_class TEXT NOT NULL DEFAULT 'LEGACY_OBSERVED'"
+    )
+
+
+def _normalize_intent_class(value: Any) -> str:
+    text = str(value or INTENT_CLASS_AUTHORITATIVE).strip().upper()
+    if text not in INTENT_CLASSES:
+        raise InventoryLedgerError(
+            f"intent_class desconocido: {value!r}. "
+            f"Admitidos: {', '.join(INTENT_CLASSES)}"
+        )
+    return text
 
 
 def _product_exists(conn, producto_local_id: str) -> bool:
@@ -505,11 +553,61 @@ def _load_command(conn, command_id: str, *, replayed: bool) -> InventoryCommandR
         updated_at=command["updated_at"],
         operations=operations,
         replayed=replayed,
+        intent_class=_normalize_intent_class(
+            command.get("intent_class") or INTENT_CLASS_AUTHORITATIVE
+        ),
     )
 
 
 def get_inventory_command(conn, command_id: str) -> InventoryCommandRecord:
     return _load_command(conn, _require_uuid(command_id, "command_id"), replayed=False)
+
+
+def get_inventory_command_or_none(conn, command_id: str):
+    """None si el command_id no existe. No crea identidad nueva."""
+    if command_id is None or str(command_id).strip() == "":
+        return None
+    cid = _require_uuid(command_id, "command_id")
+    row = conn.execute(
+        "SELECT 1 FROM inventory_commands WHERE command_id = ?",
+        (cid,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _load_command(conn, cid, replayed=False)
+
+
+def bind_inventory_command_documento(conn, command_id: str, documento_local_id: str) -> None:
+    """Liga el documento comercial al command ya persistido.
+
+    Idempotente si el UUID es el mismo. No cambia estado/resultado.
+    Un retry posterior puede recuperar la venta sin insertar otra.
+    """
+    from local_first_db import now_iso
+
+    cid = _require_uuid(command_id, "command_id")
+    doc = _require_uuid(documento_local_id, "documento_local_id")
+    row = conn.execute(
+        "SELECT documento_local_id FROM inventory_commands WHERE command_id = ?",
+        (cid,),
+    ).fetchone()
+    if row is None:
+        raise InventoryLedgerError(f"Comando no encontrado: {cid}")
+    current = row["documento_local_id"] if hasattr(row, "keys") else row[0]
+    if current and str(current) != doc:
+        raise InventoryLedgerError(
+            f"command_id {cid} ya está ligado a otro documento"
+        )
+    if current == doc:
+        return
+    conn.execute(
+        """
+        UPDATE inventory_commands
+           SET documento_local_id = ?, updated_at = ?
+         WHERE command_id = ?
+        """,
+        (doc, now_iso(), cid),
+    )
 
 
 def _begin_or_savepoint(conn) -> str:
@@ -545,11 +643,14 @@ def create_inventory_command(
     documento_local_id: Optional[str] = None,
     device_id: Optional[str] = None,
     usuario_id: Optional[int] = None,
+    intent_class: str = INTENT_CLASS_AUTHORITATIVE,
 ) -> InventoryCommandRecord:
     """Persiste command + operaciones en una sola transacción SQLite.
 
     No modifica productos.stock. estado/resultado en 1C: PERSISTED.
     Retry con el mismo payload recupera el registro original.
+    ``intent_class=LEGACY_OBSERVED`` es observación pre-cutover: el gateway
+    se niega a transmitirla para siempre.
     """
     if not schema_bootstrap.is_sqlite_connection(conn):
         raise InventoryLedgerError(
@@ -557,6 +658,7 @@ def create_inventory_command(
         )
     command_id = _require_uuid(command_id, "command_id")
     tipo = _normalize_tipo(tipo)
+    intent_class = _normalize_intent_class(intent_class)
     documento_tipo = (
         str(documento_tipo).strip() if documento_tipo else None
     ) or None
@@ -614,8 +716,8 @@ def create_inventory_command(
                 INSERT INTO inventory_commands (
                     command_id, tipo, documento_tipo, documento_local_id,
                     device_id, usuario_id, request_hash, estado, resultado,
-                    motivo, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    motivo, created_at, updated_at, intent_class
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                 """,
                 (
                     command_id,
@@ -629,6 +731,7 @@ def create_inventory_command(
                     LEDGER_STATE_PERSISTED,
                     stamp,
                     stamp,
+                    intent_class,
                 ),
             )
             for op in normalized_ops:

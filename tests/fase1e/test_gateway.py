@@ -99,10 +99,7 @@ class GatewayPersistenciaTest(unittest.TestCase):
                 conn.close()
 
     def test_cutover_off_no_envia_ni_finge_applied(self):
-        from inventory_gateway import (
-            InventoryGateway,
-            OUTCOME_PENDING_CUTOVER,
-        )
+        from inventory_gateway import InventoryGateway
         from inventory_ledger import LEDGER_STATE_PERSISTED
 
         called = []
@@ -131,15 +128,18 @@ class GatewayPersistenciaTest(unittest.TestCase):
                     device_id=DEVICE,
                     operations=[_op(lid, "-2")],
                 )
-                self.assertEqual(result.outcome, OUTCOME_PENDING_CUTOVER)
+                self.assertEqual(result.outcome, "LEGACY_OBSERVED")
                 self.assertEqual(result.estado_local, LEDGER_STATE_PERSISTED)
                 self.assertNotEqual(result.outcome, "APPLIED")
                 self.assertEqual(called, [])
                 self.assertEqual(factory_calls, [])
-                n = conn.execute(
-                    "SELECT COUNT(*) FROM inventory_commands"
-                ).fetchone()[0]
-                self.assertEqual(n, 1)
+                row = conn.execute(
+                    "SELECT intent_class FROM inventory_commands WHERE command_id = ?",
+                    (result.command_id,),
+                ).fetchone()
+                self.assertEqual(row["intent_class"], "LEGACY_OBSERVED")
+                from inventory_gateway import list_transmittable_command_ids
+                self.assertEqual(list_transmittable_command_ids(conn), ())
             finally:
                 conn.close()
 
@@ -460,4 +460,132 @@ class GatewayPersistenciaTest(unittest.TestCase):
         self.assertNotIn("'UNKNOWN'", src)
         gw = (REPO_ROOT / "inventory_gateway.py").read_text(encoding="utf-8")
         self.assertIn("OUTCOME_UNKNOWN", gw)
-        self.assertIn("PENDING_CUTOVER", gw)
+        self.assertIn("LEGACY_OBSERVED", gw)
+        self.assertIn("GatewayPreCutoverBacklogError", gw)
+
+    def test_timeout_y_deadlock_post_persist_son_unknown(self):
+        from inventory_coordinator import (
+            CoordinatorDeadlockError,
+            CoordinatorTimeoutError,
+        )
+        from inventory_gateway import InventoryGateway, OUTCOME_UNKNOWN
+        from inventory_ledger import LEDGER_STATE_PERSISTED
+
+        for exc in (
+            CoordinatorTimeoutError("statement timeout"),
+            CoordinatorDeadlockError("deadlock exhausted"),
+        ):
+            with official_temp_db() as env:
+                conn = env.connect()
+                try:
+                    lid = seed_producto(conn, env)
+                    cid = str(uuid.uuid4())
+
+                    def transport(**kwargs):
+                        raise exc
+
+                    gw = InventoryGateway(
+                        conn, cutover_enabled=True, transport=transport
+                    )
+                    result = gw.submit(
+                        tipo="VENTA",
+                        command_id=cid,
+                        device_id=DEVICE,
+                        operations=[_op(lid, "-1")],
+                    )
+                    self.assertEqual(result.outcome, OUTCOME_UNKNOWN)
+                    self.assertEqual(result.command_id, cid)
+                    self.assertEqual(result.estado_local, LEDGER_STATE_PERSISTED)
+                finally:
+                    conn.close()
+
+    def test_unknown_reconnect_pasa_por_apply_inventory_command(self):
+        from inventory_coordinator import CoordinatorUnknownOutcomeError
+        from inventory_gateway import InventoryGateway, OUTCOME_UNKNOWN
+        from unittest.mock import MagicMock, patch
+
+        factory = MagicMock(name="pg_factory")
+        factory_calls = []
+
+        def tracked_factory():
+            factory_calls.append("factory")
+            return MagicMock(name="pg")
+
+        with official_temp_db() as env:
+            conn = env.connect()
+            try:
+                lid = seed_producto(conn, env)
+                cid = str(uuid.uuid4())
+
+                def fake_apply(pg_conn, *, connection_factory=None, **kwargs):
+                    self.assertIsNotNone(connection_factory)
+                    connection_factory()
+                    self.assertEqual(kwargs["command_id"], cid)
+                    raise CoordinatorUnknownOutcomeError("lost after persist")
+
+                gw = InventoryGateway(
+                    conn,
+                    connection_factory=tracked_factory,
+                    cutover_enabled=True,
+                )
+                with patch(
+                    "inventory_gateway.apply_inventory_command",
+                    side_effect=fake_apply,
+                ):
+                    result = gw.submit(
+                        tipo="VENTA",
+                        command_id=cid,
+                        device_id=DEVICE,
+                        operations=[_op(lid, "-1")],
+                    )
+                self.assertEqual(result.outcome, OUTCOME_UNKNOWN)
+                self.assertEqual(result.command_id, cid)
+                self.assertEqual(factory_calls, ["factory"])
+            finally:
+                conn.close()
+
+    def test_backlog_pre_cutover_no_atraviesa_cutover(self):
+        from inventory_gateway import (
+            GatewayPreCutoverBacklogError,
+            InventoryGateway,
+            assert_command_transmittable,
+            list_transmittable_command_ids,
+        )
+        from inventory_ledger import get_inventory_command
+
+        sent = []
+
+        def transport(**kwargs):
+            sent.append(kwargs["command_id"])
+            return _applied_record(kwargs["command_id"], kwargs["request_hash"])
+
+        with official_temp_db() as env:
+            conn = env.connect()
+            try:
+                lid = seed_producto(conn, env, stock=50)
+                observed = InventoryGateway(conn, transport=transport)
+                result = observed.submit(
+                    tipo="VENTA",
+                    device_id=DEVICE,
+                    operations=[_op(lid, "-5")],
+                )
+                self.assertEqual(result.outcome, "LEGACY_OBSERVED")
+                self.assertEqual(list_transmittable_command_ids(conn), ())
+                record = get_inventory_command(conn, result.command_id)
+                with self.assertRaises(GatewayPreCutoverBacklogError):
+                    assert_command_transmittable(record)
+
+                later = InventoryGateway(
+                    conn, cutover_enabled=True, transport=transport
+                )
+                retry = later.submit(
+                    tipo="VENTA",
+                    command_id=result.command_id,
+                    device_id=DEVICE,
+                    operations=[_op(lid, "-5")],
+                )
+                self.assertEqual(retry.outcome, "LEGACY_OBSERVED")
+                self.assertEqual(sent, [])
+                self.assertEqual(list_transmittable_command_ids(conn), ())
+            finally:
+                conn.close()
