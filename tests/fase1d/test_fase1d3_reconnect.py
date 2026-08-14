@@ -105,7 +105,11 @@ class Fase1D3ReconnectTest(unittest.TestCase):
         return False
 
     def test_caida_antes_de_commit_retry_aplica_una_vez(self):
-        from inventory_coordinator import InventoryCoordinatorClient, STATE_APPLIED
+        from inventory_coordinator import (
+            CoordinatorUnknownOutcomeError,
+            InventoryCoordinatorClient,
+            STATE_APPLIED,
+        )
 
         lid = self._seed_product(50000)
         cid = str(uuid.uuid4())
@@ -152,7 +156,7 @@ class Fase1D3ReconnectTest(unittest.TestCase):
             cur.execute("SELECT pg_terminate_backend(%s)", (holder_box["pid"],))
         self.admin.commit()
         thread.join(timeout=20)
-        self.assertIsNotNone(holder_box["err"])
+        self.assertIsInstance(holder_box["err"], CoordinatorUnknownOutcomeError)
         holder.rollback()
         holder.close()
 
@@ -226,8 +230,9 @@ class Fase1D3ReconnectTest(unittest.TestCase):
                 pass
         with self.admin.cursor() as cur:
             cur.execute(
-                "SELECT pg_terminate_backend(%s) FROM pg_stat_activity WHERE pid=%s",
-                (old_pid, old_pid),
+                "UPDATE inventory_balances SET quantity_scaled = 100000 "
+                "WHERE producto_local_id = %s",
+                (lid,),
             )
         self.admin.commit()
         retry_conn = connect()
@@ -239,7 +244,9 @@ class Fase1D3ReconnectTest(unittest.TestCase):
         self.assertTrue(retry.replayed)
         self.assertEqual(retry.estado, STATE_REJECTED)
         self.assertEqual(retry.motivo, motivo)
-        self.assertEqual(InventoryCoordinatorClient(retry_conn).get_balance(lid), 50000)
+        self.assertEqual(
+            InventoryCoordinatorClient(retry_conn).get_balance(lid), 100000
+        )
 
     def test_hash_conflict_despues_de_reconnect(self):
         from inventory_coordinator import (

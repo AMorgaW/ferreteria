@@ -149,9 +149,11 @@ class Fase1D3AuthorizationTest(unittest.TestCase):
                 **self._apply_kwargs(lid, -1000)
             )
         message = str(ctx.exception).lower()
-        self.assertTrue(
-            "permission denied" in message or "inventory_forbidden" in message,
-            msg=str(ctx.exception),
+        self.assertIn(
+            "permission denied",
+            message,
+            msg="el denegado debe cortarse en GRANT EXECUTE, no en el helper: "
+            + str(ctx.exception),
         )
         with self.admin.cursor() as cur:
             cur.execute(
@@ -223,6 +225,34 @@ class Fase1D3AuthorizationTest(unittest.TestCase):
         )
         self.assertEqual(rec.estado, "APPLIED")
         self.assertEqual(rec.usuario_id, 999999)
+
+    def test_device_id_manipulado_no_escala_privilegio(self):
+        from inventory_coordinator import InventoryCoordinatorClient
+
+        lid = self._seed_product(50000)
+        fake_device = str(uuid.uuid4())
+        denied = connect_as(self.denied_role, self.denied_password)
+        self.addCleanup(denied.close)
+        denied_kwargs = self._apply_kwargs(lid, -1000)
+        denied_kwargs["device_id"] = fake_device
+        with self.assertRaises(Exception) as ctx:
+            InventoryCoordinatorClient(denied).apply_command(**denied_kwargs)
+        self.assertIn("permission denied", str(ctx.exception).lower())
+        allowed = connect_as(self.allowed_role, self.allowed_password)
+        self.addCleanup(allowed.close)
+        allowed_kwargs = self._apply_kwargs(lid, -1000)
+        allowed_kwargs["device_id"] = fake_device
+        rec = InventoryCoordinatorClient(allowed).apply_command(**allowed_kwargs)
+        self.assertEqual(rec.estado, "APPLIED")
+        self.assertEqual(rec.device_id, fake_device)
+        with self.admin.cursor() as cur:
+            cur.execute(
+                "SELECT quantity_scaled FROM inventory_balances WHERE producto_local_id=%s",
+                (lid,),
+            )
+            qty = int(cur.fetchone()[0])
+        self.admin.rollback()
+        self.assertEqual(qty, 49000)
 
     def test_rpc_rechaza_venta_positiva_sin_pasar_por_adapter(self):
         import json

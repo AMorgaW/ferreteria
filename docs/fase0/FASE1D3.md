@@ -1,6 +1,7 @@
 # Fase 1D.3 — Gate de autorización empresarial + reconexión
 
-**Estado:** implementada y certificada en laboratorio Docker local el 2026-08-14.
+**Estado:** implementada y certificada en laboratorio Docker local el 2026-08-14
+(recuperación post-crash + QA adversarial GO el mismo día).
 **No autoriza Fase 1E.** No migra POS, compras ni writers productivos.
 **No declara INV-01 resuelto en SQLite.** **No declara INV-02 resuelto.**
 
@@ -8,6 +9,15 @@ Cierra los dos HIGH de la auditoría posterior a 1D.1:
 
 1. Autorización empresarial del inventario online (roles PostgreSQL no-owner).
 2. Reconexión segura tras pérdida de conexión ambigua / post-COMMIT.
+
+## Qué quedó certificado (y qué no)
+
+| Capa | Qué certifica 1D.3 | Qué no certifica |
+|---|---|---|
+| Autorización **técnica** | `session_user` + `GRANT EXECUTE` + `REVOKE PUBLIC` + RLS deny-all para DML directo + signos estructurales | JWT, `anon`/`authenticated`, `AuthManager` |
+| Autorización **empresarial mínima** | Un LOGIN no-owner miembro de `ferrepro_inventory_app` puede invocar `apply_inventory_command`; un LOGIN sin membresía y PUBLIC no | Roles comerciales SQLite (`VENDEDOR`, `BODEGUERO`, …) en PostgreSQL |
+| Identidad confiable | Rol de la conexión PostgreSQL | `p_usuario_id`, `p_device_id` (metadato de auditoría) |
+| Reconexión | Mismo `command_id` / `request_hash` / payload sobre conexión **nueva**; UNKNOWN si el COMMIT es ambiguo | Cortar el DSN productivo a un rol no-owner |
 
 ## Modelo de confianza
 
@@ -132,22 +142,38 @@ con bases creadas por Fase 1D.
 Laboratorio: contenedor `ferrepro-pg-test`, `localhost:55432`, `ferrepro_test`,
 PostgreSQL 16. Variable `FERREPRO_PG_TEST_DSN`. No se usa `SUPABASE_URI`.
 
+Roles no-owner de laboratorio: `ferrepro_inventory_allowed_test` (miembro del
+grupo) y `ferrepro_inventory_denied_test` (sin EXECUTE). La pérdida de sesión
+se induce con `pg_terminate_backend` del PID de **esa** prueba.
+
 ```text
 python -m unittest discover -s tests/fase1d -v
 ```
 
-Certificado con DSN presente: **74 tests, 0 FAIL, 0 SKIP** en pruebas PostgreSQL.
+Certificado con DSN presente: **75 tests, 0 FAIL, 0 SKIP** (incluye authz
+`device_id` inventado, UNKNOWN pre-COMMIT tipado y REJECTED replay con stock
+mutado). Authz+reconnect: 5 corridas estables antes del endurecimiento de
+cobertura; revalidar tras el cierre.
+
+La certificación post-COMMIT usa COMMIT real + `pg_terminate_backend` de esa
+sesión; el `OperationalError` de transporte lo inyecta el proxy de test
+(`_CommitThenTerminate`). El replay en PID nuevo es real. Un corte libpq
+crudo durante `COMMIT` no está instrumentado aparte.
 
 ## Riesgos restantes
 
 - El DSN productivo (`SUPABASE_URI`) sigue siendo, en la práctica, un rol owner.
   El gate existe; el corte de credenciales de inventario a `ferrepro_inventory_app`
   es trabajo operativo / Fase 1E+. No se cambió el sync.
+- Reaplicar el DDL **no** revoca un `GRANT EXECUTE` extra que el owner haya
+  dado a un rol cualquiera. Solo limpia PUBLIC / anon / authenticated /
+  service_role (si existen) y otorga al grupo de app si el rol existe.
 - AJUSTE con `EXECUTE` puede sumar o restar sin cupo comercial. Eso es estructural
   y queda a la capa de negocio cuando existan writers.
 - `p_usuario_id` / `device_id` siguen siendo metadato. No hay JWT de usuario.
 - Writers productivos no usan el coordinador. `APPLY_AUTHORITATIVE_EXCLUDE` sigue
-  `False`. INV-02 (LWW de `productos.stock`) sigue abierto.
+  `False`. INV-02 (LWW de `productos.stock`) sigue abierto. INV-01 no se declara
+  resuelto en SQLite (el xfail de dos archivos locales sigue).
 - Autoridad offline / fencing / barcodes / recepción: no hechas.
 
 **STOP — no migrar writers productivos.**
