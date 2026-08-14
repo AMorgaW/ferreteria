@@ -4,7 +4,9 @@
 APP_NAME = "FERREPRO"
 __version__ = "4.0.0"
 
-# Se incrementa cuando cambia el esquema de la base de datos. Las migraciones
-# son idempotentes (ADD COLUMN / CREATE TABLE IF NOT EXISTS), por lo que datos
-# de versiones anteriores siguen siendo compatibles hacia adelante.
+# SCHEMA_VERSION es una etiqueta escrita en sync_state tras un bootstrap
+# exitoso. NO selecciona ni ordena migraciones: el esquema se aplica con
+# CREATE TABLE IF NOT EXISTS + helpers idempotentes en schema_bootstrap.py.
+# Incrementarlo no cambia el comportamiento hasta que exista un runner
+# versionado. No se finge que controla migraciones.
 SCHEMA_VERSION = 4

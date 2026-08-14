@@ -8,6 +8,7 @@ from typing import Optional, List, Tuple
 from datetime import datetime
 import os
 from local_first_db import ensure_local_first_schema
+import schema_bootstrap
 
 def obtener_fecha_actual():
     """Obtiene la fecha/hora actual en formato local (no UTC)"""
@@ -87,9 +88,18 @@ class DatabaseManager:
         """Crea toda la estructura de la base de datos"""
         conn = self.conectar()
         cursor = conn.cursor()
-        
+        pk = schema_bootstrap.pk_sql(conn)
+        sqlite = schema_bootstrap.is_sqlite_connection(conn)
+
+        def _create(sql: str):
+            # SQLite: SERIAL no es alias de ROWID. Sustitución por motor, no
+            # un reemplazo ciego del SQL remoto ni del DDL PostgreSQL.
+            if sqlite:
+                sql = sql.replace("SERIAL PRIMARY KEY", pk)
+            cursor.execute(sql)
+
         # Tabla de usuarios
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS usuarios (
                 id SERIAL PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
@@ -105,7 +115,7 @@ class DatabaseManager:
         ''')
         
         # Tabla de proveedores (DEBE CREARSE ANTES DE PRODUCTOS)
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS proveedores (
                 id SERIAL PRIMARY KEY,
                 nit TEXT UNIQUE,
@@ -125,7 +135,7 @@ class DatabaseManager:
         ''')
         
         # Tabla de productos (MEJORADA CON PROVEEDOR_ID)
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS productos (
                 id SERIAL PRIMARY KEY,
                 codigo_barras TEXT UNIQUE,
@@ -143,6 +153,11 @@ class DatabaseManager:
                 unidad_medida TEXT DEFAULT 'UNIDAD',
                 viene_en_caja INTEGER DEFAULT 0,
                 unidades_por_caja INTEGER DEFAULT 1,
+                unidades_por_media_caja INTEGER DEFAULT 1,
+                vende_por_empaque INTEGER DEFAULT 0,
+                usar_unidades_categoria INTEGER DEFAULT 1,
+                unidades_venta_custom TEXT,
+                unidad_base_producto TEXT,
                 permite_decimales INTEGER DEFAULT 0,
                 iva REAL DEFAULT 0,
                 activo INTEGER DEFAULT 1,
@@ -153,7 +168,7 @@ class DatabaseManager:
         ''')
         
         # Tabla de clientes
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS clientes (
                 id SERIAL PRIMARY KEY,
                 tipo_documento TEXT DEFAULT 'CC',
@@ -174,7 +189,7 @@ class DatabaseManager:
         ''')
         
         # Tabla de ventas (mejorada)
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS ventas (
                 id SERIAL PRIMARY KEY,
                 numero_factura TEXT UNIQUE,
@@ -196,7 +211,7 @@ class DatabaseManager:
         ''')
         
         # Tabla de detalle de ventas
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS detalle_ventas (
                 id SERIAL PRIMARY KEY,
                 venta_id INTEGER NOT NULL,
@@ -213,7 +228,7 @@ class DatabaseManager:
         ''')
         
         # [OK] CORREGIDO: Tabla de movimientos con numero_factura
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS movimientos (
                 id SERIAL PRIMARY KEY,
                 tipo TEXT NOT NULL,
@@ -236,7 +251,7 @@ class DatabaseManager:
         ''')
         
         # [OK] AGREGADO: Tabla de movimientos_inventario (para compatibilidad)
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS movimientos_inventario (
                 id SERIAL PRIMARY KEY,
                 tipo_movimiento TEXT NOT NULL,
@@ -257,7 +272,7 @@ class DatabaseManager:
         ''')
 
         # [OK] NUEVO: Tabla de compras (encabezado)
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS compras (
                 id SERIAL PRIMARY KEY,
                 proveedor_id INTEGER NOT NULL,
@@ -269,13 +284,17 @@ class DatabaseManager:
                 observaciones TEXT,
                 usuario_id INTEGER,
                 estado TEXT DEFAULT 'COMPLETADA',
+                estado_pago TEXT DEFAULT 'PENDIENTE',
+                monto_pagado REAL DEFAULT 0,
+                saldo_pendiente REAL DEFAULT 0,
+                fecha_vencimiento DATE,
                 FOREIGN KEY (proveedor_id) REFERENCES proveedores(id),
                 FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
             )
         ''')
 
         # [OK] NUEVO: Tabla de detalle de compras
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS detalle_compras (
                 id SERIAL PRIMARY KEY,
                 compra_id INTEGER NOT NULL,
@@ -289,7 +308,7 @@ class DatabaseManager:
         ''')
         
         # Tabla de cierre de caja
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS cierres_caja (
                 id SERIAL PRIMARY KEY,
                 usuario_id INTEGER NOT NULL,
@@ -311,7 +330,7 @@ class DatabaseManager:
         ''')
         
         # Tabla de cuentas por cobrar
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS cuentas_por_cobrar (
                 id SERIAL PRIMARY KEY,
                 venta_id INTEGER NOT NULL,
@@ -328,7 +347,7 @@ class DatabaseManager:
         ''')
         
         # Tabla de pagos de cuentas por cobrar
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS pagos_cuentas (
                 id SERIAL PRIMARY KEY,
                 cuenta_id INTEGER NOT NULL,
@@ -341,7 +360,7 @@ class DatabaseManager:
         ''')
         
         # Tabla de alertas
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS alertas (
                 id SERIAL PRIMARY KEY,
                 tipo TEXT NOT NULL,
@@ -356,7 +375,7 @@ class DatabaseManager:
         ''')
         
         # [OK] NUEVO: Tabla de abonos a compras
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS abonos_compras (
                 id SERIAL PRIMARY KEY,
                 id_compra INTEGER NOT NULL,
@@ -372,7 +391,7 @@ class DatabaseManager:
         ''')
         
         # [OK] NUEVO: Tabla de resumen de deudas (desnormalizado para queries rápidas)
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS resumen_deudas (
                 id SERIAL PRIMARY KEY,
                 id_proveedor INTEGER NOT NULL,
@@ -383,7 +402,7 @@ class DatabaseManager:
         ''')
         
         # [OK] NUEVO: Tabla de abonos a ventas (cuentas por cobrar)
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS abonos_ventas (
                 id SERIAL PRIMARY KEY,
                 id_venta INTEGER NOT NULL,
@@ -399,7 +418,7 @@ class DatabaseManager:
         ''')
         
         # [OK] NUEVO: Tabla de egresos de caja (gastos operativos)
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS egresos_caja (
                 id SERIAL PRIMARY KEY,
                 monto REAL NOT NULL,
@@ -415,7 +434,7 @@ class DatabaseManager:
         ''')
         
         # [OK] NUEVO: Tabla de fórmulas de mezcla de pinturas
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS formulas_mezcla (
                 id SERIAL PRIMARY KEY,
                 nombre TEXT NOT NULL,
@@ -432,7 +451,7 @@ class DatabaseManager:
         ''')
 
         # [OK] NUEVO: Detalle de componentes de una fórmula de mezcla
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS formula_detalle (
                 id SERIAL PRIMARY KEY,
                 formula_id INTEGER NOT NULL,
@@ -444,42 +463,8 @@ class DatabaseManager:
             )
         ''')
 
-        # [OK] NUEVO: Índices para mezclas
-        try:
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_formula_detalle_formula ON formula_detalle(formula_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_formulas_mezcla_nombre ON formulas_mezcla(nombre)")
-        except Exception:
-            pass
-
-        # Agregar tipo_unidad a detalle_ventas si no existe
-        try:
-            cursor.execute("ALTER TABLE detalle_ventas ADD COLUMN IF NOT EXISTS tipo_unidad TEXT DEFAULT 'Unidad'")
-        except Exception:
-            pass
-
-        # [OK] ACTUALIZAR: Agregar columnas a tabla compras si no existen
-        try:
-            cursor.execute('ALTER TABLE compras ADD COLUMN IF NOT EXISTS estado_pago VARCHAR DEFAULT \'PENDIENTE\'')
-        except Exception:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE compras ADD COLUMN IF NOT EXISTS monto_pagado REAL DEFAULT 0')
-        except Exception:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE compras ADD COLUMN IF NOT EXISTS saldo_pendiente REAL DEFAULT 0')
-        except Exception:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE compras ADD COLUMN IF NOT EXISTS fecha_vencimiento DATE')
-        except Exception:
-            pass
-        
         # Tabla de auditoría
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS auditoria (
                 id SERIAL PRIMARY KEY,
                 usuario_id INTEGER,
@@ -493,7 +478,7 @@ class DatabaseManager:
         ''')
         
         # Tabla de configuración
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS configuracion (
                 clave TEXT PRIMARY KEY,
                 valor TEXT NOT NULL,
@@ -501,60 +486,9 @@ class DatabaseManager:
                 fecha_modificacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
-        # Índices para mejorar rendimiento
-        indices = [
-            "CREATE EXTENSION IF NOT EXISTS pg_trgm",
-            "CREATE INDEX IF NOT EXISTS idx_productos_codigo ON productos(codigo_barras)",
-            "CREATE INDEX IF NOT EXISTS idx_productos_nombre ON productos(nombre)",
-            "CREATE INDEX IF NOT EXISTS idx_productos_activo_nombre ON productos(activo, nombre)",
-            "CREATE INDEX IF NOT EXISTS idx_productos_categoria ON productos(categoria)",
-            "CREATE INDEX IF NOT EXISTS idx_productos_marca ON productos(marca)",
-            "CREATE INDEX IF NOT EXISTS idx_productos_proveedor ON productos(proveedor_id)",
-            "CREATE INDEX IF NOT EXISTS idx_productos_nombre_trgm ON productos USING gin (LOWER(nombre) gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS idx_productos_codigo_trgm ON productos USING gin (LOWER(codigo_barras) gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS idx_productos_marca_trgm ON productos USING gin (LOWER(marca) gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON ventas(fecha)",
-            "CREATE INDEX IF NOT EXISTS idx_ventas_cliente ON ventas(cliente_id)",
-            "CREATE INDEX IF NOT EXISTS idx_ventas_estado_fecha ON ventas(estado, fecha)",
-            "CREATE INDEX IF NOT EXISTS idx_detalle_ventas_venta ON detalle_ventas(venta_id)",
-            "CREATE INDEX IF NOT EXISTS idx_detalle_ventas_producto ON detalle_ventas(producto_id)",
-            "CREATE INDEX IF NOT EXISTS idx_movimientos_fecha ON movimientos(fecha)",
-            "CREATE INDEX IF NOT EXISTS idx_movimientos_proveedor ON movimientos(proveedor_id)",
-            "CREATE INDEX IF NOT EXISTS idx_clientes_documento ON clientes(numero_documento)",
-            "CREATE INDEX IF NOT EXISTS idx_clientes_nombre ON clientes(nombre)",
-            "CREATE INDEX IF NOT EXISTS idx_clientes_activo_nombre ON clientes(activo, nombre)",
-            "CREATE INDEX IF NOT EXISTS idx_clientes_nombre_trgm ON clientes USING gin (LOWER(nombre) gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS idx_clientes_documento_trgm ON clientes USING gin (LOWER(numero_documento) gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS idx_proveedores_nombre ON proveedores(nombre)",
-            "CREATE INDEX IF NOT EXISTS idx_proveedores_nit ON proveedores(nit)",
-            "CREATE INDEX IF NOT EXISTS idx_proveedores_activo_nombre ON proveedores(activo, nombre)",
-            "CREATE INDEX IF NOT EXISTS idx_proveedores_nombre_trgm ON proveedores USING gin (LOWER(nombre) gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS idx_proveedores_nit_trgm ON proveedores USING gin (LOWER(nit) gin_trgm_ops)",
-            "CREATE INDEX IF NOT EXISTS idx_compras_fecha ON compras(fecha)",
-            "CREATE INDEX IF NOT EXISTS idx_compras_proveedor ON compras(proveedor_id)",
-            "CREATE INDEX IF NOT EXISTS idx_detalle_compras_compra ON detalle_compras(compra_id)",
-            "CREATE INDEX IF NOT EXISTS idx_detalle_compras_producto ON detalle_compras(producto_id)",
-            "CREATE INDEX IF NOT EXISTS idx_abonos_compra ON abonos_compras(id_compra)",
-            "CREATE INDEX IF NOT EXISTS idx_abonos_fecha ON abonos_compras(fecha_abono)",
-            "CREATE INDEX IF NOT EXISTS idx_cuentas_cobrar_cliente_estado ON cuentas_por_cobrar(cliente_id, estado)",
-            "CREATE INDEX IF NOT EXISTS idx_cuentas_cobrar_vencimiento ON cuentas_por_cobrar(fecha_vencimiento)",
-            "CREATE INDEX IF NOT EXISTS idx_alertas_leida_fecha ON alertas(leida, fecha_creacion)",
-            "CREATE INDEX IF NOT EXISTS idx_egresos_fecha ON egresos_caja(fecha)",
-        ]
-        
-        conn.commit()
 
-        for indice in indices:
-            try:
-                cursor.execute(indice)
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                pass  # El índice ya existe
-        
         # Crear tabla de configuración de categorías (nueva)
-        cursor.execute('''
+        _create('''
             CREATE TABLE IF NOT EXISTS categorias_config (
                 id SERIAL PRIMARY KEY,
                 nombre TEXT UNIQUE NOT NULL,
@@ -564,35 +498,35 @@ class DatabaseManager:
                 fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
-        # Agregar nuevos campos a la tabla productos si no existen
-        self.agregar_columnas_productos(cursor)
-        
-        # Insertar configuración predefinida de categorías
-        self.insertar_categorias_predefinidas(cursor)
-        
-        conn.commit()
+
+        try:
+            schema_bootstrap.apply_engine_schema_fixes(conn)
+            self.insertar_categorias_predefinidas(cursor)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+            raise
         conn.close()
         print("[OK] Base de datos inicializada correctamente")
     
-    def agregar_columnas_productos(self, cursor):
-        """Agrega nuevas columnas a la tabla productos si no existen"""
+    def agregar_columnas_productos(self, cursor=None):
+        """Idempotente: añade columnas de negocio faltantes. No traga errores."""
+        conn = self.conectar()
         try:
-            cursor.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS usar_unidades_categoria INTEGER DEFAULT 1")
+            schema_bootstrap.apply_required_columns(conn)
+            conn.commit()
         except Exception:
-            pass
-        try:
-            cursor.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS unidades_venta_custom TEXT")
-        except Exception:
-            pass
-        try:
-            cursor.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS unidad_base_producto TEXT")
-        except Exception:
-            pass
-        try:
-            cursor.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS presentacion TEXT")
-        except Exception:
-            pass
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
     
     def insertar_categorias_predefinidas(self, cursor):
         """Inserta las categorías predefinidas con sus unidades de venta"""
@@ -703,36 +637,48 @@ class DatabaseManager:
                 print(f"[WARN] Error al insertar categoría {cat['nombre']}: {e}")
     
     def crear_usuario_admin_default(self):
-        """Crea un usuario administrador por defecto si no existe"""
+        """Crea el administrador inicial únicamente con una clave local configurada."""
         conn = self.conectar()
         cursor = conn.cursor()
         
         cursor.execute("SELECT COUNT(*) FROM usuarios WHERE username = 'admin'")
         if cursor.fetchone()[0] == 0:
-            password_hash = hashlib.sha256("admin123".encode()).hexdigest()
+            bootstrap_password = os.environ.get("FERREPRO_BOOTSTRAP_ADMIN_PASSWORD", "").strip()
+            if not bootstrap_password:
+                print("[INFO] No se creó el administrador inicial: configure "
+                      "FERREPRO_BOOTSTRAP_ADMIN_PASSWORD en el .env local.")
+                conn.close()
+                return
+            password_hash = hashlib.sha256(bootstrap_password.encode()).hexdigest()
             cursor.execute('''
                 INSERT INTO usuarios (username, password_hash, nombre_completo, rol)
                 VALUES (?, ?, ?, ?)
             ''', ('admin', password_hash, 'Administrador', 'ADMIN'))
             conn.commit()
-            print("[OK] Usuario admin creado (usuario: admin, contraseña: admin123)")
+            print("[OK] Usuario administrador inicial creado.")
         
         conn.close()
     
     def crear_usuario_empleado_default(self):
-        """Crea un usuario empleado (VENDEDOR) por defecto si no existe"""
+        """Crea el vendedor inicial únicamente con una clave local configurada."""
         conn = self.conectar()
         cursor = conn.cursor()
 
         cursor.execute("SELECT COUNT(*) FROM usuarios WHERE username = 'empleado'")
         if cursor.fetchone()[0] == 0:
-            password_hash = hashlib.sha256("empleado123".encode()).hexdigest()
+            bootstrap_password = os.environ.get("FERREPRO_BOOTSTRAP_SELLER_PASSWORD", "").strip()
+            if not bootstrap_password:
+                print("[INFO] No se creó el vendedor inicial: configure "
+                      "FERREPRO_BOOTSTRAP_SELLER_PASSWORD en el .env local.")
+                conn.close()
+                return
+            password_hash = hashlib.sha256(bootstrap_password.encode()).hexdigest()
             cursor.execute('''
                 INSERT INTO usuarios (username, password_hash, nombre_completo, rol)
                 VALUES (?, ?, ?, ?)
             ''', ('empleado', password_hash, 'Empleado', 'VENDEDOR'))
             conn.commit()
-            print("[OK] Usuario empleado creado (usuario: empleado, contraseña: empleado123)")
+            print("[OK] Usuario vendedor inicial creado.")
 
         conn.close()
 
@@ -746,15 +692,15 @@ class DatabaseManager:
         Verifica el esquema y agrega columnas faltantes si es necesario.
         """
         conn = self.conectar()
-        cursor = conn.cursor()
-
         try:
-            cursor.execute("ALTER TABLE movimientos_inventario ADD COLUMN IF NOT EXISTS numero_factura TEXT")
-            cursor.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS proveedor_id INTEGER")
-            cursor.execute("ALTER TABLE productos ADD COLUMN IF NOT EXISTS fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            schema_bootstrap.apply_engine_schema_fixes(conn)
             conn.commit()
-        except Exception as e:
-            print(f"[AVISO] Error verificando esquema: {e}")
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
     

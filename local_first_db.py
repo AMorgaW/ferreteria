@@ -4,6 +4,7 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime
+import schema_bootstrap
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,12 +48,11 @@ def connect(db_path=DEFAULT_DB_PATH):
 
 
 def table_columns(conn, table):
-    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    return schema_bootstrap.column_names(conn, table)
 
 
 def add_column_if_missing(conn, table, column, definition):
-    if column not in table_columns(conn, table):
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    return schema_bootstrap.add_column_if_missing(conn, table, column, definition)
 
 
 def row_to_dict(row):
@@ -207,10 +207,7 @@ def ensure_local_first_schema(db_path=DEFAULT_DB_PATH):
             "CREATE INDEX IF NOT EXISTS idx_historial_precios_prod_fecha ON historial_precios(producto_id, fecha)",
         ]
         for statement in indexes:
-            try:
-                conn.execute(statement)
-            except sqlite3.Error:
-                pass
+            schema_bootstrap.create_index_if_missing(conn, statement)
 
         # Migración: egresos_caja tenía una FK a 'cajas' (tabla inexistente) que
         # impedía registrar egresos cuando foreign_keys=ON. Se reconstruye la
@@ -239,7 +236,9 @@ def ensure_local_first_schema(db_path=DEFAULT_DB_PATH):
                 conn.execute("ALTER TABLE egresos_caja_fix RENAME TO egresos_caja")
                 conn.execute("PRAGMA foreign_keys=ON")
         except sqlite3.Error as _exc:
-            print(f"[SCHEMA] No se pudo corregir FK de egresos_caja: {_exc}")
+            raise schema_bootstrap.SchemaBootstrapError(
+                f"No se pudo corregir FK de egresos_caja: {_exc}"
+            ) from _exc
 
         # Migración: limpiar movimientos legacy 'COBRO_CREDITO' con producto_id=-1.
         # Eran un marcador de cobro de crédito (no inventario) que violaba la FK
@@ -255,27 +254,30 @@ def ensure_local_first_schema(db_path=DEFAULT_DB_PATH):
                     "DELETE FROM movimientos WHERE tipo='COBRO_CREDITO' AND producto_id=-1")
                 conn.execute("PRAGMA foreign_keys=ON")
         except sqlite3.Error as _exc:
-            print(f"[SCHEMA] No se pudo limpiar COBRO_CREDITO legacy: {_exc}")
+            raise schema_bootstrap.SchemaBootstrapError(
+                f"No se pudo limpiar COBRO_CREDITO legacy: {_exc}"
+            ) from _exc
 
-        # Registrar la versión de esquema aplicada (para futuras migraciones)
-        try:
-            from version import SCHEMA_VERSION
-            conn.execute("""
-                INSERT INTO sync_state (clave, valor, updated_at)
-                VALUES ('schema_version', ?, ?)
-                ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor,
-                                                 updated_at = excluded.updated_at
-            """, (str(SCHEMA_VERSION), now_iso()))
-        except Exception:
-            pass
+        # Registrar la versión de esquema aplicada (etiqueta; no selecciona
+        # migraciones — ver version.py).
+        from version import SCHEMA_VERSION
+        conn.execute("""
+            INSERT INTO sync_state (clave, valor, updated_at)
+            VALUES ('schema_version', ?, ?)
+            ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor,
+                                             updated_at = excluded.updated_at
+        """, (str(SCHEMA_VERSION), now_iso()))
 
         # Estrategia B: local_id (UUID) como identidad de sincronización.
-        try:
-            ensure_local_id_unique(conn)
-        except Exception as _exc:
-            print(f"[MIGRACION local_id] {_exc}")
+        ensure_local_id_unique(conn)
 
         conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         conn.close()
 
@@ -356,7 +358,9 @@ def ensure_local_id_unique(conn):
                 f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_local_id "
                 f"ON {table}(local_id)")
         except sqlite3.Error as exc:
-            print(f"[MIGRACION local_id] {table}: {exc}")
+            raise schema_bootstrap.SchemaBootstrapError(
+                f"Migración local_id en {table}: {exc}"
+            ) from exc
     conn.commit()
 
 
