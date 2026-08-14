@@ -118,13 +118,18 @@ class SchemaSyncYAlcanceTest(unittest.TestCase):
         self.assertIn("Nunca ejecutar contra SQLite", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS inventory_commands", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS inventory_operations", sql)
-        self.assertIn("command_id TEXT PRIMARY KEY", sql)
-        self.assertIn("operation_id TEXT PRIMARY KEY", sql)
+        self.assertIn("CONSTRAINT pk_inventory_commands PRIMARY KEY (command_id)", sql)
+        self.assertIn("CONSTRAINT pk_inventory_operations PRIMARY KEY (operation_id)", sql)
         self.assertIn("producto_local_id TEXT NOT NULL", sql)
         self.assertIn("delta_scaled BIGINT NOT NULL", sql)
         self.assertIn("request_hash TEXT NOT NULL", sql)
-        self.assertIn("UNIQUE (command_id, line_no)", sql)
+        self.assertIn(
+            "CONSTRAINT uq_inventory_operations_command_line UNIQUE (command_id, line_no)",
+            sql,
+        )
         self.assertIn("REFERENCES inventory_commands(command_id)", sql)
+        self.assertIn("inventory_commands_pkey", sql)
+        self.assertIn("inventory_operations_command_id_line_no_key", sql)
         self.assertNotIn("CREATE FUNCTION", sql)
         lowered = sql.lower()
         self.assertNotIn("uuid primary key", lowered)

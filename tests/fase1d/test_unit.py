@@ -245,6 +245,203 @@ class UnitCoordinatorTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 4)
 
+    def test_signo_venta_positivo_rechazado(self):
+        from inventory_coordinator import InvalidDeltaSignError, apply_inventory_command
+
+        fake = MagicMock()
+        with self.assertRaises(InvalidDeltaSignError):
+            apply_inventory_command(
+                fake,
+                command_id=str(uuid.uuid4()),
+                tipo="VENTA",
+                device_id=DEVICE,
+                operations=[_op_scaled(str(uuid.uuid4()), 1000)],
+            )
+
+    def test_signo_mezcla_requiere_ambos(self):
+        from inventory_coordinator import InvalidDeltaSignError, apply_inventory_command
+
+        fake = MagicMock()
+        pid = str(uuid.uuid4())
+        with self.assertRaises(InvalidDeltaSignError):
+            apply_inventory_command(
+                fake,
+                command_id=str(uuid.uuid4()),
+                tipo="MEZCLA",
+                device_id=DEVICE,
+                operations=[_op_scaled(pid, -1000)],
+            )
+
+    def test_signo_devolucion_mixta_rechazada(self):
+        from inventory_coordinator import InvalidDeltaSignError, apply_inventory_command
+
+        fake = MagicMock()
+        a = str(uuid.uuid4())
+        b = str(uuid.uuid4())
+        with self.assertRaises(InvalidDeltaSignError):
+            apply_inventory_command(
+                fake,
+                command_id=str(uuid.uuid4()),
+                tipo="DEVOLUCION",
+                device_id=DEVICE,
+                operations=[
+                    _op_scaled(a, 1000, line_no=1),
+                    _op_scaled(b, -1000, line_no=2),
+                ],
+            )
+
+    def test_unknown_reconecta_mismo_command_id(self):
+        from inventory_coordinator import apply_inventory_command
+        from psycopg2 import OperationalError
+        from psycopg2.extensions import TRANSACTION_STATUS_IDLE
+
+        command_id = str(uuid.uuid4())
+        producto = str(uuid.uuid4())
+        seen_ids = []
+        factory_calls = []
+
+        def payload(replayed):
+            return {
+                "command_id": command_id,
+                "tipo": "VENTA",
+                "documento_tipo": None,
+                "documento_local_id": None,
+                "device_id": DEVICE,
+                "usuario_id": None,
+                "request_hash": "a" * 64,
+                "estado": "APPLIED",
+                "resultado": "APPLIED",
+                "motivo": None,
+                "created_at": "t",
+                "updated_at": "t",
+                "operations": [
+                    {
+                        "operation_id": str(uuid.uuid4()),
+                        "producto_local_id": producto,
+                        "delta_scaled": -1000,
+                        "line_no": 1,
+                    }
+                ],
+                "replayed": replayed,
+            }
+
+        class FakeCursor:
+            def __init__(self, owner):
+                self.owner = owner
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, params=None):
+                if "SET LOCAL" in sql:
+                    return
+                seen_ids.append(params[0])
+                self._row = (payload(self.owner.replayed),)
+
+            def fetchone(self):
+                return self._row
+
+        class FakeConn:
+            def __init__(self, *, die_on_commit=False, replayed=False):
+                self.autocommit = False
+                self.closed = 0
+                self.die_on_commit = die_on_commit
+                self.replayed = replayed
+                self.commits = 0
+                self.rollbacks = 0
+
+            def cursor(self):
+                return FakeCursor(self)
+
+            def commit(self):
+                self.commits += 1
+                if self.die_on_commit:
+                    raise OperationalError("server closed the connection unexpectedly")
+
+            def rollback(self):
+                self.rollbacks += 1
+
+            def close(self):
+                self.closed = 1
+
+            def get_transaction_status(self):
+                return TRANSACTION_STATUS_IDLE
+
+        first = FakeConn(die_on_commit=True, replayed=False)
+
+        def factory():
+            factory_calls.append(True)
+            return FakeConn(die_on_commit=False, replayed=True)
+
+        rec = apply_inventory_command(
+            first,
+            command_id=command_id,
+            tipo="VENTA",
+            device_id=DEVICE,
+            operations=[_op(producto, "-1")],
+            connection_factory=factory,
+        )
+        self.assertEqual(seen_ids, [command_id, command_id])
+        self.assertEqual(len(factory_calls), 1)
+        self.assertEqual(rec.command_id, command_id)
+        self.assertTrue(rec.replayed)
+
+    def test_unknown_sin_factory_no_inventa_command_id(self):
+        from inventory_coordinator import (
+            CoordinatorUnknownOutcomeError,
+            apply_inventory_command,
+        )
+        from psycopg2 import OperationalError
+        from psycopg2.extensions import TRANSACTION_STATUS_IDLE
+
+        command_id = str(uuid.uuid4())
+        producto = str(uuid.uuid4())
+
+        class FakeCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, params=None):
+                if "SET LOCAL" in sql:
+                    return
+                raise OperationalError("server closed the connection unexpectedly")
+
+            def fetchone(self):
+                return None
+
+        class FakeConn:
+            autocommit = False
+            closed = 0
+
+            def cursor(self):
+                return FakeCursor()
+
+            def rollback(self):
+                return None
+
+            def close(self):
+                self.closed = 1
+
+            def get_transaction_status(self):
+                return TRANSACTION_STATUS_IDLE
+
+        with self.assertRaises(CoordinatorUnknownOutcomeError) as ctx:
+            apply_inventory_command(
+                FakeConn(),
+                command_id=command_id,
+                tipo="VENTA",
+                device_id=DEVICE,
+                operations=[_op(producto, "-1")],
+            )
+        self.assertIn("UNKNOWN", str(ctx.exception).upper())
+        self.assertIn("command_id", str(ctx.exception))
+
     def test_rechaza_conexion_postgres_autocommit(self):
         from inventory_coordinator import CoordinatorError, apply_inventory_command
 

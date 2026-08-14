@@ -3,34 +3,106 @@
 -- Idempotente. No modifica productos.stock. No entra al sync LWW.
 -- Autoridad online: inventory_balances.quantity_scaled (BIGINT, escala 1000).
 -- apply_inventory_command: una RPC → una transacción.
+-- Fase 1D.3: gate session_user + constraints nombradas.
 
 CREATE TABLE IF NOT EXISTS inventory_balances (
-    producto_local_id TEXT PRIMARY KEY,
+    producto_local_id TEXT NOT NULL,
     quantity_scaled BIGINT NOT NULL CHECK (quantity_scaled >= 0),
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    CONSTRAINT pk_inventory_balances PRIMARY KEY (producto_local_id)
 );
 
 CREATE TABLE IF NOT EXISTS inventory_balance_init (
-    producto_local_id TEXT PRIMARY KEY,
+    producto_local_id TEXT NOT NULL,
     quantity_scaled BIGINT NOT NULL,
     source TEXT NOT NULL,
-    initialized_at TEXT NOT NULL
+    initialized_at TEXT NOT NULL,
+    CONSTRAINT pk_inventory_balance_init PRIMARY KEY (producto_local_id)
 );
 
 CREATE TABLE IF NOT EXISTS inventory_balance_init_state (
-    init_key TEXT PRIMARY KEY CHECK (init_key = 'legacy_cutover'),
-    initialized_at TEXT NOT NULL
+    init_key TEXT NOT NULL CHECK (init_key = 'legacy_cutover'),
+    initialized_at TEXT NOT NULL,
+    CONSTRAINT pk_inventory_balance_init_state PRIMARY KEY (init_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_inventory_balances_updated
     ON inventory_balances(updated_at);
+
+-- Compatibilidad con bases ya creadas por Fase 1D (nombres implícitos).
+DO $ferrepro_rename$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_constraint c
+          JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public'
+           AND t.relname = 'inventory_balances'
+           AND c.conname = 'inventory_balances_pkey'
+    ) THEN
+        ALTER TABLE public.inventory_balances
+            RENAME CONSTRAINT inventory_balances_pkey TO pk_inventory_balances;
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_constraint c
+          JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public'
+           AND t.relname = 'inventory_balance_init'
+           AND c.conname = 'inventory_balance_init_pkey'
+    ) THEN
+        ALTER TABLE public.inventory_balance_init
+            RENAME CONSTRAINT inventory_balance_init_pkey TO pk_inventory_balance_init;
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_constraint c
+          JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public'
+           AND t.relname = 'inventory_balance_init_state'
+           AND c.conname = 'inventory_balance_init_state_pkey'
+    ) THEN
+        ALTER TABLE public.inventory_balance_init_state
+            RENAME CONSTRAINT inventory_balance_init_state_pkey
+            TO pk_inventory_balance_init_state;
+    END IF;
+END
+$ferrepro_rename$;
 
 ALTER TABLE inventory_balances ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_balance_init ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_balance_init_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_commands ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_operations ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION public.ferrepro_inventory_caller_is_allowed()
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $ferrepro_fn$
+DECLARE
+    v_has_app boolean := false;
+BEGIN
+    BEGIN
+        v_has_app := pg_catalog.pg_has_role(
+            session_user,
+            'ferrepro_inventory_app',
+            'USAGE'
+        );
+    EXCEPTION
+        WHEN undefined_object THEN
+            v_has_app := false;
+    END;
+    RETURN v_has_app
+        OR session_user = current_user;
+END;
+$ferrepro_fn$;
 
 -- FASE1D-BEGIN apply_inventory_command
 CREATE OR REPLACE FUNCTION public.apply_inventory_command(
@@ -80,7 +152,13 @@ DECLARE
     v_constraint text;
     BIGINT_MIN numeric := -9223372036854775808;
     BIGINT_MAX numeric := 9223372036854775807;
+    v_pos int := 0;
+    v_neg int := 0;
 BEGIN
+    IF NOT public.ferrepro_inventory_caller_is_allowed() THEN
+        RAISE EXCEPTION 'INVENTORY_FORBIDDEN: el caller no está autorizado para apply_inventory_command'
+            USING ERRCODE = '42501';
+    END IF;
     IF p_command_id IS NULL OR btrim(p_command_id) = '' THEN
         RAISE EXCEPTION 'INVALID_COMMAND: command_id es obligatorio'
             USING ERRCODE = '22023';
@@ -210,6 +288,27 @@ BEGIN
         ),
         '[]'::jsonb
     );
+
+    SELECT
+        COUNT(*) FILTER (WHERE (e->>'delta_scaled')::bigint > 0),
+        COUNT(*) FILTER (WHERE (e->>'delta_scaled')::bigint < 0)
+      INTO v_pos, v_neg
+      FROM jsonb_array_elements(v_parsed) e;
+    IF v_tipo = 'VENTA' AND v_pos > 0 THEN
+        RAISE EXCEPTION 'INVALID_DELTA_SIGN: VENTA exige todas las líneas con delta < 0'
+            USING ERRCODE = '22023';
+    ELSIF v_tipo IN ('COMPRA', 'RECEPCION') AND v_neg > 0 THEN
+        RAISE EXCEPTION USING ERRCODE = '22023',
+            MESSAGE = 'INVALID_DELTA_SIGN: ' || v_tipo
+                || ' exige todas las líneas con delta > 0';
+    ELSIF v_tipo = 'DEVOLUCION' AND v_pos > 0 AND v_neg > 0 THEN
+        RAISE EXCEPTION 'INVALID_DELTA_SIGN: DEVOLUCION no admite signos mixtos en el mismo comando'
+            USING ERRCODE = '22023';
+    ELSIF v_tipo = 'MEZCLA' AND (v_pos = 0 OR v_neg = 0) THEN
+        RAISE EXCEPTION 'INVALID_DELTA_SIGN: MEZCLA exige al menos un delta < 0 y uno > 0'
+            USING ERRCODE = '22023';
+    END IF;
+
     SELECT
         '{"command_id":' || pg_catalog.to_jsonb(v_command_id)::text
         || ',"documento_local_id":'
@@ -440,7 +539,10 @@ BEGIN
     EXCEPTION
         WHEN unique_violation THEN
             GET STACKED DIAGNOSTICS v_constraint = CONSTRAINT_NAME;
-            IF v_constraint = 'inventory_commands_pkey' THEN
+            IF v_constraint IN (
+                'pk_inventory_commands',
+                'inventory_commands_pkey'
+            ) THEN
                 SELECT request_hash
                   INTO v_existing_hash
                   FROM public.inventory_commands
@@ -455,14 +557,18 @@ BEGIN
                 END IF;
                 RAISE;
             ELSIF v_constraint IN (
+                'pk_inventory_operations',
                 'inventory_operations_pkey',
+                'uq_inventory_operations_command_line',
                 'inventory_operations_command_id_line_no_key'
             ) THEN
                 RAISE EXCEPTION
                     'DUPLICATE_OPERATION: operation_id repetido en otro comando'
                     USING ERRCODE = '22023';
             ELSIF v_constraint IN (
+                'pk_inventory_balances',
                 'inventory_balances_pkey',
+                'pk_inventory_balance_init',
                 'inventory_balance_init_pkey'
             ) THEN
                 RAISE;
@@ -541,6 +647,10 @@ DECLARE
     v_qty bigint;
     v_n integer := 0;
 BEGIN
+    IF session_user IS DISTINCT FROM current_user THEN
+        RAISE EXCEPTION 'INVENTORY_FORBIDDEN: seed_inventory_balance solo el owner'
+            USING ERRCODE = '42501';
+    END IF;
     BEGIN
         v_pid := (btrim(p_producto_local_id))::uuid::text;
     EXCEPTION WHEN invalid_text_representation THEN
@@ -607,6 +717,10 @@ DECLARE
     v_pid text;
     v_inserted_one integer;
 BEGIN
+    IF session_user IS DISTINCT FROM current_user THEN
+        RAISE EXCEPTION 'INVENTORY_FORBIDDEN: initialize_inventory_balances_from_legacy solo el owner'
+            USING ERRCODE = '42501';
+    END IF;
     PERFORM pg_advisory_xact_lock(
         pg_catalog.hashtextextended('ferrepro.invbal.init:legacy_cutover', 0)
     );
@@ -677,9 +791,12 @@ REVOKE ALL ON FUNCTION public.apply_inventory_command(text, text, text, text, te
 REVOKE ALL ON FUNCTION public.inventory_command_to_json(text, boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.ferrepro_inventory_caller_is_allowed() FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_balances FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_balance_init FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_balance_init_state FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_commands FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_operations FROM PUBLIC;
 
 DO $ferrepro_do$
 BEGIN
@@ -688,6 +805,7 @@ BEGIN
         REVOKE ALL ON FUNCTION public.inventory_command_to_json(text, boolean) FROM anon;
         REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM anon;
         REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM anon;
+        REVOKE ALL ON FUNCTION public.ferrepro_inventory_caller_is_allowed() FROM anon;
         REVOKE ALL ON TABLE public.inventory_balances FROM anon;
         REVOKE ALL ON TABLE public.inventory_balance_init FROM anon;
         REVOKE ALL ON TABLE public.inventory_balance_init_state FROM anon;
@@ -699,6 +817,7 @@ BEGIN
         REVOKE ALL ON FUNCTION public.inventory_command_to_json(text, boolean) FROM authenticated;
         REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM authenticated;
         REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM authenticated;
+        REVOKE ALL ON FUNCTION public.ferrepro_inventory_caller_is_allowed() FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_balances FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_balance_init FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_balance_init_state FROM authenticated;
@@ -710,11 +829,25 @@ BEGIN
         REVOKE ALL ON FUNCTION public.inventory_command_to_json(text, boolean) FROM service_role;
         REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM service_role;
         REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM service_role;
+        REVOKE ALL ON FUNCTION public.ferrepro_inventory_caller_is_allowed() FROM service_role;
         REVOKE ALL ON TABLE public.inventory_balances FROM service_role;
         REVOKE ALL ON TABLE public.inventory_balance_init FROM service_role;
         REVOKE ALL ON TABLE public.inventory_balance_init_state FROM service_role;
         REVOKE ALL ON TABLE public.inventory_commands FROM service_role;
         REVOKE ALL ON TABLE public.inventory_operations FROM service_role;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ferrepro_inventory_app') THEN
+        GRANT EXECUTE ON FUNCTION public.apply_inventory_command(text, text, text, text, text, integer, text, jsonb) TO ferrepro_inventory_app;
+        GRANT USAGE ON SCHEMA public TO ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.inventory_command_to_json(text, boolean) FROM ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.ferrepro_inventory_caller_is_allowed() FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_balances FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_balance_init FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_balance_init_state FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_commands FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_operations FROM ferrepro_inventory_app;
     END IF;
 END
 $ferrepro_do$;

@@ -53,7 +53,7 @@ class ContractCoordinatorTest(unittest.TestCase):
 
         sql = postgres_coordinator_sql()
         self.assertIn("CREATE TABLE IF NOT EXISTS inventory_balances", sql)
-        self.assertIn("producto_local_id TEXT PRIMARY KEY", sql)
+        self.assertIn("CONSTRAINT pk_inventory_balances PRIMARY KEY (producto_local_id)", sql)
         self.assertIn("quantity_scaled BIGINT NOT NULL", sql)
         self.assertIn("CHECK (quantity_scaled >= 0)", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS inventory_balance_init", sql)
@@ -65,15 +65,19 @@ class ContractCoordinatorTest(unittest.TestCase):
         apply_sql = coordinator_apply_sql()
         self.assertIn("GET STACKED DIAGNOSTICS", apply_sql)
         self.assertIn("CONSTRAINT_NAME", apply_sql)
+        self.assertIn("pk_inventory_commands", apply_sql)
         self.assertIn("inventory_commands_pkey", apply_sql)
+        self.assertIn("pk_inventory_operations", apply_sql)
         self.assertIn("inventory_operations_pkey", apply_sql)
+        self.assertIn("uq_inventory_operations_command_line", apply_sql)
         self.assertIn("inventory_operations_command_id_line_no_key", apply_sql)
+        self.assertIn("pk_inventory_balances", apply_sql)
         self.assertIn("inventory_balances_pkey", apply_sql)
         idx = apply_sql.find("WHEN unique_violation THEN")
         self.assertGreater(idx, 0)
-        handler = apply_sql[idx:idx + 1800]
+        handler = apply_sql[idx:idx + 2800]
         replay = handler.find("inventory_command_to_json")
-        commands_pk = handler.find("inventory_commands_pkey")
+        commands_pk = handler.find("pk_inventory_commands")
         else_raise = handler.rfind("ELSE")
         self.assertGreater(commands_pk, 0)
         self.assertGreater(replay, commands_pk)
@@ -138,6 +142,10 @@ class ContractCoordinatorTest(unittest.TestCase):
         self.assertIn("FROM anon", sql)
         self.assertIn("FROM authenticated", sql)
         self.assertIn("ENABLE ROW LEVEL SECURITY", sql)
+        self.assertIn("ferrepro_inventory_app", sql)
+        self.assertIn("ferrepro_inventory_caller_is_allowed", sql)
+        self.assertIn("session_user", sql)
+        self.assertIn("INVALID_DELTA_SIGN", sql)
 
     def test_migracion_idempotente(self):
         from inventory_coordinator import postgres_coordinator_sql

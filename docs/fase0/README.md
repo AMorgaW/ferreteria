@@ -6,7 +6,8 @@ Fase 1A (bootstrap SQLite) se implementó después, con GO humano, en
 **Siguiente paso de inventario/recepción:** autorización humana de Fase 1E
 (migrar writers productivos al coordinador). Fase 1D (coordinador
 PostgreSQL de stock) está hecha. La certificación PostgreSQL real de
-laboratorio está en [FASE1D1.md](FASE1D1.md). **No autoriza migrar POS/compras.**
+laboratorio está en [FASE1D1.md](FASE1D1.md). El gate de autorización y la
+reconexión post-desconexión están en [FASE1D3.md](FASE1D3.md). **No autoriza migrar POS/compras.**
 
 ## Qué es Fase 0
 

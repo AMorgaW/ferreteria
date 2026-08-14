@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 import psycopg2
 from psycopg2 import errorcodes
@@ -40,6 +40,55 @@ from inventory_ledger import (
 
 BIGINT_MIN = -9223372036854775808
 BIGINT_MAX = 9223372036854775807
+
+# Rol PostgreSQL de aplicación (NOLOGIN). Los tests crean un LOGIN miembro.
+# No es un rol comercial SQLite (ADMIN/GERENTE/VENDEDOR/…).
+INVENTORY_APP_ROLE = "ferrepro_inventory_app"
+
+CONSTRAINT_PK_INVENTORY_COMMANDS = "pk_inventory_commands"
+CONSTRAINT_PK_INVENTORY_COMMANDS_LEGACY = "inventory_commands_pkey"
+CONSTRAINT_PK_INVENTORY_OPERATIONS = "pk_inventory_operations"
+CONSTRAINT_PK_INVENTORY_OPERATIONS_LEGACY = "inventory_operations_pkey"
+CONSTRAINT_UQ_INVENTORY_OPERATIONS_LINE = "uq_inventory_operations_command_line"
+CONSTRAINT_UQ_INVENTORY_OPERATIONS_LINE_LEGACY = (
+    "inventory_operations_command_id_line_no_key"
+)
+CONSTRAINT_PK_INVENTORY_BALANCES = "pk_inventory_balances"
+CONSTRAINT_PK_INVENTORY_BALANCES_LEGACY = "inventory_balances_pkey"
+CONSTRAINT_PK_INVENTORY_BALANCE_INIT = "pk_inventory_balance_init"
+CONSTRAINT_PK_INVENTORY_BALANCE_INIT_LEGACY = "inventory_balance_init_pkey"
+CONSTRAINT_PK_INVENTORY_BALANCE_INIT_STATE = "pk_inventory_balance_init_state"
+CONSTRAINT_PK_INVENTORY_BALANCE_INIT_STATE_LEGACY = (
+    "inventory_balance_init_state_pkey"
+)
+
+# Reglas estructurales de signo. No son cupos comerciales.
+COMMAND_DELTA_SIGN_RULES = {
+    "VENTA": "all_negative",
+    "COMPRA": "all_positive",
+    "RECEPCION": "all_positive",
+    "DEVOLUCION": "uniform_sign",
+    "AJUSTE": "any_nonzero",
+    "MEZCLA": "mixed",
+}
+
+_LOST_CONNECTION_MARKERS = (
+    "connection already closed",
+    "cursor already closed",
+    "server closed the connection",
+    "connection reset",
+    "eof detected",
+    "ssl syscall",
+    "could not receive data",
+    "could not send data",
+    "terminating connection",
+    "connection not open",
+    "connection timed out",
+    "timeout expired",
+    "broken pipe",
+    "admin_shutdown",
+    "crash_shutdown",
+)
 
 
 REMOTE_COORDINATOR_MIGRATION_FILENAME = "supabase_inventory_coordinator.sql"
@@ -79,6 +128,24 @@ class CoordinatorTimeoutError(CoordinatorError):
 
 class CoordinatorDeadlockError(CoordinatorError):
     """Deadlock PostgreSQL agotó reintentos. Reintentar el mismo command_id."""
+
+
+class CoordinatorUnknownOutcomeError(CoordinatorError):
+    """La conexión se perdió; el COMMIT puede haber ocurrido o no.
+
+    El caller debe abrir una conexión PostgreSQL **nueva** y reintentar el
+    **mismo** command_id / request_hash / payload. Nunca generar otro id.
+    """
+
+    outcome = "UNKNOWN"
+    retryable = True
+
+
+class InvalidDeltaSignError(InventoryLedgerError):
+    """Tipo de comando con signos de delta estructuralmente imposibles."""
+
+
+ConnectionFactory = Callable[[], Any]
 
 
 @dataclass(frozen=True)
@@ -166,9 +233,100 @@ def _extract_marked(sql: str, name: str) -> str:
     return sql[start:stop]
 
 
+def assert_command_delta_signs(
+    tipo: str, operations: Sequence[Mapping[str, Any]]
+) -> None:
+    """Impide combinaciones de signo imposibles. No inventa cupos comerciales."""
+    tipo = _normalize_tipo(tipo)
+    deltas = [int(op["delta_scaled"]) for op in operations]
+    rule = COMMAND_DELTA_SIGN_RULES.get(tipo)
+    if rule == "all_negative":
+        if any(delta >= 0 for delta in deltas):
+            raise InvalidDeltaSignError(
+                "INVALID_DELTA_SIGN: VENTA exige todas las líneas con delta < 0"
+            )
+    elif rule == "all_positive":
+        if any(delta <= 0 for delta in deltas):
+            raise InvalidDeltaSignError(
+                f"INVALID_DELTA_SIGN: {tipo} exige todas las líneas con delta > 0"
+            )
+    elif rule == "uniform_sign":
+        signs = {1 if delta > 0 else -1 for delta in deltas}
+        if len(signs) > 1:
+            raise InvalidDeltaSignError(
+                "INVALID_DELTA_SIGN: DEVOLUCION no admite signos mixtos "
+                "en el mismo comando"
+            )
+    elif rule == "mixed":
+        if not any(delta < 0 for delta in deltas) or not any(
+            delta > 0 for delta in deltas
+        ):
+            raise InvalidDeltaSignError(
+                "INVALID_DELTA_SIGN: MEZCLA exige al menos un delta < 0 y uno > 0"
+            )
+
+
+def _is_lost_connection(exc: BaseException) -> bool:
+    if isinstance(exc, QueryCanceled) or isinstance(exc, DeadlockDetected):
+        return False
+    pgcode = getattr(exc, "pgcode", None)
+    if pgcode in (errorcodes.QUERY_CANCELED, errorcodes.DEADLOCK_DETECTED):
+        return False
+    if isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in _LOST_CONNECTION_MARKERS)
+
+
+def _discard_connection(conn) -> None:
+    if conn is None:
+        return
+    try:
+        if not getattr(conn, "closed", 1):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _connection_is_dead(conn) -> bool:
+    if conn is None:
+        return True
+    closed = getattr(conn, "closed", 0)
+    if isinstance(closed, bool) and closed:
+        return True
+    if isinstance(closed, int) and not isinstance(closed, bool) and closed != 0:
+        return True
+    get_status = getattr(conn, "get_transaction_status", None)
+    if get_status is None or not callable(get_status):
+        return False
+    try:
+        status = get_status()
+    except Exception:
+        return True
+    if not isinstance(status, int):
+        return False
+    return status == psycopg2.extensions.TRANSACTION_STATUS_UNKNOWN
+
+
 def _raise_from_pg(exc: BaseException) -> None:
     message = str(exc)
     pgcode = getattr(exc, "pgcode", None)
+    if _is_lost_connection(exc):
+        raise CoordinatorUnknownOutcomeError(
+            "Conexión PostgreSQL perdida (UNKNOWN); reintente el mismo "
+            "command_id en una conexión nueva"
+        ) from exc
+    if "INVENTORY_FORBIDDEN" in message or pgcode == errorcodes.INSUFFICIENT_PRIVILEGE:
+        raise CoordinatorError(message) from exc
+    if "INVALID_DELTA_SIGN" in message:
+        raise InvalidDeltaSignError(message) from exc
     if "IDEMPOTENCY_CONFLICT" in message:
         raise IdempotencyConflictError(message) from exc
     if "DUPLICATE_OPERATION" in message:
@@ -220,6 +378,7 @@ def _prepare_command(
             raise QuantityScaleError(
                 f"delta_scaled fuera de rango BIGINT: {delta}"
             )
+    assert_command_delta_signs(tipo, normalized_ops)
     computed_hash = command_request_hash(
         command_id=command_id,
         tipo=tipo,
@@ -255,7 +414,7 @@ def _prepare_command(
 
 
 def apply_inventory_command(
-    conn,
+    conn=None,
     *,
     command_id: str,
     tipo: str,
@@ -268,10 +427,14 @@ def apply_inventory_command(
     timeout_seconds: float = 8.0,
     retry_on_timeout: bool = True,
     max_deadlock_retries: int = 3,
+    connection_factory: Optional[ConnectionFactory] = None,
+    max_reconnect_retries: int = 1,
 ) -> InventoryCommandRecord:
     """Invoca el RPC autoritativo. No genera un command_id nuevo en retry.
 
-    Timeout/deadlock reintentan el **mismo** command_id y el mismo request_hash.
+    Timeout/deadlock/UNKNOWN reintentan el **mismo** command_id y request_hash.
+    Si la conexión se pierde, ``connection_factory`` abre una sesión nueva.
+    Sin factory, el UNKNOWN se propaga para que el caller reconecte.
     """
     prepared = _prepare_command(
         command_id=command_id,
@@ -283,27 +446,68 @@ def apply_inventory_command(
         usuario_id=usuario_id,
         request_hash=request_hash,
     )
-    if schema_bootstrap.is_sqlite_connection(conn):
+    if conn is not None and schema_bootstrap.is_sqlite_connection(conn):
         raise CoordinatorError(
             "apply_inventory_command del coordinador solo opera sobre PostgreSQL"
         )
-    _require_idle_transaction(conn)
+    if conn is None and connection_factory is None:
+        raise CoordinatorError(
+            "apply_inventory_command requiere conn o connection_factory"
+        )
     timeout_ms = max(1, int(float(timeout_seconds) * 1000))
     timeout_attempts = 2 if retry_on_timeout else 1
     timeout_retries_left = timeout_attempts - 1
     deadlock_retries_left = max(0, int(max_deadlock_retries))
+    reconnect_retries_left = max(0, int(max_reconnect_retries))
+    active = conn
+
+    def _acquire() -> Any:
+        nonlocal active
+        if active is not None and not _connection_is_dead(active):
+            _require_idle_transaction(active)
+            return active
+        if connection_factory is None:
+            if active is None:
+                raise CoordinatorUnknownOutcomeError(
+                    "sin conexión usable; abra una nueva y reintente el mismo command_id"
+                )
+            _require_idle_transaction(active)
+            return active
+        _discard_connection(active)
+        active = connection_factory()
+        if active is not None and schema_bootstrap.is_sqlite_connection(active):
+            raise CoordinatorError(
+                "apply_inventory_command del coordinador solo opera sobre PostgreSQL"
+            )
+        _require_idle_transaction(active)
+        return active
+
     while True:
         try:
-            return _invoke_apply_rpc(conn, prepared, timeout_ms=timeout_ms)
-        except CoordinatorTimeoutError as exc:
+            current = _acquire()
+            return _invoke_apply_rpc(current, prepared, timeout_ms=timeout_ms)
+        except CoordinatorTimeoutError:
             if timeout_retries_left <= 0:
                 raise
             timeout_retries_left -= 1
+            if _connection_is_dead(active):
+                _discard_connection(active)
+                active = None
             continue
-        except CoordinatorDeadlockError as exc:
+        except CoordinatorDeadlockError:
             if deadlock_retries_left <= 0:
                 raise
             deadlock_retries_left -= 1
+            if _connection_is_dead(active):
+                _discard_connection(active)
+                active = None
+            continue
+        except CoordinatorUnknownOutcomeError:
+            _discard_connection(active)
+            active = None
+            if connection_factory is None or reconnect_retries_left <= 0:
+                raise
+            reconnect_retries_left -= 1
             continue
 
 
@@ -343,10 +547,17 @@ def _invoke_apply_rpc(
             row = cur.fetchone()
         conn.commit()
     except Exception as exc:
+        lost = _is_lost_connection(exc)
         try:
             conn.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_exc:
+            lost = lost or _is_lost_connection(rollback_exc)
+            _discard_connection(conn)
+        if lost:
+            raise CoordinatorUnknownOutcomeError(
+                "Conexión PostgreSQL perdida (UNKNOWN); reintente el mismo "
+                "command_id en una conexión nueva"
+            ) from exc
         if isinstance(exc, psycopg2.Error):
             _raise_from_pg(exc)
         raise
@@ -459,15 +670,39 @@ class InventoryCoordinatorClient:
     """Adapter mínimo para invocar el coordinador desde Python.
 
     No conecta POS ni compras. Un retry debe reutilizar command_id.
+    No revive una conexión muerta: si hay ``connection_factory``, abre
+    una sesión PostgreSQL nueva y reintenta el mismo comando preparado.
     """
 
-    def __init__(self, conn, *, timeout_seconds: float = 8.0):
+    def __init__(
+        self,
+        conn=None,
+        *,
+        connection_factory: Optional[ConnectionFactory] = None,
+        timeout_seconds: float = 8.0,
+    ):
+        if conn is None and connection_factory is None:
+            raise CoordinatorError(
+                "InventoryCoordinatorClient requiere conn o connection_factory"
+            )
         self.conn = conn
+        self.connection_factory = connection_factory
         self.timeout_seconds = timeout_seconds
+
+    def _factory(self) -> Any:
+        if self.connection_factory is None:
+            raise CoordinatorUnknownOutcomeError(
+                "sin connection_factory; no se reutiliza una conexión muerta"
+            )
+        self.conn = self.connection_factory()
+        return self.conn
 
     def apply_command(self, **kwargs) -> InventoryCommandRecord:
         kwargs.setdefault("timeout_seconds", self.timeout_seconds)
-        return apply_inventory_command(self.conn, **kwargs)
+        factory = self._factory if self.connection_factory is not None else None
+        return apply_inventory_command(
+            self.conn, connection_factory=factory, **kwargs
+        )
 
     def seed_balance(
         self, producto_local_id: str, quantity_scaled: int
@@ -480,6 +715,11 @@ class InventoryCoordinatorClient:
 
 def _require_idle_transaction(conn) -> None:
     """Evita que el adapter confirme una transacción ajena al RPC."""
+    if conn is None or _connection_is_dead(conn):
+        raise CoordinatorUnknownOutcomeError(
+            "conexión cerrada o desconocida; abra una nueva y reintente "
+            "el mismo command_id"
+        )
     if getattr(conn, "autocommit", False) is True:
         raise CoordinatorError(
             "El coordinador requiere una conexión PostgreSQL con autocommit=False"
@@ -490,9 +730,18 @@ def _require_idle_transaction(conn) -> None:
     try:
         status = get_status()
     except Exception as exc:
-        raise CoordinatorError(
+        raise CoordinatorUnknownOutcomeError(
             "No se pudo verificar el estado transaccional de la conexión"
         ) from exc
+    if status == psycopg2.extensions.TRANSACTION_STATUS_INERROR:
+        try:
+            conn.rollback()
+            status = get_status()
+        except Exception as exc:
+            raise CoordinatorUnknownOutcomeError(
+                "conexión abortada irrecuperable; abra una nueva y reintente "
+                "el mismo command_id"
+            ) from exc
     if status != psycopg2.extensions.TRANSACTION_STATUS_IDLE:
         raise CoordinatorError(
             "El coordinador requiere una conexión sin transacción activa"
@@ -504,34 +753,106 @@ _POSTGRES_COORDINATOR_SQL = r"""-- FERREPRO Fase 1D — coordinador autoritativo
 -- Idempotente. No modifica productos.stock. No entra al sync LWW.
 -- Autoridad online: inventory_balances.quantity_scaled (BIGINT, escala 1000).
 -- apply_inventory_command: una RPC → una transacción.
+-- Fase 1D.3: gate session_user + constraints nombradas.
 
 CREATE TABLE IF NOT EXISTS inventory_balances (
-    producto_local_id TEXT PRIMARY KEY,
+    producto_local_id TEXT NOT NULL,
     quantity_scaled BIGINT NOT NULL CHECK (quantity_scaled >= 0),
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    CONSTRAINT pk_inventory_balances PRIMARY KEY (producto_local_id)
 );
 
 CREATE TABLE IF NOT EXISTS inventory_balance_init (
-    producto_local_id TEXT PRIMARY KEY,
+    producto_local_id TEXT NOT NULL,
     quantity_scaled BIGINT NOT NULL,
     source TEXT NOT NULL,
-    initialized_at TEXT NOT NULL
+    initialized_at TEXT NOT NULL,
+    CONSTRAINT pk_inventory_balance_init PRIMARY KEY (producto_local_id)
 );
 
 CREATE TABLE IF NOT EXISTS inventory_balance_init_state (
-    init_key TEXT PRIMARY KEY CHECK (init_key = 'legacy_cutover'),
-    initialized_at TEXT NOT NULL
+    init_key TEXT NOT NULL CHECK (init_key = 'legacy_cutover'),
+    initialized_at TEXT NOT NULL,
+    CONSTRAINT pk_inventory_balance_init_state PRIMARY KEY (init_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_inventory_balances_updated
     ON inventory_balances(updated_at);
+
+-- Compatibilidad con bases ya creadas por Fase 1D (nombres implícitos).
+DO $ferrepro_rename$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_constraint c
+          JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public'
+           AND t.relname = 'inventory_balances'
+           AND c.conname = 'inventory_balances_pkey'
+    ) THEN
+        ALTER TABLE public.inventory_balances
+            RENAME CONSTRAINT inventory_balances_pkey TO pk_inventory_balances;
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_constraint c
+          JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public'
+           AND t.relname = 'inventory_balance_init'
+           AND c.conname = 'inventory_balance_init_pkey'
+    ) THEN
+        ALTER TABLE public.inventory_balance_init
+            RENAME CONSTRAINT inventory_balance_init_pkey TO pk_inventory_balance_init;
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_constraint c
+          JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public'
+           AND t.relname = 'inventory_balance_init_state'
+           AND c.conname = 'inventory_balance_init_state_pkey'
+    ) THEN
+        ALTER TABLE public.inventory_balance_init_state
+            RENAME CONSTRAINT inventory_balance_init_state_pkey
+            TO pk_inventory_balance_init_state;
+    END IF;
+END
+$ferrepro_rename$;
 
 ALTER TABLE inventory_balances ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_balance_init ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_balance_init_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_commands ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_operations ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION public.ferrepro_inventory_caller_is_allowed()
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $ferrepro_fn$
+DECLARE
+    v_has_app boolean := false;
+BEGIN
+    BEGIN
+        v_has_app := pg_catalog.pg_has_role(
+            session_user,
+            'ferrepro_inventory_app',
+            'USAGE'
+        );
+    EXCEPTION
+        WHEN undefined_object THEN
+            v_has_app := false;
+    END;
+    RETURN v_has_app
+        OR session_user = current_user;
+END;
+$ferrepro_fn$;
 
 -- FASE1D-BEGIN apply_inventory_command
 CREATE OR REPLACE FUNCTION public.apply_inventory_command(
@@ -581,7 +902,13 @@ DECLARE
     v_constraint text;
     BIGINT_MIN numeric := -9223372036854775808;
     BIGINT_MAX numeric := 9223372036854775807;
+    v_pos int := 0;
+    v_neg int := 0;
 BEGIN
+    IF NOT public.ferrepro_inventory_caller_is_allowed() THEN
+        RAISE EXCEPTION 'INVENTORY_FORBIDDEN: el caller no está autorizado para apply_inventory_command'
+            USING ERRCODE = '42501';
+    END IF;
     IF p_command_id IS NULL OR btrim(p_command_id) = '' THEN
         RAISE EXCEPTION 'INVALID_COMMAND: command_id es obligatorio'
             USING ERRCODE = '22023';
@@ -711,6 +1038,27 @@ BEGIN
         ),
         '[]'::jsonb
     );
+
+    SELECT
+        COUNT(*) FILTER (WHERE (e->>'delta_scaled')::bigint > 0),
+        COUNT(*) FILTER (WHERE (e->>'delta_scaled')::bigint < 0)
+      INTO v_pos, v_neg
+      FROM jsonb_array_elements(v_parsed) e;
+    IF v_tipo = 'VENTA' AND v_pos > 0 THEN
+        RAISE EXCEPTION 'INVALID_DELTA_SIGN: VENTA exige todas las líneas con delta < 0'
+            USING ERRCODE = '22023';
+    ELSIF v_tipo IN ('COMPRA', 'RECEPCION') AND v_neg > 0 THEN
+        RAISE EXCEPTION USING ERRCODE = '22023',
+            MESSAGE = 'INVALID_DELTA_SIGN: ' || v_tipo
+                || ' exige todas las líneas con delta > 0';
+    ELSIF v_tipo = 'DEVOLUCION' AND v_pos > 0 AND v_neg > 0 THEN
+        RAISE EXCEPTION 'INVALID_DELTA_SIGN: DEVOLUCION no admite signos mixtos en el mismo comando'
+            USING ERRCODE = '22023';
+    ELSIF v_tipo = 'MEZCLA' AND (v_pos = 0 OR v_neg = 0) THEN
+        RAISE EXCEPTION 'INVALID_DELTA_SIGN: MEZCLA exige al menos un delta < 0 y uno > 0'
+            USING ERRCODE = '22023';
+    END IF;
+
     SELECT
         '{"command_id":' || pg_catalog.to_jsonb(v_command_id)::text
         || ',"documento_local_id":'
@@ -941,7 +1289,10 @@ BEGIN
     EXCEPTION
         WHEN unique_violation THEN
             GET STACKED DIAGNOSTICS v_constraint = CONSTRAINT_NAME;
-            IF v_constraint = 'inventory_commands_pkey' THEN
+            IF v_constraint IN (
+                'pk_inventory_commands',
+                'inventory_commands_pkey'
+            ) THEN
                 SELECT request_hash
                   INTO v_existing_hash
                   FROM public.inventory_commands
@@ -956,14 +1307,18 @@ BEGIN
                 END IF;
                 RAISE;
             ELSIF v_constraint IN (
+                'pk_inventory_operations',
                 'inventory_operations_pkey',
+                'uq_inventory_operations_command_line',
                 'inventory_operations_command_id_line_no_key'
             ) THEN
                 RAISE EXCEPTION
                     'DUPLICATE_OPERATION: operation_id repetido en otro comando'
                     USING ERRCODE = '22023';
             ELSIF v_constraint IN (
+                'pk_inventory_balances',
                 'inventory_balances_pkey',
+                'pk_inventory_balance_init',
                 'inventory_balance_init_pkey'
             ) THEN
                 RAISE;
@@ -1042,6 +1397,10 @@ DECLARE
     v_qty bigint;
     v_n integer := 0;
 BEGIN
+    IF session_user IS DISTINCT FROM current_user THEN
+        RAISE EXCEPTION 'INVENTORY_FORBIDDEN: seed_inventory_balance solo el owner'
+            USING ERRCODE = '42501';
+    END IF;
     BEGIN
         v_pid := (btrim(p_producto_local_id))::uuid::text;
     EXCEPTION WHEN invalid_text_representation THEN
@@ -1108,6 +1467,10 @@ DECLARE
     v_pid text;
     v_inserted_one integer;
 BEGIN
+    IF session_user IS DISTINCT FROM current_user THEN
+        RAISE EXCEPTION 'INVENTORY_FORBIDDEN: initialize_inventory_balances_from_legacy solo el owner'
+            USING ERRCODE = '42501';
+    END IF;
     PERFORM pg_advisory_xact_lock(
         pg_catalog.hashtextextended('ferrepro.invbal.init:legacy_cutover', 0)
     );
@@ -1178,9 +1541,12 @@ REVOKE ALL ON FUNCTION public.apply_inventory_command(text, text, text, text, te
 REVOKE ALL ON FUNCTION public.inventory_command_to_json(text, boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.ferrepro_inventory_caller_is_allowed() FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_balances FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_balance_init FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_balance_init_state FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_commands FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_operations FROM PUBLIC;
 
 DO $ferrepro_do$
 BEGIN
@@ -1189,6 +1555,7 @@ BEGIN
         REVOKE ALL ON FUNCTION public.inventory_command_to_json(text, boolean) FROM anon;
         REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM anon;
         REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM anon;
+        REVOKE ALL ON FUNCTION public.ferrepro_inventory_caller_is_allowed() FROM anon;
         REVOKE ALL ON TABLE public.inventory_balances FROM anon;
         REVOKE ALL ON TABLE public.inventory_balance_init FROM anon;
         REVOKE ALL ON TABLE public.inventory_balance_init_state FROM anon;
@@ -1200,6 +1567,7 @@ BEGIN
         REVOKE ALL ON FUNCTION public.inventory_command_to_json(text, boolean) FROM authenticated;
         REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM authenticated;
         REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM authenticated;
+        REVOKE ALL ON FUNCTION public.ferrepro_inventory_caller_is_allowed() FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_balances FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_balance_init FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_balance_init_state FROM authenticated;
@@ -1211,11 +1579,25 @@ BEGIN
         REVOKE ALL ON FUNCTION public.inventory_command_to_json(text, boolean) FROM service_role;
         REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM service_role;
         REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM service_role;
+        REVOKE ALL ON FUNCTION public.ferrepro_inventory_caller_is_allowed() FROM service_role;
         REVOKE ALL ON TABLE public.inventory_balances FROM service_role;
         REVOKE ALL ON TABLE public.inventory_balance_init FROM service_role;
         REVOKE ALL ON TABLE public.inventory_balance_init_state FROM service_role;
         REVOKE ALL ON TABLE public.inventory_commands FROM service_role;
         REVOKE ALL ON TABLE public.inventory_operations FROM service_role;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ferrepro_inventory_app') THEN
+        GRANT EXECUTE ON FUNCTION public.apply_inventory_command(text, text, text, text, text, integer, text, jsonb) TO ferrepro_inventory_app;
+        GRANT USAGE ON SCHEMA public TO ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.inventory_command_to_json(text, boolean) FROM ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.ferrepro_inventory_caller_is_allowed() FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_balances FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_balance_init FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_balance_init_state FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_commands FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_operations FROM ferrepro_inventory_app;
     END IF;
 END
 $ferrepro_do$;

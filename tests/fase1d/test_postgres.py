@@ -515,7 +515,7 @@ class PostgresIntegrationTest(unittest.TestCase):
                 "JOIN pg_class c ON c.oid = con.conrelid "
                 "WHERE c.relname = 'inventory_balances' AND con.contype = 'p'"
             )
-            self.assertEqual(cur.fetchone()[0], "inventory_balances_pkey")
+            self.assertEqual(cur.fetchone()[0], "pk_inventory_balances")
             cur.execute(
                 """
                 INSERT INTO inventory_balances (
@@ -556,7 +556,9 @@ class PostgresIntegrationTest(unittest.TestCase):
             )
             defn = cur.fetchone()[0]
         self.assertIn("GET STACKED DIAGNOSTICS", defn)
+        self.assertIn("pk_inventory_commands", defn)
         self.assertIn("inventory_commands_pkey", defn)
+        self.assertIn("pk_inventory_balances", defn)
         self.assertIn("inventory_balances_pkey", defn)
 
     def test_overflow_bigint_real_no_cambia_balance(self):

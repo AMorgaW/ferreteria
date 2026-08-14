@@ -45,9 +45,11 @@ Fase 0: documentación, ADRs, harness, tests de ruptura. Producción de inventar
 
 **Fase 1C:** ledger `inventory_commands` / `inventory_operations` e idempotencia. No aplica stock.
 
-**Fase 1D (esta subfase):** coordinador PostgreSQL `apply_inventory_command` + `inventory_balances`. No reabrir el ledger 1C. No migrar writers productivos.
+**Fase 1D / 1D.1 / 1D.3:** coordinador PostgreSQL `apply_inventory_command` +
+`inventory_balances`, certificación real, gate `session_user` y reconexión
+con el mismo `command_id`. No reabrir el ledger 1C. No migrar writers.
 
-**Prohibido en 1D y aún no autorizado (1E+):** conectar POS/compras/devoluciones/mezclas/ajustes al coordinador, `APPLY_AUTHORITATIVE_EXCLUDE = True`, barcodes múltiples, recepción, OCR, fencing/leases/`OFFLINE_INVENTORY_AUTHORITY`, UI nueva.
+**Prohibido en 1D.3 y aún no autorizado (1E+):** conectar POS/compras/devoluciones/mezclas/ajustes al coordinador, `APPLY_AUTHORITATIVE_EXCLUDE = True`, barcodes múltiples, recepción, OCR, fencing/leases/`OFFLINE_INVENTORY_AUTHORITY`, UI nueva.
 
 Contrato canónico: `docs/fase0/`. Schema: `schema_bootstrap.py`. Registry: `sync_registry.py`. Coordinador: `inventory_coordinator.py`.
 

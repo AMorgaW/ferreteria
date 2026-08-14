@@ -29,6 +29,7 @@ Eres QA adversarial de FERREPRO. Tu trabajo es **demostrar que el entregable est
 - Fase 1B / 1B.1 / 1B.2: cerradas con GO.
 - Fase 1C (ledger): cerrada con GO.
 - Fase 1D (coordinador PostgreSQL): **autorizada**. Auditar RPC atómica, locking real vs contract, idempotencia remota, separación de `inventory_balances` vs `productos.stock`, REVOKE PUBLIC, ausencia de LWW. No rechazarla por no haber migrado POS.
+- Fase 1D.3 (gate + reconexión): **autorizada**. Auditar autorización con roles no-owner, `session_user` vs parámetros manipulables, reconexión con el mismo `command_id` tras `pg_terminate_backend`. No rechazarla por no haber migrado POS.
 - Fase 1E+ (writers productivos, barcodes, recepción, fencing): **no autorizar**. Decisión humana.
 
 Al auditar 1D: concurrencia PostgreSQL solo es certificable si los tests de integración se ejecutaron contra PostgreSQL real. UNIT/CONTRACT no equivalen a locking. `APPLY_AUTHORITATIVE_EXCLUDE` sigue False. El xfail de dos SQLite de INV-01 sigue xfail. No se adelantó 1E.
