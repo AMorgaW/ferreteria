@@ -12,7 +12,6 @@ UPDATE_STOCK_FILES = frozenset({
     "services/mezclas_service.py",
     "local_server.py",
     "ui/dashboard_ui.py",
-    "scripts/seed_productos_prueba.py",
 })
 
 # INSERT de stock inicial (no es UPDATE, se rastrea aparte).

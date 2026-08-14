@@ -5,33 +5,14 @@ import sqlite3
 import uuid
 from datetime import datetime
 import schema_bootstrap
+from sync_registry import pk_column, sync_tables, table_for_entity
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB_PATH = os.environ.get("LOCAL_DB_PATH", os.path.join(BASE_DIR, "ferreteria.db"))
 
-
-SYNC_TABLES = [
-    "usuarios",
-    "productos",
-    "clientes",
-    "proveedores",
-    "ventas",
-    "detalle_ventas",
-    "movimientos",
-    "movimientos_inventario",
-    "cuentas_por_cobrar",
-    "pagos_cuentas",
-    "cierres_caja",
-    "abonos_ventas",
-    "abonos_compras",
-    "egresos_caja",
-    "configuracion",
-    "compras",
-    "detalle_compras",
-    "auditoria",
-    "historial_precios",
-]
+# Derivado del registry canónico. No editar esta lista a mano.
+SYNC_TABLES = sync_tables()
 
 
 def now_iso():
@@ -111,6 +92,20 @@ def ensure_local_first_schema(db_path=DEFAULT_DB_PATH):
         """)
         add_column_if_missing(conn, "local_sessions", "last_activity_at", "TEXT")
 
+        # Historial de precios debe existir ANTES de añadir columnas sync:
+        # está en SYNC_REGISTRY y en un SQLite fresco no lo crea database.py.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS historial_precios (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                producto_id INTEGER NOT NULL,
+                tipo TEXT NOT NULL,
+                precio_anterior REAL,
+                precio_nuevo REAL,
+                usuario_id INTEGER,
+                fecha TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         for table in SYNC_TABLES:
             exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -135,19 +130,6 @@ def ensure_local_first_schema(db_path=DEFAULT_DB_PATH):
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='productos'"
         ).fetchone():
             add_column_if_missing(conn, "productos", "presentacion", "TEXT")
-
-        # Historial de precios (trazabilidad de cambios de precio).
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS historial_precios (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                producto_id INTEGER NOT NULL,
-                tipo TEXT NOT NULL,
-                precio_anterior REAL,
-                precio_nuevo REAL,
-                usuario_id INTEGER,
-                fecha TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
 
         # Contadores atómicos (p. ej. consecutivo de factura por día) para evitar
         # colisiones de numero_factura en ventas simultáneas.
@@ -272,6 +254,11 @@ def ensure_local_first_schema(db_path=DEFAULT_DB_PATH):
         ensure_local_id_unique(conn)
 
         conn.commit()
+
+        # Identidad de dispositivo (ADR-0003 capa 1B): UUID persistente.
+        # No escribe device_id de fila ni habilita autoridad offline.
+        from local_first_config import get_or_create_device_id
+        get_or_create_device_id()
     except Exception:
         try:
             conn.rollback()
@@ -283,18 +270,7 @@ def ensure_local_first_schema(db_path=DEFAULT_DB_PATH):
 
 
 def normalize_table_name(entity_type):
-    mapping = {
-        "product": "productos",
-        "customer": "clientes",
-        "supplier": "proveedores",
-        "sale": "ventas",
-        "sale_detail": "detalle_ventas",
-        "inventory_movement": "movimientos",
-        "user": "usuarios",
-        "payment": "pagos_cuentas",
-        "cash_closing": "cierres_caja",
-    }
-    return mapping.get(entity_type, entity_type)
+    return table_for_entity(entity_type)
 
 
 def enqueue_sync(conn, entity_type, entity_id, operation, payload, table_name=None):
@@ -327,9 +303,13 @@ def ensure_local_id_unique(conn):
         cols = table_columns(conn, table)
         if "local_id" not in cols:
             continue
-        # Identificador de fila: 'id' si existe; si no (p. ej. tabla clave-valor
-        # 'configuracion'), el rowid implícito de SQLite.
-        pk = "id" if "id" in cols else "rowid"
+        declared_pk = pk_column(table)
+        if declared_pk in cols:
+            pk = declared_pk
+        elif "id" in cols:
+            pk = "id"
+        else:
+            pk = "rowid"
         try:
             # 1) Backfill: UUID a las filas sin local_id.
             faltantes = conn.execute(
@@ -364,17 +344,43 @@ def ensure_local_id_unique(conn):
     conn.commit()
 
 
+def new_local_id():
+    """UUID global estable. No deriva de hostname, id entero, fecha ni nombre."""
+    return str(uuid.uuid4())
+
+
+def _row_pk(table, columns):
+    declared_pk = pk_column(table)
+    if declared_pk in columns:
+        return declared_pk
+    if "id" in columns:
+        return "id"
+    return "rowid"
+
+
 def ensure_local_id(conn, table, row_id):
     columns = table_columns(conn, table)
     if "local_id" not in columns:
         return None
-    row = conn.execute(f"SELECT local_id FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    pk = _row_pk(table, columns)
+    row = conn.execute(
+        f"SELECT local_id FROM {table} WHERE {pk} = ?", (row_id,)
+    ).fetchone()
     if not row:
         return None
     local_id = row["local_id"]
     if not local_id:
-        local_id = str(uuid.uuid4())
-        conn.execute(f"UPDATE {table} SET local_id = ?, updated_at = ? WHERE id = ?", (local_id, now_iso(), row_id))
+        local_id = new_local_id()
+        if "updated_at" in columns:
+            conn.execute(
+                f"UPDATE {table} SET local_id = ?, updated_at = ? WHERE {pk} = ?",
+                (local_id, now_iso(), row_id),
+            )
+        else:
+            conn.execute(
+                f"UPDATE {table} SET local_id = ? WHERE {pk} = ?",
+                (local_id, row_id),
+            )
     return local_id
 
 
@@ -389,6 +395,7 @@ def enqueue_entity(conn, entity_type, entity_id, operation, table_name):
     columnas de sincronización (no hace nada si la fila no existe).
     """
     columns = table_columns(conn, table_name)
+    pk = _row_pk(table_name, columns)
     ensure_local_id(conn, table_name, entity_id)
     sets, params = [], []
     if "sync_status" in columns:
@@ -399,9 +406,9 @@ def enqueue_entity(conn, entity_type, entity_id, operation, table_name):
     if sets:
         params.append(entity_id)
         conn.execute(
-            f"UPDATE {table_name} SET {', '.join(sets)} WHERE id = ?", params)
+            f"UPDATE {table_name} SET {', '.join(sets)} WHERE {pk} = ?", params)
     row = conn.execute(
-        f"SELECT * FROM {table_name} WHERE id = ?", (entity_id,)).fetchone()
+        f"SELECT * FROM {table_name} WHERE {pk} = ?", (entity_id,)).fetchone()
     payload = row_to_dict(row)
     if payload is None:
         return None

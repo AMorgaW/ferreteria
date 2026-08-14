@@ -173,12 +173,25 @@ class ContratoExpectedFailureTest(unittest.TestCase):
         )
         self.assertIn("token_hex(8)", productos_src)
 
-    @unittest.expectedFailure
     def test_contrato_device_identity(self):
-        """INV-11."""
+        """INV-11 (Fase 1B): UUID persistente. Sin fencing ni autoridad offline."""
+        import socket
+
+        from local_first_config import get_or_create_device_id
+
         config_src = (REPO_ROOT / "local_first_config.py").read_text(encoding="utf-8")
         self.assertIn("device_identity", config_src)
         self.assertIn("device_id", config_src)
+        self.assertIn("def get_or_create_device_id", config_src)
+        self.assertNotIn("OFFLINE_INVENTORY_AUTHORITY", config_src)
+        with official_temp_db() as env:
+            first = get_or_create_device_id()
+            second = get_or_create_device_id()
+            self.assertEqual(first, second)
+            uuid.UUID(first)
+            self.assertNotEqual(first, socket.gethostname())
+            ident = env.db_path.parent / "config" / "device_identity.json"
+            self.assertTrue(ident.exists())
 
     @unittest.expectedFailure
     def test_contrato_offline_authority(self):
@@ -265,9 +278,12 @@ class ContratoExpectedFailureTest(unittest.TestCase):
     @unittest.expectedFailure
     def test_contrato_upsert_no_pisa_stock_en_fuente(self):
         """INV-02b: _upsert no hace LWW de todas las columnas (incluye stock)."""
-        from local_sync import SupabaseSyncService
+        from local_sync import SupabaseSyncService, build_remote_upsert_sql
 
-        src = inspect.getsource(SupabaseSyncService._upsert)
+        src = (
+            inspect.getsource(SupabaseSyncService._upsert)
+            + inspect.getsource(build_remote_upsert_sql)
+        )
         self.assertNotIn("EXCLUDED.{c}", src)
 
     @unittest.expectedFailure

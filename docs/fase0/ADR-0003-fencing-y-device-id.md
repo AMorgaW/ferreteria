@@ -127,4 +127,11 @@ v1 documenta estos casos. No se implementa Paxos entre ferreterías.
 
 ## Implementación
 
-Prohibida en Fase 0. Este ADR es el spec que faltaba antes de código.
+Identidad persistente básica: **Fase 1B**
+(`local_first_config.get_or_create_device_id`, archivo
+`config/device_identity.json`). UUID estable, no hostname/IP/MAC/username.
+
+Leases, epoch, `device_registry`, `OFFLINE_INVENTORY_AUTHORITY` y fencing:
+siguen prohibidos hasta GO humano de la fase de autoridad offline.
+La columna `device_id` de las tablas sync **no** se reutiliza como identidad
+del equipo.

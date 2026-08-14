@@ -4,6 +4,7 @@ Repositorio para gestión de productos
 Capa de acceso a datos para productos
 """
 import secrets
+import uuid
 from datetime import datetime
 from typing import List, Optional, Tuple
 from models import Producto
@@ -227,8 +228,8 @@ class ProductosRepository:
                     precio_compra, precio_venta, stock, stock_minimo,
                     ubicacion, descripcion, unidad_medida, viene_en_caja,
                     unidades_por_caja, unidades_por_media_caja, vende_por_empaque,
-                    permite_decimales, iva, activo
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    permite_decimales, iva, activo, local_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 producto.codigo_barras,
                 producto.nombre,
@@ -249,7 +250,8 @@ class ProductosRepository:
                 producto.vende_por_empaque,
                 1 if producto.permite_decimales else 0,
                 producto.iva,
-                1 if producto.activo else 0
+                1 if producto.activo else 0,
+                str(uuid.uuid4()),
             ))
 
             producto_id = cursor.lastrowid

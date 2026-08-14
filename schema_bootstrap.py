@@ -137,6 +137,7 @@ POSTGRES_ONLY_STATEMENTS: Tuple[str, ...] = (
 )
 
 REMOTE_MIGRATION_FILENAME = "supabase_local_first_migration.sql"
+REMOTE_IDENTITY_MIGRATION_FILENAME = "supabase_sync_identity.sql"
 
 
 def _quote_ident(name: str) -> str:
@@ -310,6 +311,28 @@ def apply_required_columns(conn) -> None:
 def apply_shared_indexes(conn) -> None:
     for statement in SHARED_INDEXES:
         create_index_if_missing(conn, statement)
+
+
+def apply_postgres_identity_sql(conn, sql: str) -> None:
+    """Aplica la migración explícita de identidad PostgreSQL.
+
+    Nunca debe llamarse con una conexión SQLite. El bootstrap SQLite no
+    referencia este SQL.
+    """
+    if is_sqlite_connection(conn):
+        raise SchemaBootstrapError(
+            "Migración de identidad PostgreSQL no debe ejecutarse contra SQLite"
+        )
+    if not (sql or "").strip():
+        raise SchemaBootstrapError("SQL de identidad PostgreSQL vacío")
+    try:
+        _cursor(conn).execute(sql)
+    except SchemaBootstrapError:
+        raise
+    except Exception as exc:
+        raise SchemaBootstrapError(
+            f"Fallo aplicando identidad PostgreSQL: {exc}"
+        ) from exc
 
 
 def apply_postgres_only_statements(conn) -> None:

@@ -29,6 +29,7 @@ backups/
 
 # Config local con credenciales de servidor
 config/local_first_config.json
+config/device_identity.json
 
 # Artefactos temporales de pruebas/preview
 _test_*.py

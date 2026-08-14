@@ -12,6 +12,17 @@ import psycopg2.extensions
 
 from local_first_db import (DEFAULT_DB_PATH, SYNC_TABLES, connect,
                             ensure_local_first_schema, now_iso)
+from sync_registry import (
+    REMOTE_TABLES_REQUIRED_FOR_STARTUP,
+    fk_map,
+    has_surrogate_integer_pk,
+    pk_column,
+    postgres_identity_sql,
+    remote_upsert_returning_column,
+    synced_tables,
+    tables_requiring_postgres_local_id_unique,
+    topo_order,
+)
 
 # Fechas/horas de Postgres como TEXTO (igual que SQLite) para poder guardarlas
 # directamente en columnas TEXT locales durante el pull.
@@ -39,39 +50,30 @@ def load_env():
 load_env()
 
 
-# ── Estrategia B: identidad de sincronización por local_id (UUID) ──────────
-# Grafo de claves foráneas: tabla -> [(columna_fk, tabla_padre), ...].
-# Se usa para TRADUCIR las FKs entre el espacio de ids local y el remoto,
-# usando local_id (UUID) como pivote estable entre equipos.
-FK_MAP = {
-    "productos": [("proveedor_id", "proveedores")],
-    "ventas": [("cliente_id", "clientes"), ("usuario_id", "usuarios")],
-    "compras": [("proveedor_id", "proveedores"), ("usuario_id", "usuarios")],
-    "cierres_caja": [("usuario_id", "usuarios")],
-    "detalle_ventas": [("producto_id", "productos"), ("venta_id", "ventas")],
-    "detalle_compras": [("producto_id", "productos"), ("compra_id", "compras")],
-    "abonos_ventas": [("id_venta", "ventas")],
-    "abonos_compras": [("id_compra", "compras")],
-    "movimientos": [("producto_id", "productos"), ("proveedor_id", "proveedores"),
-                    ("usuario_id", "usuarios")],
-    "movimientos_inventario": [("producto_id", "productos"), ("proveedor_id", "proveedores"),
-                               ("usuario_id", "usuarios"), ("cliente_id", "clientes")],
-    "egresos_caja": [("id_caja", "cierres_caja")],
-    "cuentas_por_cobrar": [("cliente_id", "clientes"), ("venta_id", "ventas")],
-    "pagos_cuentas": [("cuenta_id", "cuentas_por_cobrar")],
-    "auditoria": [("usuario_id", "usuarios")],
-    "historial_precios": [("producto_id", "productos"), ("usuario_id", "usuarios")],
-}
+# Derivados del registry canónico (sync_registry.SYNC_REGISTRY). No editar a mano.
+FK_MAP = fk_map()
+TOPO_ORDER = topo_order()
 
-# Orden topológico: PADRES antes que HIJOS (evita registros huérfanos al bajar).
-TOPO_ORDER = [
-    "usuarios", "proveedores", "clientes", "configuracion",
-    "productos", "ventas", "compras", "cierres_caja", "auditoria",
-    "detalle_ventas", "detalle_compras", "abonos_ventas", "abonos_compras",
-    "movimientos", "movimientos_inventario", "egresos_caja",
-    "historial_precios", "cuentas_por_cobrar",
-    "pagos_cuentas",
-]
+
+def build_remote_upsert_sql(table, columns):
+    """UPSERT remoto por local_id. RETURNING usa la PK declarada en el registry.
+
+    No asume que todas las tablas tengan columna entera ``id``.
+    """
+    returning = remote_upsert_returning_column(table)
+    updates = ", ".join(
+        f"{c}=EXCLUDED.{c}" for c in columns if c != "local_id"
+    )
+    if not updates:
+        updates = "local_id=EXCLUDED.local_id"
+    col_sql = ", ".join(columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    return (
+        f"INSERT INTO {table} ({col_sql}) "
+        f"VALUES ({placeholders}) "
+        f"ON CONFLICT (local_id) DO UPDATE SET {updates} "
+        f"RETURNING {returning}"
+    )
 
 
 class _PadreNoSincronizado(Exception):
@@ -133,13 +135,15 @@ class SupabaseSyncService:
         return remote
 
     def _ensure_remote_local_id_identity(self, remote):
-        """Estrategia B — Fase 1 (lado REMOTO/Supabase): rellena local_id
-        faltantes, deduplica y crea índice UNIQUE sobre local_id (requisito para
-        el UPSERT `ON CONFLICT (local_id)`). Idempotente; se ejecuta una vez por
-        proceso."""
+        """Identidad remota local_id: backfill, dedupe y UNIQUE canónico.
+
+        El UNIQUE se aplica con ``postgres_identity_sql()`` (misma fuente que
+        ``supabase_sync_identity.sql``). No crea ``ux_*`` aparte: un UNIQUE
+        equivalente ya existente (cualquier nombre) se respeta.
+        """
         if getattr(self, "_remote_identity_ensured", False):
             return
-        from local_first_db import SYNC_TABLES as _ST
+        tables = tables_requiring_postgres_local_id_unique()
         with remote.cursor() as cur:
             cur.execute("SELECT table_name FROM information_schema.columns "
                         "WHERE table_schema='public' AND column_name='local_id'")
@@ -147,7 +151,7 @@ class SupabaseSyncService:
             cur.execute("SELECT table_name FROM information_schema.columns "
                         "WHERE table_schema='public' AND column_name='id'")
             con_id = {r[0] for r in cur.fetchall()}
-        for table in _ST:
+        for table in tables:
             if table not in con_local_id:
                 continue
             try:
@@ -163,15 +167,11 @@ class SupabaseSyncService:
                         f"WHERE local_id IS NOT NULL AND local_id <> '') "
                         f"UPDATE {table} t SET local_id = gen_random_uuid()::text "
                         f"FROM d WHERE t.ctid = d.ctid AND d.rn > 1")
-                    cur.execute(
-                        f"CREATE UNIQUE INDEX IF NOT EXISTS ux_{table}_local_id "
-                        f"ON {table}(local_id)")
                     # Avanzar la secuencia del id por encima del MAX(id) actual:
                     # como el push ya NO envía el id local (Supabase asigna el
                     # suyo), la secuencia debe estar adelantada para que el id
-                    # autogenerado no choque con uno existente. Solo para tablas
-                    # con columna 'id' (configuracion es clave-valor, no aplica).
-                    if table in con_id:
+                    # autogenerado no choque con uno existente. Solo PK entera.
+                    if has_surrogate_integer_pk(table) and table in con_id:
                         cur.execute(
                             "SELECT pg_get_serial_sequence(%s, 'id')", (table,))
                         seqrow = cur.fetchone()
@@ -183,6 +183,14 @@ class SupabaseSyncService:
             except Exception as e:
                 remote.rollback()
                 print(f"[MIGRACION local_id remoto] {table}: {e}")
+        try:
+            from schema_bootstrap import apply_postgres_identity_sql
+
+            apply_postgres_identity_sql(remote, postgres_identity_sql())
+            remote.commit()
+        except Exception as e:
+            remote.rollback()
+            print(f"[MIGRACION local_id remoto] identidad canónica: {e}")
         self._remote_identity_ensured = True
 
     def _ensure_remote_schema(self, remote):
@@ -229,10 +237,8 @@ class SupabaseSyncService:
                 cur.execute("SELECT 1")
                 cur.fetchone()
                 res["lectura"] = True
-                # Tablas requeridas (las críticas del negocio)
-                requeridas = ["productos", "clientes", "proveedores", "ventas",
-                              "detalle_ventas", "movimientos", "usuarios",
-                              "compras", "cuentas_por_cobrar"]
+                # Política de arranque (no el registry completo de sync).
+                requeridas = list(REMOTE_TABLES_REQUIRED_FOR_STARTUP)
                 cur.execute(
                     "SELECT table_name FROM information_schema.tables "
                     "WHERE table_schema='public'")
@@ -285,19 +291,8 @@ class SupabaseSyncService:
                 remote.close()
         return res
 
-    # Tablas que se replican a Supabase (deben tener columna local_id).
-    SYNCED_TABLES = [
-        ("productos", "product"), ("clientes", "customer"),
-        ("proveedores", "supplier"), ("usuarios", "user"),
-        ("ventas", "sale"), ("detalle_ventas", "sale_detail"),
-        ("movimientos", "inventory_movement"),
-        ("movimientos_inventario", "inventory_movement2"),
-        ("cuentas_por_cobrar", "receivable"), ("abonos_ventas", "sale_payment"),
-        ("cierres_caja", "cash_session"), ("egresos_caja", "cash_expense"),
-        ("compras", "purchase"), ("detalle_compras", "purchase_detail"),
-        ("abonos_compras", "purchase_payment"),
-        ("auditoria", "audit_log"), ("historial_precios", "price_history"),
-    ]
+    # Derivado del registry canónico. Incluye configuracion y pagos_cuentas.
+    SYNCED_TABLES = synced_tables()
 
     def backfill_to_remote(self):
         """Repara la consistencia histórica local <-> Supabase:
@@ -320,13 +315,42 @@ class SupabaseSyncService:
                 cols = table_columns(local, table)
                 if "local_id" not in cols:
                     continue
+                pk = pk_column(table)
+                n_enq, n_rec = 0, 0
+                if pk not in cols:
+                    continue
+                if pk != "id":
+                    try:
+                        with remote.cursor() as rc:
+                            rc.execute(
+                                f"SELECT local_id FROM {table} "
+                                f"WHERE local_id IS NOT NULL AND local_id <> ''"
+                            )
+                            remote_lids = {row[0] for row in rc.fetchall()}
+                    except Exception:
+                        continue
+                    rows = local.execute(
+                        f"SELECT {pk} AS pk, local_id FROM {table}"
+                    ).fetchall()
+                    for row in rows:
+                        lid = row["local_id"] or ensure_local_id(
+                            local, table, row["pk"]
+                        )
+                        if lid and lid not in remote_lids:
+                            enqueue_entity(
+                                local, entity_type, row["pk"], "create", table
+                            )
+                            n_enq += 1
+                    remote.commit()
+                    if n_enq:
+                        encolados[table] = n_enq
+                    continue
                 try:
                     with remote.cursor() as rc:
                         rc.execute(f"SELECT id, local_id FROM {table}")
                         remote_map = {row[0]: row[1] for row in rc.fetchall()}
                 except Exception:
                     continue
-                n_enq, n_rec = 0, 0
                 rows = local.execute(f"SELECT id, local_id FROM {table}").fetchall()
                 for row in rows:
                     rid = row["id"]
@@ -478,14 +502,8 @@ class SupabaseSyncService:
                 remote.close()
             local.close()
 
-    # Tablas "padre" primero (aunque se desactivan las FK durante la carga).
-    PULL_ORDER = [
-        "usuarios", "configuracion", "productos", "clientes", "proveedores",
-        "compras", "ventas", "cierres_caja", "detalle_compras", "detalle_ventas",
-        "movimientos", "movimientos_inventario", "egresos_caja", "abonos_ventas",
-        "abonos_compras", "cuentas_por_cobrar", "pagos_cuentas",
-        "historial_precios", "auditoria",
-    ]
+    # Derivado: mismo orden que TOPO_ORDER. Ya no es una lista independiente.
+    PULL_ORDER = TOPO_ORDER
 
     def _get_state(self, local, key, default=None):
         """Lee un valor de la tabla sync_state (clave-valor)."""
@@ -570,8 +588,11 @@ class SupabaseSyncService:
                         skipped += 1
                         continue
                     # Columnas a escribir: intersección, EXCLUYENDO el id local
-                    # (nunca se sobreescribe). El id remoto se guarda en remote_id.
-                    remote_id_val = r.get("id")
+                    # surrogate (nunca se sobreescribe). La PK de negocio que no
+                    # es `id` (p.ej. configuracion.clave) SÍ se escribe.
+                    # El id remoto se guarda en remote_id cuando existe.
+                    pk = pk_column(table)
+                    remote_id_val = r.get("id") if has_surrogate_integer_pk(table) else None
                     campos = {k: v for k, v in r.items()
                               if k in cols_local and k != "id"}
                     if "remote_id" in cols_local and remote_id_val is not None:
@@ -587,19 +608,21 @@ class SupabaseSyncService:
                     if "remote_id" in cols_local and remote_id_val is not None:
                         try:
                             existing = local.execute(
-                                f"SELECT id, local_id FROM {table} "
+                                f"SELECT {pk} AS pk, local_id FROM {table} "
                                 "WHERE remote_id = ? LIMIT 1",
                                 (str(remote_id_val),)
                             ).fetchone()
                             if existing and existing["local_id"] != campos["local_id"]:
                                 conflict = local.execute(
-                                    f"SELECT id FROM {table} WHERE local_id = ? LIMIT 1",
+                                    f"SELECT {pk} AS pk FROM {table} "
+                                    "WHERE local_id = ? LIMIT 1",
                                     (campos["local_id"],)
                                 ).fetchone()
                                 if not conflict:
                                     local.execute(
-                                        f"UPDATE {table} SET local_id = ? WHERE id = ?",
-                                        (campos["local_id"], existing["id"])
+                                        f"UPDATE {table} SET local_id = ? "
+                                        f"WHERE {pk} = ?",
+                                        (campos["local_id"], existing["pk"])
                                     )
                         except Exception:
                             pass
@@ -667,10 +690,14 @@ class SupabaseSyncService:
         return res
 
     def _mapa_push(self, local, remote, parent, cache):
-        """{ id_local_padre : id_remoto_padre }  (pivote local_id). Precarga una
-        vez por tabla padre y por ciclo."""
+        """{ pk_local_padre : id_remoto_padre }  (pivote local_id). Precarga una
+        vez por tabla padre y por ciclo. Padres sin PK entera no traducen FKs.
+        """
         k = ("pushmap", parent)
         if k in cache:
+            return cache[k]
+        if not has_surrogate_integer_pk(parent):
+            cache[k] = {}
             return cache[k]
         loc = {r["id"]: r["local_id"] for r in
                local.execute(f"SELECT id, local_id FROM {parent}") if r["local_id"]}
@@ -682,9 +709,12 @@ class SupabaseSyncService:
         return m
 
     def _mapa_pull(self, local, remote, parent, cache):
-        """{ id_remoto_padre : id_local_padre }  (pivote local_id)."""
+        """{ id_remoto_padre : pk_local_padre }  (pivote local_id)."""
         k = ("pullmap", parent)
         if k in cache:
+            return cache[k]
+        if not has_surrogate_integer_pk(parent):
+            cache[k] = {}
             return cache[k]
         with remote.cursor() as cur:
             cur.execute(f"SELECT id, local_id FROM {parent} WHERE local_id IS NOT NULL")
@@ -708,17 +738,22 @@ class SupabaseSyncService:
             if local_id:
                 with remote.cursor() as cur:
                     cur.execute(f"DELETE FROM {table} WHERE local_id = %s", (local_id,))
-            elif "id" in payload:
-                with remote.cursor() as cur:
-                    cur.execute(f"DELETE FROM {table} WHERE id = %s", (payload["id"],))
+            else:
+                pk = pk_column(table)
+                if pk in payload:
+                    with remote.cursor() as cur:
+                        cur.execute(
+                            f"DELETE FROM {table} WHERE {pk} = %s", (payload[pk],)
+                        )
             return None
 
         return self._upsert(remote, local, table, payload, cache)
 
     def _upsert(self, remote, local, table, payload, cache):
         """PUSH con identidad local_id: traduce las FKs (id local -> id remoto),
-        NO envía el id local (Supabase asigna el suyo) y hace UPSERT por
-        local_id. Devuelve el id remoto asignado (para guardar remote_id)."""
+        NO envía el id local surrogate (Supabase asigna el suyo) y hace UPSERT
+        por local_id. Devuelve la PK remota (id entero o clave de negocio).
+        """
         payload = dict(payload)  # copia; no mutar el original
         # Traducir claves foráneas al espacio de ids remoto.
         for fk_col, parent in FK_MAP.get(table, []):
@@ -731,30 +766,23 @@ class SupabaseSyncService:
                     f"{table}.{fk_col} -> {parent} (id local {val}) aún no está en Supabase")
             payload[fk_col] = rid
 
-        # Excluir el id local: la identidad de sincronización es local_id.
+        # Excluir el id local surrogate. La PK de negocio (clave) SÍ viaja.
         clean = {k: v for k, v in payload.items() if v is not None and k != "id"}
         if "local_id" not in clean:
             return None  # sin local_id no hay identidad (no debería pasar tras Fase 1)
         columns = list(clean.keys())
-        placeholders = ", ".join(["%s"] * len(columns))
-        col_sql = ", ".join(columns)
-        updates = ", ".join([f"{c}=EXCLUDED.{c}" for c in columns if c != "local_id"])
-        if not updates:
-            updates = "local_id=EXCLUDED.local_id"
         values = [clean[c] for c in columns]
-        sql = f"""
-            INSERT INTO {table} ({col_sql})
-            VALUES ({placeholders})
-            ON CONFLICT (local_id) DO UPDATE SET {updates}
-            RETURNING id
-        """
+        sql = build_remote_upsert_sql(table, columns)
         with remote.cursor() as cur:
             cur.execute(sql, values)
             row = cur.fetchone()
             remote_id = row[0] if row else None
-        # Actualizar el mapa de push en caliente para que un HIJO en el MISMO
-        # ciclo encuentre a este padre recién subido (evita diferir 1 ciclo).
-        if remote_id is not None and payload.get("id") is not None:
+        # Mapas FK solo aplican a padres con PK entera `id`.
+        if (
+            remote_id is not None
+            and has_surrogate_integer_pk(table)
+            and payload.get("id") is not None
+        ):
             cache.setdefault(("pushmap", table), {})[payload["id"]] = remote_id
         return remote_id
 

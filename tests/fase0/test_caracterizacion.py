@@ -282,20 +282,25 @@ class CaracterizacionTest(unittest.TestCase):
                 self.assertNotIn(forbidden, tables)
 
     def test_registries_divergen(self):
-        """CAR INV-18."""
+        """INV-18 (Fase 1B): una sola fuente; derivadas no divergen."""
         from local_first_db import SYNC_TABLES
         from local_sync import TOPO_ORDER, SupabaseSyncService
+        from sync_registry import sync_tables, synced_tables, topo_order
 
         pull_order = SupabaseSyncService.PULL_ORDER
         synced = {t for t, _et in SupabaseSyncService.SYNCED_TABLES}
-        sync_tables = set(SYNC_TABLES)
-        self.assertNotEqual(sync_tables, synced)
-        self.assertIn("configuracion", sync_tables - synced)
-        self.assertIn("pagos_cuentas", sync_tables - synced)
-        self.assertNotEqual(list(pull_order), list(TOPO_ORDER))
+        sync_tables_set = set(SYNC_TABLES)
+        self.assertEqual(list(SYNC_TABLES), list(sync_tables()))
+        self.assertEqual(list(SupabaseSyncService.SYNCED_TABLES), synced_tables())
+        self.assertEqual(sync_tables_set, synced)
+        self.assertIn("configuracion", synced)
+        self.assertIn("pagos_cuentas", synced)
+        self.assertEqual(list(pull_order), list(TOPO_ORDER))
+        self.assertEqual(list(TOPO_ORDER), list(topo_order()))
         source = (REPO_ROOT / "local_sync.py").read_text(encoding="utf-8")
         self.assertNotIn("self.PULL_ORDER", source)
         self.assertIn("TOPO_ORDER", source)
+        self.assertIn("PULL_ORDER = TOPO_ORDER", source)
 
     def test_compras_numero_factura_no_es_unique(self):
         with official_temp_db() as env:

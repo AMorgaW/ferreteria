@@ -2,6 +2,8 @@
 import json
 import os
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 
@@ -33,6 +35,11 @@ def _config_dir() -> Path:
 
 def _config_path() -> Path:
     return _config_dir() / "local_first_config.json"
+
+
+def _device_identity_path() -> Path:
+    """Archivo local, no sincronizado. Identidad del dispositivo (ADR-0003)."""
+    return _config_dir() / "device_identity.json"
 
 
 # Compatibilidad hacia atrás (dev): constantes calculadas al importar. En modo
@@ -118,6 +125,44 @@ def admin_server_url(config=None):
     config = config or load_config()
     port = int(config.get("server_port", 8000))
     return f"{server_scheme(config)}://127.0.0.1:{port}"
+
+
+def get_or_create_device_id() -> str:
+    """UUID estable del dispositivo. Se genera una sola vez y persiste.
+
+    No usa hostname, IP, MAC ni username. No habilita fencing, lease ni
+    autoridad offline de inventario. La columna device_id de las tablas sync
+    es metadato de fila y no se escribe aquí.
+    """
+    path = _device_identity_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"No se pudo leer {path.name}: {exc}"
+            ) from exc
+        if not isinstance(stored, dict) or not stored.get("device_id"):
+            raise RuntimeError(f"{path.name} no contiene device_id")
+        device_id = str(stored["device_id"]).strip()
+        try:
+            uuid.UUID(device_id)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"device_id en {path.name} no es un UUID: {device_id!r}"
+            ) from exc
+        return device_id
+    device_id = str(uuid.uuid4())
+    payload = {
+        "device_id": device_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return device_id
 
 
 def apply_environment(config=None):

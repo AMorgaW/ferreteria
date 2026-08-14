@@ -28,7 +28,6 @@ proyección local y (casi todas) encolan un snapshot LWW.
 | 14 | `local_server.py` | `create_sale` | `stock = stock - ?` **sin** `stock >=` | `SALIDA_VENTA` | POS LAN. |
 | 15 | `ui/dashboard_ui.py` | editar línea de factura | `stock = stock - ?` | no necesariamente | Writer en UI. |
 | 16 | `ui/dashboard_ui.py` | quitar línea de factura | `stock = stock + ?` | DELETE `movimientos` | Writer en UI. |
-| 21 | `scripts/seed_productos_prueba.py` | reconfigurar seed PRB-FER | `SET stock = ?` | ninguno | Script de prueba, no POS. |
 
 ## Escritura de stock sin UPDATE (insert de producto)
 
@@ -59,10 +58,14 @@ TX de stock.
 
 | Lista | Archivo | Rol |
 |---|---|---|
-| `SYNC_TABLES` | `local_first_db.py` | Schema local_id + pull |
-| `SYNCED_TABLES` | `local_sync.py` | Backfill/push. Faltan `configuracion` y `pagos_cuentas` respecto a `SYNC_TABLES`. |
-| `FK_MAP` | `local_sync.py` | Traducción FKs |
-| `TOPO_ORDER` | `local_sync.py` | Orden de pull **usado** |
-| `PULL_ORDER` | `local_sync.py` | Muerto. `productos` antes de `proveedores`. |
+| `SYNC_REGISTRY` | `sync_registry.py` | **Fuente canónica (Fase 1B).** Tablas, FKs, push/pull, entity_type, pk, proyecciones. |
+| `SYNC_TABLES` | `local_first_db.py` | Derivado: `sync_tables()`. Schema local_id + pull. |
+| `SYNCED_TABLES` | `local_sync.py` | Derivado: `synced_tables()`. Backfill/push. Incluye `configuracion` y `pagos_cuentas`. |
+| `FK_MAP` | `local_sync.py` | Derivado: `fk_map()`. Traducción FKs. |
+| `TOPO_ORDER` | `local_sync.py` | Derivado: `topo_order()`. Orden de pull **usado**. |
+| `PULL_ORDER` | `local_sync.py` | Alias de `TOPO_ORDER`. Ya no es lista independiente. |
 
-`formulas_mezcla`, `formula_detalle`, `devoluciones` están fuera de sync.
+`formulas_mezcla`, `formula_detalle`, `devoluciones` están fuera de sync
+(`NON_SYNC_TABLES`). `productos.stock` está declarado como proyección /
+`authoritative_exclude`, pero `APPLY_AUTHORITATIVE_EXCLUDE = False`: el UPSERT
+LWW de stock **sigue vigente** (INV-02 xfail).

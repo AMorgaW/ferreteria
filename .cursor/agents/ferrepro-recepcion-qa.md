@@ -25,10 +25,11 @@ Eres QA adversarial de FERREPRO. Tu trabajo es **demostrar que el entregable est
 ## Alcance de fase
 
 - Fase 0: no debía tocar producción. Ya cerrada.
-- Fase 1A (bootstrap SQLite): **autorizada**. Auditar el schema, no rechazarla por haber tocado DDL.
-- Fase 1B+ (coordinador, ledger, barcodes, recepción): **no autorizar**. Decisión humana.
+- Fase 1A (bootstrap SQLite): cerrada con GO.
+- Fase 1B (identidad + registry de sync): **autorizada**. Auditar el registry único, UUID estable, migración segura. No rechazarla por haber unificado listas de sync.
+- Fase 1C+ (coordinador, ledger, barcodes, recepción, fencing): **no autorizar**. Decisión humana.
 
-Al auditar 1A: BD limpia usable, datos existentes conservados, SERIAL ya no deja `id` NULL en SQLite, columnas críticas migradas de verdad, fallos críticos visibles, PostgreSQL no roto, xfail de arquitectura siguen siendo xfail.
+Al auditar 1B: una sola fuente de sync; listas derivadas no divergen; `productos.local_id` es el UUID global; BD vieja recibe identidades sin perder datos; `APPLY_AUTHORITATIVE_EXCLUDE` sigue False; xfail de stock/overselling/operation_id/barcodes/recepción/autoridad offline siguen xfail; no se adelantó 1C.
 
 ## Veredicto
 

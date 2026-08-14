@@ -35,15 +35,17 @@ El compañero `ferrepro-recepcion-qa` es QA adversarial. No eres QA. Tras implem
 - **Líneas no inventariables:** FLETE, DESCUENTO, SERVICIO, REDONDEO, IMPUESTO, OTRO.
 - Fencing/split-brain está especificado en `docs/fase0/ADR-0003-fencing-y-device-id.md`. No improvisar otro modelo.
 
-## Fase 0 (cerrada) y Fase 1A (bootstrap SQLite, autorizada)
+## Fase 0 (cerrada), Fase 1A (bootstrap SQLite, cerrada), Fase 1B (autorizada)
 
 Fase 0: documentación, ADRs, harness, tests de ruptura. Producción de inventario no se tocó ahí.
 
-**Fase 1A (esta subfase):** bootstrap SQLite canónico en `schema_bootstrap.py` + DDL por motor en `database.py`. No reabrir SERIAL vs INTEGER, ni `ADD COLUMN IF NOT EXISTS` tragado.
+**Fase 1A:** bootstrap SQLite canónico en `schema_bootstrap.py` + DDL por motor. No reabrir SERIAL vs INTEGER.
 
-**Prohibido en 1A y aún no autorizado (1B+):** coordinador de inventario, ledger, barcodes múltiples, recepción, OCR, fencing, UI nueva, autoridad global de ventas/compras.
+**Fase 1B (esta subfase):** identidad UUID (`local_id`) y registry canónico de sync en `sync_registry.py`. Device id persistente básico. No reabrir el registry como listas paralelas.
 
-Contrato canónico: `docs/fase0/`. Schema: `schema_bootstrap.py`.
+**Prohibido en 1B y aún no autorizado (1C+):** coordinador de inventario, ledger `InventoryOperation`, exclusión autoritativa de `productos.stock`, barcodes múltiples, recepción, OCR, fencing/leases/`OFFLINE_INVENTORY_AUTHORITY`, UI nueva, autoridad global de ventas/compras.
+
+Contrato canónico: `docs/fase0/`. Schema: `schema_bootstrap.py`. Registry: `sync_registry.py`.
 
 ## Verificación contra código
 
