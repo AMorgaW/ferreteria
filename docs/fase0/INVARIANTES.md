@@ -13,8 +13,8 @@ Cada invariante tiene un test en `tests/fase0/`.
 | INV-03 | Un solo writer de ingreso por factura de proveedor | `crear_compra`, `MovimientosService` y `InventarioRepository` incrementan con `ENTRADA_COMPRA` | CAR `test_tres_caminos_entrada_compra` + XFAIL `test_contrato_entrada_compra_unica` |
 | INV-04 | Extracción/borrador no muta stock | No hay tablas de recepción; las compras sí mutan | XFAIL `test_contrato_tablas_recepcion_existen` |
 | INV-05 | Solo `cantidad_aceptada` entra a stock | `crear_compra` usa la cantidad del ítem sin dañada/faltante | XFAIL `test_contrato_cantidad_aceptada` |
-| INV-06 | `operation_id` UNIQUE; retry no doble-cuenta | No existe tabla/ledger | XFAIL `test_contrato_ledger_operation_id` |
-| INV-07 | Timeout post-commit recupera resultado | No hay recuperación por operation_id | XFAIL `test_contrato_retry_recupera_resultado` |
+| INV-06 | `operation_id` UNIQUE; retry no doble-cuenta | **Ledger persistido en Fase 1C** (`inventory_operations`). No aplica stock | PASS `test_contrato_ledger_operation_id` + `tests/fase1c` |
+| INV-07 | Timeout post-commit recupera resultado | **Recupera el comando persistido (PERSISTED).** No aplica delta de stock | PASS `test_contrato_retry_recupera_resultado` + `tests/fase1c` |
 | INV-08 | Producto nuevo con ≥1 barcode; FRP- + 16 hex | Columna única; SKU con `id` local y 4 hex | XFAIL `test_contrato_frp_y_producto_codigos` |
 | INV-09 | Varios barcodes por SKU; no reutilización | `productos.codigo_barras` UNIQUE de una columna | CAR `test_un_solo_codigo_barras` |
 | INV-10 | Alias proveedor ≠ barcode | No hay modelo de alias | XFAIL junto a INV-08 |

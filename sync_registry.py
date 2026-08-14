@@ -17,8 +17,9 @@ class SyncRegistryError(Exception):
     """Registry inválido: ciclo, padre ausente o identificador desconocido."""
 
 
-# False en 1B/1B.1: declara el contrato de stock-como-proyección sin cambiar el
-# UPSERT productivo. Pasar a True es Fase 1C+ (InventoryOperation).
+# False en 1B–1C: declara el contrato de stock-como-proyección sin cambiar el
+# UPSERT productivo. Pasar a True corresponde al coordinador (fase posterior),
+# no a persistir el ledger.
 APPLY_AUTHORITATIVE_EXCLUDE = False
 
 # Prefijo canónico del UNIQUE(local_id) en PostgreSQL. El runtime histórico
@@ -176,6 +177,13 @@ NON_SYNC_TABLES: Dict[str, str] = {
     "sync_queue": "outbox local",
     "sync_conflicts": "cola local",
     "sync_state": "watermark local",
+    "inventory_commands": (
+        "ledger append-only/idempotente; no LWW. Transporte especial futuro. "
+        "1C no activa push/pull."
+    ),
+    "inventory_operations": (
+        "líneas del ledger; FK al comando. No LWW. Transporte especial futuro."
+    ),
 }
 
 # PK real del DDL oficial para tablas que PgCursor puede insertar y NO están
@@ -197,6 +205,8 @@ NON_SYNC_INSERT_PK: Dict[str, str] = {
     "sync_queue": "id",
     "sync_conflicts": "id",
     "sync_state": "clave",
+    "inventory_commands": "command_id",
+    "inventory_operations": "operation_id",
 }
 
 REMOTE_IDENTITY_MIGRATION_FILENAME = "supabase_sync_identity.sql"

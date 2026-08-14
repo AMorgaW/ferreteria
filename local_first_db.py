@@ -240,6 +240,10 @@ def ensure_local_first_schema(db_path=DEFAULT_DB_PATH):
                 f"No se pudo limpiar COBRO_CREDITO legacy: {_exc}"
             ) from _exc
 
+        # Ledger de comandos de inventario (Fase 1C). No muta stock. No sync LWW.
+        from inventory_ledger import ensure_inventory_ledger_schema
+        ensure_inventory_ledger_schema(conn)
+
         # Registrar la versión de esquema aplicada (etiqueta; no selecciona
         # migraciones — ver version.py).
         from version import SCHEMA_VERSION

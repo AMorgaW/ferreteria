@@ -18,10 +18,8 @@ STILL_XFAIL = (
     "test_contrato_payload_productos_sin_stock_autoritativo",
     "test_contrato_entrada_compra_unica",
     "test_contrato_coordinador_inventario_existe",
-    "test_contrato_retry_recupera_resultado",
     "test_contrato_tablas_recepcion_existen",
     "test_contrato_cantidad_aceptada",
-    "test_contrato_ledger_operation_id",
     "test_contrato_frp_y_producto_codigos",
     "test_contrato_offline_authority",
     "test_contrato_outbox_propaga",
@@ -34,6 +32,8 @@ STILL_XFAIL = (
 NOW_PASS = (
     "test_contrato_integer_primary_key",
     "test_contrato_device_identity",
+    "test_contrato_ledger_operation_id",
+    "test_contrato_retry_recupera_resultado",
 )
 
 

@@ -3,10 +3,9 @@
 **Estado:** ejecutada. **Producción (Fase 0): no modificada.**  
 Fase 1A (bootstrap SQLite) se implementó después, con GO humano, en
 `schema_bootstrap.py` + DDL por motor. No reabre este contrato.
-**Siguiente paso de inventario/recepción:** autorización humana de Fase 1C
-(InventoryOperation / coordinador). Fase 1B (identidad + registry), Fase 1B.1
-(hardening de PK genérica e identidad PostgreSQL) y Fase 1B.2 (hardening
-final de identidad remota) están hechas. **No autoriza implementar 1C.**
+**Siguiente paso de inventario/recepción:** autorización humana de Fase 1D
+(coordinador PostgreSQL de stock). Fase 1C (ledger de comandos e
+idempotencia) está hecha. **No autoriza implementar 1D.**
 
 ## Qué es Fase 0
 
@@ -45,6 +44,7 @@ Prohibido (y no se hizo):
 | [FASE1B.md](FASE1B.md) | Identidad UUID + registry canónico de sync (implementada) |
 | [FASE1B1.md](FASE1B1.md) | Hardening 1B.1: PK genérica, identidad PG única, arranque |
 | [FASE1B2.md](FASE1B2.md) | Hardening 1B.2: garantía remota, paridad UNIQUE, PgCursor |
+| [FASE1C.md](FASE1C.md) | Ledger de comandos e idempotencia (implementada; no aplica stock) |
 
 Código de ruptura: `tests/fase0/`.
 
@@ -57,9 +57,9 @@ fallan contra el código de hoy y **deben** seguir fallando hasta que una
 fase posterior implemente el contrato. Un XPASS significa que el contrato
 se cumplió en silencio o que el test se volvió trivial.
 
-Suite actual: **34 tests, OK, 15 expected failures** (INV-15 en 1A, INV-11 e
-INV-18 en 1B). El schema SQLite de 1A y el registry/identidad de 1B no cierran
-los xfail de autoridad, ledger, barcodes, recepción ni fencing.
+Suite actual: **34 tests en fase0**. INV-15 (1A), INV-11/INV-18 (1B), INV-06/INV-07
+(1C, ledger persistido) pasan. El coordinador, LWW de stock, barcodes, recepción
+y fencing siguen xfail. **No declara INV-01 ni INV-02 resueltos.**
 
 ## NO-GO de producción (sigue vigente)
 

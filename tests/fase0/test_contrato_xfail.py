@@ -87,9 +87,11 @@ class ContratoExpectedFailureTest(unittest.TestCase):
                 hits.append(rel.as_posix())
         self.assertTrue(hits)
 
-    @unittest.expectedFailure
     def test_contrato_retry_recupera_resultado(self):
-        """INV-07: retry con el mismo operation_id no aplica el delta otra vez."""
+        """INV-07 (Fase 1C): el ledger expone operation_id y resultado recuperable.
+
+        No afirma que el delta se haya aplicado a productos.stock.
+        """
         hits = []
         for path in REPO_ROOT.rglob("*.py"):
             rel = path.relative_to(REPO_ROOT)
@@ -129,9 +131,8 @@ class ContratoExpectedFailureTest(unittest.TestCase):
                 conn.close()
             self.assertIn("cantidad_aceptada", cols)
 
-    @unittest.expectedFailure
     def test_contrato_ledger_operation_id(self):
-        """INV-06 / INV-07."""
+        """INV-06 (Fase 1C): existe inventory_operations.operation_id."""
         with official_temp_db() as env:
             conn = env.connect()
             try:

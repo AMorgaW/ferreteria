@@ -264,7 +264,8 @@ class CaracterizacionTest(unittest.TestCase):
             finally:
                 conn.close()
 
-    def test_no_existe_ledger_ni_recepcion(self):
+    def test_existe_ledger_no_recepcion(self):
+        """Fase 1C: el ledger existe; recepción y barcodes múltiples no."""
         with official_temp_db() as env:
             conn = env.connect()
             try:
@@ -275,8 +276,9 @@ class CaracterizacionTest(unittest.TestCase):
                 }
             finally:
                 conn.close()
+            self.assertIn("inventory_operations", tables)
+            self.assertIn("inventory_commands", tables)
             for forbidden in (
-                "inventory_operations", "inventario_operaciones",
                 "recepcion_documentos", "recepcion_lineas", "producto_codigos",
             ):
                 self.assertNotIn(forbidden, tables)

@@ -17,7 +17,9 @@ Fuentes de verdad (no mezclar):
   El mismo ``crear_estructura_completa()`` emite ``SERIAL PRIMARY KEY``.
   La identidad local-first remota vive en ``supabase_local_first_migration.sql``
   y **solo** se ejecuta contra Postgres en
-  ``SupabaseSyncService._ensure_remote_schema``. No es un script SQLite.
+  ``SupabaseSyncService._ensure_remote_schema``. El ledger de inventario
+  (Fase 1C) vive en ``supabase_inventory_ledger.sql`` y se aplica después,
+  nunca contra SQLite. No es un script SQLite.
 
 Por qué ``INTEGER PRIMARY KEY`` y no ``AUTOINCREMENT`` en tablas de negocio:
 SQLite trata ``INTEGER PRIMARY KEY`` (el tipo debe ser exactamente INTEGER)
@@ -138,6 +140,7 @@ POSTGRES_ONLY_STATEMENTS: Tuple[str, ...] = (
 
 REMOTE_MIGRATION_FILENAME = "supabase_local_first_migration.sql"
 REMOTE_IDENTITY_MIGRATION_FILENAME = "supabase_sync_identity.sql"
+REMOTE_LEDGER_MIGRATION_FILENAME = "supabase_inventory_ledger.sql"
 
 
 def _quote_ident(name: str) -> str:
@@ -332,6 +335,28 @@ def apply_postgres_identity_sql(conn, sql: str) -> None:
     except Exception as exc:
         raise SchemaBootstrapError(
             f"Fallo aplicando identidad PostgreSQL: {exc}"
+        ) from exc
+
+
+def apply_postgres_ledger_sql(conn, sql: str) -> None:
+    """Aplica el DDL del ledger de inventario en PostgreSQL.
+
+    Nunca debe llamarse con una conexión SQLite. No modifica stock.
+    No crea RPC. El bootstrap SQLite no referencia este SQL.
+    """
+    if is_sqlite_connection(conn):
+        raise SchemaBootstrapError(
+            "Migración de ledger PostgreSQL no debe ejecutarse contra SQLite"
+        )
+    if not (sql or "").strip():
+        raise SchemaBootstrapError("SQL de ledger PostgreSQL vacío")
+    try:
+        _cursor(conn).execute(sql)
+    except SchemaBootstrapError:
+        raise
+    except Exception as exc:
+        raise SchemaBootstrapError(
+            f"Fallo aplicando ledger PostgreSQL: {exc}"
         ) from exc
 
 
