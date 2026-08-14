@@ -31,6 +31,6 @@ python -m unittest discover -s tests/fase1b -v
 python -m unittest discover -s tests/fase1b1 -v
 ```
 
-QA (adversarial): GO FASE 1C respecto de los blockers de 1B.1. HIGH residual:
-`supabase_local_first_migration.sql` aún puede crear un `uq_*` redundante si ya existe `ux_*`;
-`_remote_identity_ensured` se marca aunque falle la SQL canónica. No son BLOCKER ni 1C.
+QA (adversarial): GO FASE 1C respecto de los blockers de 1B.1. Los HIGH residual
+de `_remote_identity_ensured` tras fallo y de `uq_*` redundante junto a `ux_*`
+los cierra Fase 1B.2 (`docs/fase0/FASE1B2.md`). **No autoriza implementar 1C.**

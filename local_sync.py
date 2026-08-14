@@ -18,6 +18,7 @@ from sync_registry import (
     has_surrogate_integer_pk,
     pk_column,
     postgres_identity_sql,
+    postgres_local_id_unique_exists_query,
     remote_upsert_returning_column,
     synced_tables,
     tables_requiring_postgres_local_id_unique,
@@ -76,6 +77,10 @@ def build_remote_upsert_sql(table, columns):
     )
 
 
+class RemoteLocalIdIdentityError(Exception):
+    """Identidad remota local_id no garantizada. El flag no puede quedar True."""
+
+
 class _PadreNoSincronizado(Exception):
     """El registro padre referenciado por una FK aún no existe en el destino;
     la fila se difiere (queda pendiente) y se reintenta en el siguiente ciclo."""
@@ -88,6 +93,9 @@ class SupabaseSyncService:
         self.interval = int(os.environ.get("SYNC_INTERVAL_SECONDS", interval))
         self._stop = threading.Event()
         self._thread = None
+        self._schema_ensured = False
+        self._remote_identity_ensured = False
+        self._remote_identity_last_error = None
 
     def start_background(self):
         if self._thread and self._thread.is_alive():
@@ -130,31 +138,62 @@ class SupabaseSyncService:
             pass
         try:
             self._ensure_remote_local_id_identity(remote)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Degradar sin fingir éxito: el sync de negocio puede usar la
+            # conexión, pero la identidad NO está garantizada.
+            self._remote_identity_ensured = False
+            self._remote_identity_last_error = exc
+            print(f"[IDENTIDAD remota] no garantizada: {exc}")
         return remote
 
+    def _rollback_remote_identity(self, remote):
+        try:
+            remote.rollback()
+        except Exception as rollback_exc:
+            print(f"[IDENTIDAD remota] rollback: {rollback_exc}")
+
     def _ensure_remote_local_id_identity(self, remote):
-        """Identidad remota local_id: backfill, dedupe y UNIQUE canónico.
+        """Identidad remota local_id: backfill, dedupe, UNIQUE y verificación.
 
         El UNIQUE se aplica con ``postgres_identity_sql()`` (misma fuente que
         ``supabase_sync_identity.sql``). No crea ``ux_*`` aparte: un UNIQUE
         equivalente ya existente (cualquier nombre) se respeta.
+
+        Política abort / reintento / degradar (Fase 1B.2):
+
+        - ABORTAR (flag False + excepción en ``_remote_identity_last_error``,
+          se relanza): fallo de backfill, dedupe, UNIQUE, verificación
+          posterior, SQL canónica o ``SchemaBootstrapError``. Conexión rota
+          o ``SUPABASE_URI`` ausente tampoco marcan ensured.
+        - REINTENTABLE: cualquier fallo anterior. La siguiente llamada vuelve
+          a intentar porque el flag no se puso True.
+        - DEGRADAR SIN FINGIR ÉXITO: ``_remote_connect`` puede devolver la
+          conexión para no bloquear sync de negocio, pero no traga el error
+          de identidad (no ``except pass``). Conserva la excepción y deja
+          flag False.
+
+        El flag ``_remote_identity_ensured`` SOLO pasa a True cuando la
+        conexión es usable, el backfill y el dedupe terminaron, el UNIQUE
+        canónico o equivalente existe, y la verificación posterior confirma
+        UNIQUE de una sola columna sobre ``local_id`` en cada tabla presente
+        con esa columna. Entonces ``_remote_identity_last_error`` queda None.
+
+        Idempotente: si ya está ensured, return. Dos llamadas exitosas no
+        recrean índices.
         """
         if getattr(self, "_remote_identity_ensured", False):
             return
-        tables = tables_requiring_postgres_local_id_unique()
-        with remote.cursor() as cur:
-            cur.execute("SELECT table_name FROM information_schema.columns "
-                        "WHERE table_schema='public' AND column_name='local_id'")
-            con_local_id = {r[0] for r in cur.fetchall()}
-            cur.execute("SELECT table_name FROM information_schema.columns "
-                        "WHERE table_schema='public' AND column_name='id'")
-            con_id = {r[0] for r in cur.fetchall()}
-        for table in tables:
-            if table not in con_local_id:
-                continue
-            try:
+        try:
+            tables = tables_requiring_postgres_local_id_unique()
+            with remote.cursor() as cur:
+                cur.execute("SELECT table_name FROM information_schema.columns "
+                            "WHERE table_schema='public' AND column_name='local_id'")
+                con_local_id = {r[0] for r in cur.fetchall()}
+                cur.execute("SELECT table_name FROM information_schema.columns "
+                            "WHERE table_schema='public' AND column_name='id'")
+                con_id = {r[0] for r in cur.fetchall()}
+            present = [table for table in tables if table in con_local_id]
+            for table in present:
                 with remote.cursor() as cur:
                     cur.execute(
                         f"UPDATE {table} SET local_id = gen_random_uuid()::text "
@@ -180,18 +219,30 @@ class SupabaseSyncService:
                                 f"SELECT setval('{seqrow[0]}', "
                                 f"COALESCE((SELECT MAX(id) FROM {table}), 1), true)")
                 remote.commit()
-            except Exception as e:
-                remote.rollback()
-                print(f"[MIGRACION local_id remoto] {table}: {e}")
-        try:
             from schema_bootstrap import apply_postgres_identity_sql
 
             apply_postgres_identity_sql(remote, postgres_identity_sql())
             remote.commit()
-        except Exception as e:
-            remote.rollback()
-            print(f"[MIGRACION local_id remoto] identidad canónica: {e}")
+            verify_sql = postgres_local_id_unique_exists_query()
+            missing = []
+            for table in present:
+                with remote.cursor() as cur:
+                    cur.execute(verify_sql, (table,))
+                    row = cur.fetchone()
+                    if not row or not row[0]:
+                        missing.append(table)
+            if missing:
+                raise RemoteLocalIdIdentityError(
+                    "UNIQUE(local_id) no verificado tras aplicar SQL canónica: "
+                    + ", ".join(missing)
+                )
+        except Exception as exc:
+            self._remote_identity_ensured = False
+            self._remote_identity_last_error = exc
+            self._rollback_remote_identity(remote)
+            raise
         self._remote_identity_ensured = True
+        self._remote_identity_last_error = None
 
     def _ensure_remote_schema(self, remote):
         if getattr(self, '_schema_ensured', False):

@@ -4,8 +4,9 @@
 Fase 1A (bootstrap SQLite) se implementó después, con GO humano, en
 `schema_bootstrap.py` + DDL por motor. No reabre este contrato.
 **Siguiente paso de inventario/recepción:** autorización humana de Fase 1C
-(InventoryOperation / coordinador). Fase 1B (identidad + registry) y Fase 1B.1
-(hardening de PK genérica e identidad PostgreSQL) están hechas.
+(InventoryOperation / coordinador). Fase 1B (identidad + registry), Fase 1B.1
+(hardening de PK genérica e identidad PostgreSQL) y Fase 1B.2 (hardening
+final de identidad remota) están hechas. **No autoriza implementar 1C.**
 
 ## Qué es Fase 0
 
@@ -43,6 +44,7 @@ Prohibido (y no se hizo):
 | [INVARIANTES.md](INVARIANTES.md) | Invariantes deseados vs violación actual |
 | [FASE1B.md](FASE1B.md) | Identidad UUID + registry canónico de sync (implementada) |
 | [FASE1B1.md](FASE1B1.md) | Hardening 1B.1: PK genérica, identidad PG única, arranque |
+| [FASE1B2.md](FASE1B2.md) | Hardening 1B.2: garantía remota, paridad UNIQUE, PgCursor |
 
 Código de ruptura: `tests/fase0/`.
 

@@ -53,6 +53,9 @@ INV-02 (stale stock), INV-01 (overselling), INV-06 (operation_id), INV-08
   identidad PostgreSQL canónica (`postgres_identity_sql` + equivalencia `uq_*`/`ux_*`)
   y la política de arranque `REMOTE_TABLES_REQUIRED_FOR_STARTUP` (subconjunto
   derivado, no Kahn).
+- Fase 1B.2 cerró: `_remote_identity_ensured` ya no se marca si falla la
+  identidad remota; la migración manual no crea `uq_*` redundante junto a
+  `ux_*`; `PgCursor` no añade `RETURNING id` a `configuracion`.
 - El cobro real de CxC sigue siendo `abonos_ventas`. No hay escritor productivo
   de `configuracion` hacia el outbox.
 - `APPLY_AUTHORITATIVE_EXCLUDE` sigue `False`. No declarar INV-02 resuelto.

@@ -11,7 +11,7 @@ Conversiones automaticas:
   - julianday('now') - julianday(x) -> (CURRENT_DATE - DATE(x))
   - DATE('now') -> CURRENT_DATE
   - INSERT OR IGNORE INTO -> INSERT INTO ... ON CONFLICT DO NOTHING
-  - lastrowid -> via RETURNING id
+  - lastrowid -> via RETURNING id solo si la PK declarada es `id`
 """
 import re
 import sqlite3
@@ -153,6 +153,62 @@ def _is_plain_insert(query: str) -> bool:
     )
 
 
+_INSERT_TABLE_RE = re.compile(
+    r"^\s*INSERT\s+(?:OR\s+[A-Za-z]+\s+)?INTO\s+"
+    r"(?:(?P<schema>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)\.)?"
+    r"(?P<table>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+class PgCompatError(Exception):
+    """No se puede adaptar el INSERT remoto sin inventar una PK."""
+
+
+def _unquote_ident(name: str) -> str:
+    if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+        return name[1:-1]
+    return name.lower()
+
+
+def insert_table_name(query: str):
+    """Nombre de tabla de un INSERT, o None si no se puede parsear."""
+    match = _INSERT_TABLE_RE.match(query or "")
+    if not match:
+        return None
+    return _unquote_ident(match.group("table"))
+
+
+def plain_insert_returning_clause(query: str) -> str:
+    """Sufijo RETURNING para INSERT plano según PK declarada. No inventa PK.
+
+    - Tabla con PK declarada ``id`` (sync o no-sync de DDL): `` RETURNING id``.
+    - Tabla con PK no-id (configuracion, consecutivos, login_intentos, …):
+      ``""``; lastrowid=None.
+    - Tabla sin metadata de PK: ``PgCompatError`` (no se asume ``id``).
+    - Nombre de tabla irresoluble: ``PgCompatError`` visible.
+    """
+    if not _is_plain_insert(query):
+        return ""
+    table = insert_table_name(query)
+    if not table:
+        raise PgCompatError(
+            "INSERT remoto: no se pudo resolver el nombre de tabla; "
+            "no se inventa RETURNING id"
+        )
+    from sync_registry import declared_insert_pk
+
+    pk = declared_insert_pk(table)
+    if pk is None:
+        raise PgCompatError(
+            f"INSERT remoto INTO {table}: falta PK declarada; "
+            "no se inventa RETURNING id"
+        )
+    if pk != "id":
+        return ""
+    return " RETURNING id"
+
+
 class PgCursor:
     """Cursor wrapper: convierte queries SQLite y expone lastrowid."""
 
@@ -192,17 +248,19 @@ class PgCursor:
                 self._c.execute(q)
             return
 
-        # INSERT normal -> agregar RETURNING id para soportar lastrowid
+        # INSERT plano: RETURNING solo si la PK declarada es id.
         if _is_plain_insert(query):
-            q = q.rstrip().rstrip(";") + " RETURNING id"
+            clause = plain_insert_returning_clause(query)
+            if clause:
+                q = q.rstrip().rstrip(";") + clause
             if params:
                 self._c.execute(q, params)
             else:
                 self._c.execute(q)
-            try:
+            if clause:
                 row = self._c.fetchone()
                 self.lastrowid = row[0] if row else None
-            except Exception:
+            else:
                 self.lastrowid = None
             return
 

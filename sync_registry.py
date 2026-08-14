@@ -178,6 +178,27 @@ NON_SYNC_TABLES: Dict[str, str] = {
     "sync_state": "watermark local",
 }
 
+# PK real del DDL oficial para tablas que PgCursor puede insertar y NO están
+# en SYNC_REGISTRY. No se inventa `id`: solo lo que el CREATE TABLE declara.
+# Callers remotos (DB_MODE=remote → DatabaseManager.conectar):
+# formulas_mezcla / devoluciones usan lastrowid; consecutivos / login_intentos
+# tienen PK TEXT y no deben recibir RETURNING id.
+NON_SYNC_INSERT_PK: Dict[str, str] = {
+    "devoluciones": "id",
+    "devolucion_detalle": "id",
+    "formulas_mezcla": "id",
+    "formula_detalle": "id",
+    "alertas": "id",
+    "categorias_config": "id",
+    "resumen_deudas": "id",
+    "consecutivos": "clave",
+    "login_intentos": "username",
+    "local_sessions": "token",
+    "sync_queue": "id",
+    "sync_conflicts": "id",
+    "sync_state": "clave",
+}
+
 REMOTE_IDENTITY_MIGRATION_FILENAME = "supabase_sync_identity.sql"
 
 
@@ -270,6 +291,17 @@ def pk_column(table: str) -> str:
     if spec is None:
         return "id"
     return spec.get("pk") or "id"
+
+
+def declared_insert_pk(table: str) -> Optional[str]:
+    """PK de INSERT para PgCursor. None = no hay metadata; no inventar ``id``.
+
+    Sync: ``pk`` del registry. No-sync: ``NON_SYNC_INSERT_PK`` (DDL oficial).
+    """
+    spec = SYNC_REGISTRY.get(table)
+    if spec is not None and spec.get("sync"):
+        return spec.get("pk") or "id"
+    return NON_SYNC_INSERT_PK.get(table)
 
 
 def has_surrogate_integer_pk(table: str) -> bool:
@@ -401,6 +433,8 @@ def tables_requiring_postgres_local_id_unique(
 
 # Comprobación plpgsql: cualquier UNIQUE de una columna sobre local_id cuenta,
 # sea cual sea el nombre (uq_* canónico o ux_* legado).
+# Fuente única del predicado: copiar este fragmento en
+# supabase_local_first_migration.sql (paridad 1B.2). No generar ese archivo.
 _POSTGRES_LOCAL_ID_UNIQUE_EXISTS_PLPGSQL = """\
 EXISTS (
                     SELECT 1
@@ -417,6 +451,47 @@ EXISTS (
                       AND i.indnkeyatts = 1
                       AND a.attname = 'local_id'
                 )"""
+
+
+def postgres_local_id_unique_exists_plpgsql() -> str:
+    """Predicado plpgsql canónico: UNIQUE de una columna sobre local_id."""
+    return _POSTGRES_LOCAL_ID_UNIQUE_EXISTS_PLPGSQL.strip()
+
+
+def equivalent_local_id_unique_exists(indexes: Iterable[Mapping]) -> bool:
+    """True si algún índice es UNIQUE de UNA columna ``local_id`` sin predicado.
+
+    Codifica el mismo criterio que ``_POSTGRES_LOCAL_ID_UNIQUE_EXISTS_PLPGSQL``:
+    unique + 1 columna clave + ``local_id`` + sin predicado parcial.
+    El nombre (``uq_*`` canónico o ``ux_*`` legado) no importa.
+    UNIQUE compuesto o índice no-UNIQUE no cuentan como identidad.
+    """
+    for idx in indexes:
+        unique = bool(idx.get("unique", idx.get("indisunique", False)))
+        if not unique:
+            continue
+        columns = idx.get("columns") or idx.get("key_columns") or ()
+        if isinstance(columns, str):
+            columns = (columns,)
+        columns = tuple(columns)
+        nkey = idx.get("indnkeyatts", idx.get("nkeyatts", len(columns)))
+        predicate = idx.get("predicate", idx.get("indpred", None))
+        if (
+            nkey == 1
+            and len(columns) == 1
+            and columns[0] == "local_id"
+            and not predicate
+        ):
+            return True
+    return False
+
+
+def postgres_local_id_unique_exists_query() -> str:
+    """SELECT EXISTS(...) para una tabla (``%s`` = relname). Misma semántica."""
+    pred = _POSTGRES_LOCAL_ID_UNIQUE_EXISTS_PLPGSQL.replace(
+        "trel.relname = t", "trel.relname = %s", 1
+    )
+    return f"SELECT {pred}"
 
 
 def postgres_identity_sql(tables: Optional[Iterable[str]] = None) -> str:

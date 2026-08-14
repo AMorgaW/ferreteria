@@ -1,4 +1,7 @@
 -- Ejecutar una vez en el editor SQL de Supabase antes de activar sincronizacion.
+-- UNIQUE(local_id): mismo predicado pg_index que sync_registry.postgres_identity_sql().
+-- Un UNIQUE equivalente ya existente (cualquier nombre, p.ej. ux_* legado) se
+-- respeta. No DROP para renombrar. No crear uq_* redundante junto a ux_*.
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- Historial de precios (no existía en Supabase): se crea para poder replicarlo.
@@ -15,6 +18,7 @@ CREATE TABLE IF NOT EXISTS historial_precios (
 DO $$
 DECLARE
     table_name text;
+    t text;
 BEGIN
     FOREACH table_name IN ARRAY ARRAY[
         'usuarios', 'productos', 'clientes', 'proveedores', 'ventas',
@@ -36,11 +40,29 @@ BEGIN
             EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS device_id text', table_name);
             EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS created_by integer', table_name);
             EXECUTE format('ALTER TABLE %I ADD COLUMN IF NOT EXISTS updated_by integer', table_name);
-            EXECUTE format(
-                'CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I(local_id)',
-                'uq_' || table_name || '_local_id',
-                table_name
-            );
+            -- t debe coincidir con el predicado canónico (trel.relname = t).
+            t := table_name;
+            IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_index i
+                    JOIN pg_class trel ON trel.oid = i.indrelid
+                    JOIN pg_namespace nsp ON nsp.oid = trel.relnamespace
+                    JOIN pg_attribute a ON a.attrelid = trel.oid
+                         AND a.attnum = i.indkey[0]
+                         AND NOT a.attisdropped
+                    WHERE nsp.nspname = 'public'
+                      AND trel.relname = t
+                      AND i.indisunique
+                      AND i.indpred IS NULL
+                      AND i.indnkeyatts = 1
+                      AND a.attname = 'local_id'
+                ) THEN
+                EXECUTE format(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I(local_id)',
+                    'uq_' || t || '_local_id',
+                    t
+                );
+            END IF;
         END IF;
     END LOOP;
 END $$;
