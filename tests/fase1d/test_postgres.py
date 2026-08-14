@@ -470,3 +470,142 @@ class PostgresIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(rec.estado, "APPLIED")
         self.assertEqual(self._client().get_balance(lid), 20000)
+
+    def test_unique_violation_no_es_replay(self):
+        from inventory_coordinator import DuplicateOperationError
+        from psycopg2.errors import UniqueViolation
+
+        a = self._seed_product(50000)
+        b = self._seed_product(50000)
+        oid = str(uuid.uuid4())
+        first = self._client().apply_command(
+            command_id=str(uuid.uuid4()),
+            tipo="VENTA",
+            device_id=DEVICE,
+            operations=[_op_scaled(a, -1000, operation_id=oid)],
+        )
+        self.assertEqual(first.estado, "APPLIED")
+        self.assertFalse(first.replayed)
+        with self.assertRaises(DuplicateOperationError) as ctx:
+            self._client().apply_command(
+                command_id=str(uuid.uuid4()),
+                tipo="VENTA",
+                device_id=DEVICE,
+                operations=[_op_scaled(b, -1000, operation_id=oid)],
+            )
+        self.assertNotIn("ya se proces", str(ctx.exception).lower())
+        self.assertEqual(self._client().get_balance(a), 49000)
+        self.assertEqual(self._client().get_balance(b), 50000)
+        recovered = self._client().apply_command(
+            command_id=str(uuid.uuid4()),
+            tipo="VENTA",
+            device_id=DEVICE,
+            operations=[_op_scaled(b, -1000)],
+        )
+        self.assertEqual(recovered.estado, "APPLIED")
+        self.assertFalse(recovered.replayed)
+        self.assertEqual(self._client().get_balance(b), 49000)
+
+        lid = insert_producto(self.conn, stock=0)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT conname FROM pg_constraint con "
+                "JOIN pg_class c ON c.oid = con.conrelid "
+                "WHERE c.relname = 'inventory_balances' AND con.contype = 'p'"
+            )
+            self.assertEqual(cur.fetchone()[0], "inventory_balances_pkey")
+            cur.execute(
+                """
+                INSERT INTO inventory_balances (
+                    producto_local_id, quantity_scaled, created_at, updated_at
+                ) VALUES (%s, 1000, 't', 't')
+                """,
+                (lid,),
+            )
+        self.conn.commit()
+        with self.assertRaises(UniqueViolation):
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO inventory_balances (
+                        producto_local_id, quantity_scaled, created_at, updated_at
+                    ) VALUES (%s, 1, 't', 't')
+                    """,
+                    (lid,),
+                )
+        self.conn.rollback()
+        other = self._client().apply_command(
+            command_id=str(uuid.uuid4()),
+            tipo="COMPRA",
+            device_id=DEVICE,
+            operations=[_op_scaled(lid, 2000)],
+        )
+        self.assertEqual(other.estado, "APPLIED")
+        self.assertFalse(other.replayed)
+        self.assertEqual(self._client().get_balance(lid), 3000)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pg_get_functiondef(p.oid)
+                FROM pg_proc p
+                JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname='public' AND p.proname='apply_inventory_command'
+                """
+            )
+            defn = cur.fetchone()[0]
+        self.assertIn("GET STACKED DIAGNOSTICS", defn)
+        self.assertIn("inventory_commands_pkey", defn)
+        self.assertIn("inventory_balances_pkey", defn)
+
+    def test_overflow_bigint_real_no_cambia_balance(self):
+        from inventory_coordinator import BIGINT_MAX, MOTIVO_QUANTITY_OVERFLOW
+
+        lid = self._seed_product(BIGINT_MAX)
+        rec = self._client().apply_command(
+            command_id=str(uuid.uuid4()),
+            tipo="COMPRA",
+            device_id=DEVICE,
+            operations=[_op_scaled(lid, 1)],
+        )
+        self.assertEqual(rec.estado, "REJECTED")
+        self.assertIn(MOTIVO_QUANTITY_OVERFLOW, rec.motivo or "")
+        self.assertEqual(self._client().get_balance(lid), BIGINT_MAX)
+
+    def test_fixed_point_0125(self):
+        lid = self._seed_product(125)
+        rec = self._client().apply_command(
+            command_id=str(uuid.uuid4()),
+            tipo="VENTA",
+            device_id=DEVICE,
+            operations=[_op(lid, "-0.125")],
+        )
+        self.assertEqual(rec.operations[0].delta_scaled, -125)
+        self.assertEqual(self._client().get_balance(lid), 0)
+
+    def test_set_local_timeout_no_fuga_y_rollback(self):
+        lid = self._seed_product(5000)
+        self._client().apply_command(
+            command_id=str(uuid.uuid4()),
+            tipo="VENTA",
+            device_id=DEVICE,
+            operations=[_op_scaled(lid, -1000)],
+            timeout_seconds=15,
+        )
+        with self.conn.cursor() as cur:
+            cur.execute("SHOW statement_timeout")
+            shown = str(cur.fetchone()[0]).strip().lower().replace(" ", "")
+        self.assertNotIn(shown, ("15s", "15sec", "15000ms", "15000"))
+        with self.conn.cursor() as cur:
+            try:
+                cur.execute("SELECT 1/0")
+            except Exception:
+                pass
+        self.conn.rollback()
+        rec = self._client().apply_command(
+            command_id=str(uuid.uuid4()),
+            tipo="VENTA",
+            device_id=DEVICE,
+            operations=[_op_scaled(lid, -1000)],
+        )
+        self.assertEqual(rec.estado, "APPLIED")
+        self.assertEqual(self._client().get_balance(lid), 3000)

@@ -20,6 +20,22 @@ class ContractCoordinatorTest(unittest.TestCase):
 
         self.assertNotIn("%", postgres_coordinator_sql())
 
+    def test_sql_no_empieza_con_backslash_ni_basura(self):
+        """Regresión: r'''\\ no debe preservar un backslash de continuación."""
+        from inventory_coordinator import postgres_coordinator_sql
+
+        sql = postgres_coordinator_sql()
+        self.assertTrue(sql)
+        self.assertFalse(sql.startswith("\\"))
+        self.assertFalse(sql.startswith("\ufeff"))
+        self.assertRegex(
+            sql,
+            r"^(?:--|[A-Za-z])",
+            "el SQL generado debe empezar por comentario o DDL, no por basura",
+        )
+        src = (REPO_ROOT / "inventory_coordinator.py").read_text(encoding="utf-8")
+        self.assertNotIn('r"""\\', src)
+
     def test_artefacto_sql_paridad(self):
         from inventory_coordinator import (
             REMOTE_COORDINATOR_MIGRATION_FILENAME,
@@ -42,6 +58,27 @@ class ContractCoordinatorTest(unittest.TestCase):
         self.assertIn("CHECK (quantity_scaled >= 0)", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS inventory_balance_init", sql)
         self.assertIn("Nunca ejecutar contra SQLite", sql)
+
+    def test_unique_violation_distingue_constraints(self):
+        from inventory_coordinator import coordinator_apply_sql
+
+        apply_sql = coordinator_apply_sql()
+        self.assertIn("GET STACKED DIAGNOSTICS", apply_sql)
+        self.assertIn("CONSTRAINT_NAME", apply_sql)
+        self.assertIn("inventory_commands_pkey", apply_sql)
+        self.assertIn("inventory_operations_pkey", apply_sql)
+        self.assertIn("inventory_operations_command_id_line_no_key", apply_sql)
+        self.assertIn("inventory_balances_pkey", apply_sql)
+        idx = apply_sql.find("WHEN unique_violation THEN")
+        self.assertGreater(idx, 0)
+        handler = apply_sql[idx:idx + 1800]
+        replay = handler.find("inventory_command_to_json")
+        commands_pk = handler.find("inventory_commands_pkey")
+        else_raise = handler.rfind("ELSE")
+        self.assertGreater(commands_pk, 0)
+        self.assertGreater(replay, commands_pk)
+        self.assertGreater(else_raise, replay)
+        self.assertIn("RAISE;", handler[else_raise:])
 
     def test_rpc_locking_y_atomicidad(self):
         from inventory_coordinator import coordinator_apply_sql

@@ -470,8 +470,7 @@ class InventoryCoordinatorClient:
         return fetch_inventory_balance(self.conn, producto_local_id)
 
 
-_POSTGRES_COORDINATOR_SQL = r"""\
--- FERREPRO Fase 1D — coordinador autoritativo de inventario.
+_POSTGRES_COORDINATOR_SQL = r"""-- FERREPRO Fase 1D — coordinador autoritativo de inventario.
 -- SOLO PostgreSQL/Supabase. Nunca ejecutar contra SQLite.
 -- Idempotente. No modifica productos.stock. No entra al sync LWW.
 -- Autoridad online: inventory_balances.quantity_scaled (BIGINT, escala 1000).
@@ -541,6 +540,7 @@ DECLARE
     v_item jsonb;
     v_motivo text;
     v_estado text;
+    v_constraint text;
     BIGINT_MIN numeric := -9223372036854775808;
     BIGINT_MAX numeric := 9223372036854775807;
 BEGIN
@@ -859,21 +859,36 @@ BEGIN
         FROM jsonb_array_elements(v_parsed) e;
     EXCEPTION
         WHEN unique_violation THEN
-            SELECT request_hash
-              INTO v_existing_hash
-              FROM public.inventory_commands
-             WHERE command_id = v_command_id;
-            IF FOUND THEN
-                IF v_existing_hash IS DISTINCT FROM v_hash THEN
-                    RAISE EXCEPTION USING ERRCODE = '22023',
-                        MESSAGE = 'IDEMPOTENCY_CONFLICT: command_id ' || v_command_id
-                            || ' ya existe con otro request_hash';
+            GET STACKED DIAGNOSTICS v_constraint = CONSTRAINT_NAME;
+            IF v_constraint = 'inventory_commands_pkey' THEN
+                SELECT request_hash
+                  INTO v_existing_hash
+                  FROM public.inventory_commands
+                 WHERE command_id = v_command_id;
+                IF FOUND THEN
+                    IF v_existing_hash IS DISTINCT FROM v_hash THEN
+                        RAISE EXCEPTION USING ERRCODE = '22023',
+                            MESSAGE = 'IDEMPOTENCY_CONFLICT: command_id ' || v_command_id
+                                || ' ya existe con otro request_hash';
+                    END IF;
+                    RETURN public.inventory_command_to_json(v_command_id, true);
                 END IF;
-                RETURN public.inventory_command_to_json(v_command_id, true);
+                RAISE;
+            ELSIF v_constraint IN (
+                'inventory_operations_pkey',
+                'inventory_operations_command_id_line_no_key'
+            ) THEN
+                RAISE EXCEPTION
+                    'DUPLICATE_OPERATION: operation_id repetido en otro comando'
+                    USING ERRCODE = '22023';
+            ELSIF v_constraint IN (
+                'inventory_balances_pkey',
+                'inventory_balance_init_pkey'
+            ) THEN
+                RAISE;
+            ELSE
+                RAISE;
             END IF;
-            RAISE EXCEPTION
-                'DUPLICATE_OPERATION: operation_id repetido en otro comando'
-                USING ERRCODE = '22023';
     END;
 
     RETURN public.inventory_command_to_json(v_command_id, false);
