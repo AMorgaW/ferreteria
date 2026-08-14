@@ -352,6 +352,7 @@ class PostgresIntegrationTest(unittest.TestCase):
                 (lid,),
             )
             before = cur.fetchone()[0]
+        self.conn.rollback()
         applied = self._client().apply_command(
             command_id=str(uuid.uuid4()),
             tipo="VENTA",
@@ -366,6 +367,7 @@ class PostgresIntegrationTest(unittest.TestCase):
                 (lid,),
             )
             qty, after = cur.fetchone()
+        self.conn.rollback()
         self.assertEqual(int(qty), 49000)
         self.assertNotEqual(after, before)
         rejected = self._client().apply_command(

@@ -6,7 +6,7 @@ import sys
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from psycopg2.errors import QueryCanceled
 
@@ -218,6 +218,62 @@ class UnitCoordinatorTest(unittest.TestCase):
         self.assertEqual(rec.command_id, command_id)
         self.assertTrue(rec.replayed)
         self.assertGreaterEqual(conn.commits, 1)
+
+    def test_deadlock_agota_todos_los_reintentos_configurados(self):
+        from inventory_coordinator import CoordinatorDeadlockError, apply_inventory_command
+
+        calls = []
+
+        def fail_deadlock(*_args, **_kwargs):
+            calls.append(True)
+            raise CoordinatorDeadlockError("deadlock sintético")
+
+        with patch("inventory_coordinator._invoke_apply_rpc", fail_deadlock), patch(
+            "inventory_coordinator.schema_bootstrap.is_sqlite_connection",
+            return_value=False,
+        ):
+            with self.assertRaises(CoordinatorDeadlockError):
+                apply_inventory_command(
+                    object(),
+                    command_id=str(uuid.uuid4()),
+                    tipo="VENTA",
+                    device_id=DEVICE,
+                    operations=[_op(str(uuid.uuid4()), "-1")],
+                    retry_on_timeout=False,
+                    max_deadlock_retries=3,
+                )
+
+        self.assertEqual(len(calls), 4)
+
+    def test_rechaza_conexion_postgres_autocommit(self):
+        from inventory_coordinator import CoordinatorError, apply_inventory_command
+
+        conn = MagicMock()
+        conn.autocommit = True
+        with self.assertRaises(CoordinatorError):
+            apply_inventory_command(
+                conn,
+                command_id=str(uuid.uuid4()),
+                tipo="VENTA",
+                device_id=DEVICE,
+                operations=[_op(str(uuid.uuid4()), "-1")],
+            )
+
+    def test_rechaza_transaccion_activa_ajena(self):
+        from inventory_coordinator import CoordinatorError, apply_inventory_command
+        from psycopg2.extensions import TRANSACTION_STATUS_INTRANS
+
+        conn = MagicMock()
+        conn.autocommit = False
+        conn.get_transaction_status.return_value = TRANSACTION_STATUS_INTRANS
+        with self.assertRaises(CoordinatorError):
+            apply_inventory_command(
+                conn,
+                command_id=str(uuid.uuid4()),
+                tipo="VENTA",
+                device_id=DEVICE,
+                operations=[_op(str(uuid.uuid4()), "-1")],
+            )
 
     def test_no_adelanta_writers_productivos(self):
         writers = [

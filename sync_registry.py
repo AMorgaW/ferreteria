@@ -196,6 +196,9 @@ COORDINATOR_REMOTE_TABLES: Dict[str, str] = {
         "registro one-shot de inicialización. ON CONFLICT DO NOTHING; "
         "no pisa un balance más nuevo."
     ),
+    "inventory_balance_init_state": (
+        "marcador persistente del corte legacy; no entra al sync LWW."
+    ),
 }
 
 # PK real del DDL oficial para tablas que PgCursor puede insertar y NO están

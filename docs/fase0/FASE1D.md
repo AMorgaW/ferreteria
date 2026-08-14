@@ -15,9 +15,11 @@ Hecho:
 - Tabla `inventory_balances` (PostgreSQL): autoridad online
 - RPC `apply_inventory_command(...)` en una transacción
 - Adapter Python `inventory_coordinator.py` (timeout, retry con el mismo
-  `command_id`, APPLIED / REJECTED / IdempotencyConflict)
+  `command_id`, APPLIED / REJECTED / IdempotencyConflict; exige conexión
+  PostgreSQL `autocommit=False` sin transacción activa)
 - Semilla explícita `seed_inventory_balance` (no pisa un balance existente)
-- Infraestructura one-shot `initialize_inventory_balances_from_legacy`
+- Infraestructura one-shot `initialize_inventory_balances_from_legacy`, con
+  marcador persistente `inventory_balance_init_state` y locks por producto
   **no ejecutada** por arranque ni sync
 - Tablas del coordinador fuera del sync LWW
 
@@ -95,7 +97,9 @@ Cómo nace una fila:
 
 `initialize_inventory_balances_from_legacy()` copia
 `round(productos.stock::numeric * 1000)` **solo** a productos sin fila en
-`inventory_balances`. `ON CONFLICT DO NOTHING`.
+`inventory_balances`. `ON CONFLICT DO NOTHING`. Un marcador persistente evita
+una segunda ejecución; la función toma el mismo advisory lock por producto que
+el coordinador para no chocar con comandos concurrentes.
 
 **No la ejecuta** `_ensure_remote_schema`, el adapter de aplicación ni el
 POS. Un corte de producción exige fase de control posterior (1E+): ventana
@@ -107,8 +111,8 @@ La función es `SECURITY DEFINER` con `SET search_path = pg_catalog, public`.
 Sin SQL dinámico en el RPC. `REVOKE ALL … FROM PUBLIC`. Si existen roles
 Supabase `anon` / `authenticated` / `service_role`, también se les revoca
 EXECUTE y el acceso a las tablas. RLS habilitado en
-`inventory_balances`, `inventory_balance_init`, `inventory_commands` e
-`inventory_operations` (el owner/BYPASSRLS de la URI de FERREPRO sigue
+`inventory_balances`, `inventory_balance_init`, `inventory_balance_init_state`,
+`inventory_commands` e `inventory_operations` (el owner/BYPASSRLS de la URI de FERREPRO sigue
 pudiendo ejecutar el RPC).
 
 Autorización de negocio (quién puede mandar `delta = +999999999`) queda
@@ -119,7 +123,8 @@ no JWT anon). El adapter de 1D usa esa misma clase de conexión.
 
 ## Sync
 
-`inventory_balances` y `inventory_balance_init` están en
+`inventory_balances`, `inventory_balance_init` e
+`inventory_balance_init_state` están en
 `sync_registry.COORDINATOR_REMOTE_TABLES`, no en `SYNC_REGISTRY`.
 `inventory_commands` / `inventory_operations` siguen en `NON_SYNC_TABLES`.
 Ninguna viaja por UPSERT LWW.

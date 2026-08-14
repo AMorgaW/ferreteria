@@ -116,6 +116,8 @@ class ContractCoordinatorTest(unittest.TestCase):
         sql = coordinator_legacy_init_sql()
         self.assertIn("p.stock", sql)
         self.assertIn("ON CONFLICT (producto_local_id) DO NOTHING", sql)
+        self.assertIn("inventory_balance_init_state", sql)
+        self.assertIn("ferrepro.invbal.init:legacy_cutover", sql)
         self.assertIn("NO la ejecuta el coordinador", sql)
         ls = (REPO_ROOT / "local_sync.py").read_text(encoding="utf-8")
         self.assertNotIn("initialize_inventory_balances_from_legacy(", ls.split("def _ensure_remote_schema")[1][:2500])
@@ -158,7 +160,11 @@ class ContractCoordinatorTest(unittest.TestCase):
         )
 
         self.assertFalse(APPLY_AUTHORITATIVE_EXCLUDE)
-        for table in ("inventory_balances", "inventory_balance_init"):
+        for table in (
+            "inventory_balances",
+            "inventory_balance_init",
+            "inventory_balance_init_state",
+        ):
             self.assertIn(table, COORDINATOR_REMOTE_TABLES)
             self.assertFalse(is_sync_table(table))
             self.assertNotIn(table, sync_tables())

@@ -18,11 +18,17 @@ CREATE TABLE IF NOT EXISTS inventory_balance_init (
     initialized_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS inventory_balance_init_state (
+    init_key TEXT PRIMARY KEY CHECK (init_key = 'legacy_cutover'),
+    initialized_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_inventory_balances_updated
     ON inventory_balances(updated_at);
 
 ALTER TABLE inventory_balances ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_balance_init ENABLE ROW LEVEL SECURITY;
+ALTER TABLE inventory_balance_init_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_commands ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_operations ENABLE ROW LEVEL SECURITY;
 
@@ -45,8 +51,11 @@ DECLARE
     v_command_id text;
     v_device_id text;
     v_doc_id text;
+    v_documento_tipo text;
     v_tipo text;
     v_hash text;
+    v_canonical text;
+    v_computed_hash text;
     v_existing_hash text;
     v_now text;
     v_op jsonb;
@@ -92,6 +101,7 @@ BEGIN
         RAISE EXCEPTION 'INVALID_COMMAND: device_id debe ser UUID'
             USING ERRCODE = '22023';
     END;
+    v_documento_tipo := NULLIF(btrim(COALESCE(p_documento_tipo, '')), '');
     IF p_documento_local_id IS NULL OR btrim(p_documento_local_id) = '' THEN
         v_doc_id := NULL;
     ELSE
@@ -115,25 +125,6 @@ BEGIN
     IF p_operations IS NULL OR jsonb_typeof(p_operations) <> 'array' THEN
         RAISE EXCEPTION 'INVALID_COMMAND: operations debe ser un array JSON'
             USING ERRCODE = '22023';
-    END IF;
-
-    PERFORM pg_advisory_xact_lock(
-        pg_catalog.hashtextextended('ferrepro.invcmd:' || v_command_id, 0)
-    );
-
-    SELECT request_hash
-      INTO v_existing_hash
-      FROM public.inventory_commands
-     WHERE command_id = v_command_id
-     FOR UPDATE;
-
-    IF FOUND THEN
-        IF v_existing_hash IS DISTINCT FROM v_hash THEN
-            RAISE EXCEPTION USING ERRCODE = '22023',
-                MESSAGE = 'IDEMPOTENCY_CONFLICT: command_id ' || v_command_id
-                    || ' ya existe con otro request_hash';
-        END IF;
-        RETURN public.inventory_command_to_json(v_command_id, true);
     END IF;
 
     IF jsonb_array_length(p_operations) = 0 THEN
@@ -212,6 +203,67 @@ BEGIN
         );
     END LOOP;
 
+    v_parsed := COALESCE(
+        (
+            SELECT jsonb_agg(value ORDER BY (value->>'line_no')::int)
+              FROM jsonb_array_elements(v_parsed)
+        ),
+        '[]'::jsonb
+    );
+    SELECT
+        '{"command_id":' || pg_catalog.to_jsonb(v_command_id)::text
+        || ',"documento_local_id":'
+        || COALESCE(pg_catalog.to_jsonb(v_doc_id)::text, 'null')
+        || ',"documento_tipo":'
+        || COALESCE(pg_catalog.to_jsonb(v_documento_tipo)::text, 'null')
+        || ',"operations":['
+        || COALESCE(
+            (
+                SELECT string_agg(
+                    '{"delta_scaled":' || (e->>'delta_scaled')
+                    || ',"line_no":' || (e->>'line_no')
+                    || ',"operation_id":'
+                    || pg_catalog.to_jsonb(e->>'operation_id')::text
+                    || ',"producto_local_id":'
+                    || pg_catalog.to_jsonb(e->>'producto_local_id')::text
+                    || '}',
+                    ',' ORDER BY (e->>'line_no')::int
+                )
+                  FROM jsonb_array_elements(v_parsed) e
+            ),
+            ''
+        )
+        || '],"tipo":' || pg_catalog.to_jsonb(v_tipo)::text
+        || '}'
+      INTO v_canonical;
+    v_computed_hash := encode(
+        pg_catalog.sha256(pg_catalog.convert_to(v_canonical, 'UTF8')),
+        'hex'
+    );
+    IF v_computed_hash IS DISTINCT FROM v_hash THEN
+        RAISE EXCEPTION USING ERRCODE = '22023',
+            MESSAGE = 'INVALID_COMMAND: request_hash no coincide con el payload';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(
+        pg_catalog.hashtextextended('ferrepro.invcmd:' || v_command_id, 0)
+    );
+
+    SELECT request_hash
+      INTO v_existing_hash
+      FROM public.inventory_commands
+     WHERE command_id = v_command_id
+     FOR UPDATE;
+
+    IF FOUND THEN
+        IF v_existing_hash IS DISTINCT FROM v_hash THEN
+            RAISE EXCEPTION USING ERRCODE = '22023',
+                MESSAGE = 'IDEMPOTENCY_CONFLICT: command_id ' || v_command_id
+                    || ' ya existe con otro request_hash';
+        END IF;
+        RETURN public.inventory_command_to_json(v_command_id, true);
+    END IF;
+
     SELECT coalesce(array_agg(pid ORDER BY pid), ARRAY[]::text[])
       INTO v_pid_list
       FROM (
@@ -241,7 +293,7 @@ BEGIN
             device_id, usuario_id, request_hash, estado, resultado,
             motivo, created_at, updated_at
         ) VALUES (
-            v_command_id, v_tipo, p_documento_tipo, v_doc_id,
+            v_command_id, v_tipo, v_documento_tipo, v_doc_id,
             v_device_id, p_usuario_id, v_hash, v_estado, v_estado,
             v_motivo, v_now, v_now
         );
@@ -328,7 +380,7 @@ BEGIN
             device_id, usuario_id, request_hash, estado, resultado,
             motivo, created_at, updated_at
         ) VALUES (
-            v_command_id, v_tipo, p_documento_tipo, v_doc_id,
+            v_command_id, v_tipo, v_documento_tipo, v_doc_id,
             v_device_id, p_usuario_id, v_hash, v_estado, v_estado,
             v_motivo, v_now, v_now
         );
@@ -371,7 +423,7 @@ BEGIN
             device_id, usuario_id, request_hash, estado, resultado,
             motivo, created_at, updated_at
         ) VALUES (
-            v_command_id, v_tipo, p_documento_tipo, v_doc_id,
+            v_command_id, v_tipo, v_documento_tipo, v_doc_id,
             v_device_id, p_usuario_id, v_hash, v_estado, v_estado,
             NULL, v_now, v_now
         );
@@ -499,6 +551,17 @@ BEGIN
         RAISE EXCEPTION 'INVALID_DELTA: quantity_scaled de semilla debe ser >= 0'
             USING ERRCODE = '22023';
     END IF;
+    PERFORM pg_advisory_xact_lock(
+        pg_catalog.hashtextextended('ferrepro.invbal:' || v_pid, 0)
+    );
+    IF NOT EXISTS (
+        SELECT 1
+          FROM public.productos p
+         WHERE p.local_id = v_pid
+    ) THEN
+        RAISE EXCEPTION 'UNKNOWN_PRODUCT: producto_local_id no existe'
+            USING ERRCODE = '22023';
+    END IF;
     v_now := to_char(
         timezone('UTC', clock_timestamp()),
         'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
@@ -541,37 +604,70 @@ AS $ferrepro_fn$
 DECLARE
     v_now text;
     v_inserted bigint := 0;
+    v_pid text;
+    v_inserted_one integer;
 BEGIN
+    PERFORM pg_advisory_xact_lock(
+        pg_catalog.hashtextextended('ferrepro.invbal.init:legacy_cutover', 0)
+    );
+    IF EXISTS (
+        SELECT 1
+          FROM public.inventory_balance_init_state
+         WHERE init_key = 'legacy_cutover'
+    ) THEN
+        RETURN jsonb_build_object(
+            'inserted', 0,
+            'source', 'legacy_cutover',
+            'already_initialized', true
+        );
+    END IF;
     v_now := to_char(
         timezone('UTC', clock_timestamp()),
         'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
     );
-    INSERT INTO public.inventory_balances (
-        producto_local_id, quantity_scaled, created_at, updated_at
-    )
-    SELECT
-        p.local_id,
-        round((COALESCE(p.stock, 0))::numeric * 1000, 0)::bigint,
-        v_now,
-        v_now
-    FROM public.productos p
-    WHERE p.local_id IS NOT NULL
-      AND btrim(p.local_id) <> ''
-    ON CONFLICT (producto_local_id) DO NOTHING;
-    GET DIAGNOSTICS v_inserted = ROW_COUNT;
-    INSERT INTO public.inventory_balance_init (
-        producto_local_id, quantity_scaled, source, initialized_at
-    )
-    SELECT
-        b.producto_local_id,
-        b.quantity_scaled,
-        'legacy_cutover',
-        v_now
-    FROM public.inventory_balances b
-    ON CONFLICT (producto_local_id) DO NOTHING;
+    FOR v_pid IN
+        SELECT p.local_id
+          FROM public.productos p
+         WHERE p.local_id IS NOT NULL
+           AND btrim(p.local_id) <> ''
+         ORDER BY p.local_id
+    LOOP
+        PERFORM pg_advisory_xact_lock(
+            pg_catalog.hashtextextended('ferrepro.invbal:' || v_pid, 0)
+        );
+        INSERT INTO public.inventory_balances (
+            producto_local_id, quantity_scaled, created_at, updated_at
+        )
+        SELECT
+            p.local_id,
+            round((COALESCE(p.stock, 0))::numeric * 1000, 0)::bigint,
+            v_now,
+            v_now
+          FROM public.productos p
+         WHERE p.local_id = v_pid
+        ON CONFLICT (producto_local_id) DO NOTHING;
+        GET DIAGNOSTICS v_inserted_one = ROW_COUNT;
+        v_inserted := v_inserted + v_inserted_one;
+        IF v_inserted_one > 0 THEN
+            INSERT INTO public.inventory_balance_init (
+                producto_local_id, quantity_scaled, source, initialized_at
+            )
+            SELECT
+                b.producto_local_id,
+                b.quantity_scaled,
+                'legacy_cutover',
+                v_now
+              FROM public.inventory_balances b
+             WHERE b.producto_local_id = v_pid
+            ON CONFLICT (producto_local_id) DO NOTHING;
+        END IF;
+    END LOOP;
+    INSERT INTO public.inventory_balance_init_state (init_key, initialized_at)
+    VALUES ('legacy_cutover', v_now);
     RETURN jsonb_build_object(
         'inserted', v_inserted,
-        'source', 'legacy_cutover'
+        'source', 'legacy_cutover',
+        'already_initialized', false
     );
 END;
 $ferrepro_fn$;
@@ -583,6 +679,7 @@ REVOKE ALL ON FUNCTION public.seed_inventory_balance(text, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_balances FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_balance_init FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_balance_init_state FROM PUBLIC;
 
 DO $ferrepro_do$
 BEGIN
@@ -593,6 +690,7 @@ BEGIN
         REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM anon;
         REVOKE ALL ON TABLE public.inventory_balances FROM anon;
         REVOKE ALL ON TABLE public.inventory_balance_init FROM anon;
+        REVOKE ALL ON TABLE public.inventory_balance_init_state FROM anon;
         REVOKE ALL ON TABLE public.inventory_commands FROM anon;
         REVOKE ALL ON TABLE public.inventory_operations FROM anon;
     END IF;
@@ -603,6 +701,7 @@ BEGIN
         REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_balances FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_balance_init FROM authenticated;
+        REVOKE ALL ON TABLE public.inventory_balance_init_state FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_commands FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_operations FROM authenticated;
     END IF;
@@ -613,6 +712,7 @@ BEGIN
         REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_legacy() FROM service_role;
         REVOKE ALL ON TABLE public.inventory_balances FROM service_role;
         REVOKE ALL ON TABLE public.inventory_balance_init FROM service_role;
+        REVOKE ALL ON TABLE public.inventory_balance_init_state FROM service_role;
         REVOKE ALL ON TABLE public.inventory_commands FROM service_role;
         REVOKE ALL ON TABLE public.inventory_operations FROM service_role;
     END IF;
