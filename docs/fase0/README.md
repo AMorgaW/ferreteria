@@ -3,11 +3,13 @@
 **Estado:** ejecutada. **Producción (Fase 0): no modificada.**  
 Fase 1A (bootstrap SQLite) se implementó después, con GO humano, en
 `schema_bootstrap.py` + DDL por motor. No reabre este contrato.
-**Siguiente paso de inventario/recepción:** autorización humana de Fase 1E
-(migrar writers productivos al coordinador). Fase 1D (coordinador
-PostgreSQL de stock) está hecha. La certificación PostgreSQL real de
-laboratorio está en [FASE1D1.md](FASE1D1.md). El gate de autorización y la
-reconexión post-desconexión están en [FASE1D3.md](FASE1D3.md). **No autoriza migrar POS/compras.**
+**Siguiente paso de inventario/recepción:** Fase 1E.0 (gateway + inventario
+de writers) está **implementada**; ver [FASE1E.md](FASE1E.md). Cutover
+**OFF**. **No autoriza 1E.1, cutover, ni migrar POS/compras.** Fase 1D
+(coordinador PostgreSQL de stock) está hecha. La certificación PostgreSQL
+real de laboratorio está en [FASE1D1.md](FASE1D1.md). El gate de
+autorización y la reconexión post-desconexión están en
+[FASE1D3.md](FASE1D3.md).
 
 ## Qué es Fase 0
 
@@ -49,6 +51,8 @@ Prohibido (y no se hizo):
 | [FASE1C.md](FASE1C.md) | Ledger de comandos e idempotencia (implementada; no aplica stock) |
 | [FASE1D.md](FASE1D.md) | Coordinador PostgreSQL / inventory_balances (implementada; no migra writers) |
 | [FASE1D1.md](FASE1D1.md) | Certificación PostgreSQL real en Docker local (no migra writers) |
+| [FASE1D3.md](FASE1D3.md) | Gate `session_user` + reconexión post-desconexión (no migra writers) |
+| [FASE1E.md](FASE1E.md) | 1E.0 implementada: gateway + inventario. Cutover OFF. No autoriza 1E.1 ni cutover. |
 
 Código de ruptura: `tests/fase0/`.
 
@@ -61,8 +65,8 @@ fallan contra el código de hoy y **deben** seguir fallando hasta que una
 fase posterior implemente el contrato. Un XPASS significa que el contrato
 se cumplió en silencio o que el test se volvió trivial.
 
-Suite actual: **34 tests en fase0**. INV-15 (1A), INV-11/INV-18 (1B), INV-06/INV-07
-(1C, ledger persistido) pasan. El coordinador online vive en Fase 1D
+Suite actual: **37 tests en fase0** (scanner 1E.0 endurecido). INV-15 (1A), INV-11/INV-18 (1B), INV-06/INV-07
+(1C, ledger persistido) pasan. INV-19 se re-inventarió en 1E.0. El coordinador online vive en Fase 1D
 (`tests/fase1d`, PostgreSQL real opt-in; certificación de laboratorio en
 [FASE1D1.md](FASE1D1.md)). El xfail de dos SQLite, LWW de
 stock, barcodes, recepción y fencing siguen xfail. **No declara INV-02

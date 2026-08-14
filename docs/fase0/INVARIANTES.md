@@ -26,7 +26,7 @@ Cada invariante tiene un test en `tests/fase0/`.
 | INV-16 | Factura única por proveedor normalizada | `compras.numero_factura` sin UNIQUE | XFAIL `test_contrato_factura_unica_por_proveedor` |
 | INV-17 | Cantidades fixed-point | INTEGER + float + REAL mezclados | XFAIL `test_contrato_fixed_point` |
 | INV-18 | Registries de sync coherentes | **Resuelto en Fase 1B:** `sync_registry.SYNC_REGISTRY` es la fuente única; las listas se derivan | PASS `test_registries_divergen` + `tests/fase1b` |
-| INV-19 | Writers de stock conocidos | Ver `STOCK_WRITERS.md` | CAR `test_scanner_coincide_con_inventario` |
+| INV-19 | Writers de stock conocidos | **Re-inventariado en Fase 1E.0** (`STOCK_WRITERS.md`, `tests/fase0/stock_writers.py`). Scanner endurecido (UPDATE+INSERT). 0 UNKNOWN. Writers no migrados. | CAR `test_scanner_coincide_con_inventario` + `tests/fase1e` |
 | INV-20 | Esquema oficial SQLite usable por `crear_compra` | **Resuelto en Fase 1A:** columnas de pago se crean/migran de verdad | PASS `test_crear_compra_en_esquema_oficial` + `tests/fase1a` |
 
 ## Fencing (ADR-0003) — aún no testeable en runtime

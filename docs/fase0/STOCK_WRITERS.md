@@ -1,52 +1,97 @@
 # Writers actuales de `productos.stock`
 
-Inventario estático de Fase 0. La lista canónica ejecutable está en
-`tests/fase0/stock_writers.py`. El test `test_stock_writers.py` falla
-si aparece un `UPDATE productos … stock` que no esté listado.
+Re-inventario **Fase 1E.0** (verificado contra código, no solo este archivo).
+La lista canónica ejecutable está en `tests/fase0/stock_writers.py`.
+El scanner (`tests/fase0/test_stock_writers.py` y `tests/fase1e`) falla si
+aparece un `UPDATE`/`INSERT` directo de `productos.stock` que no esté listado.
 
 **Ninguna de estas rutas es la autoridad futura.** Todas mutan la
 proyección local y (casi todas) encolan un snapshot LWW.
+`inventory_balances.quantity_scaled` es la autoridad online diseñada.
+`productos.stock` sigue legacy/LWW hasta el cutover único (1E.3).
+`APPLY_AUTHORITATIVE_EXCLUDE = False` (no cambiar en 1E.0).
+`INVENTORY_CUTOVER_ENABLED = False` (gateway creado; writers no lo llaman).
 
-## UPDATE / SET stock
+Clasificación:
 
-| # | Archivo | Función | Forma SQL | Kardex | Notas |
+- **NEGATIVO:** puede reducir stock
+- **POSITIVO:** solo aumenta (o INSERT ≥ 0)
+- **MIXTO:** puede sumar o restar
+- **DERIVADO:** no debería ser autoridad; proyecta/cachea/sincroniza
+- **UNKNOWN:** blocker; en 1E.0 hay **0**
+
+No hay `CREATE TRIGGER` sobre `productos`. `scripts/` no mutan stock.
+No hay importaciones masivas de stock.
+
+## Conteos 1E.0
+
+| Total | Negativos | Positivos | Mixtos | Derivados | Unknown |
 |---|---|---|---|---|---|
-| 1 | `repositories/compras_repo.py` | `ComprasRepository.crear_compra` | `stock = stock + ?` | `movimientos.ENTRADA_COMPRA` | Incremento directo. Encola fila `productos`. |
-| 2 | `repositories/compras_repo.py` | `ComprasRepository.eliminar_compra` | `stock = stock - ?` | reversa en `movimientos` | Sin piso `stock >=`. Código con cero llamadores de UI. |
-| 3 | `services/ventas_service.py` | crear venta | `stock = stock - ? WHERE stock >= ?` | `SALIDA_VENTA` | Guard local; no serializa dos SQLite. |
-| 4 | `services/ventas_service.py` | cancelar venta | `stock = stock + ?` | `ENTRADA_DEVOLUCION` | |
-| 5 | `services/ventas_service.py` | devolución | `stock = stock + ?` | `ENTRADA_DEVOLUCION` | `devoluciones` está fuera de `SYNC_TABLES`. |
-| 6 | `services/ventas_service.py` | `agregar_productos_a_factura` | `stock = stock - ?` **sin** `stock >=` | `SALIDA_VENTA` | Puede ir negativo. |
-| 7 | `repositories/productos_repo.py` | `actualizar_stock` | `SET stock = ?` (calculado) | ninguno | Writer genérico sumar/restar. |
-| 7b | `repositories/productos_repo.py` | `actualizar_producto` | `SET … stock = ?` (valor de ficha) | ninguno | Editar producto publica snapshot LWW del stock. |
-| 8 | `services/movimientos_service.py` | `registrar_movimiento` | `SET stock = ?` | `movimientos` | Incluye `ENTRADA_COMPRA`. |
-| 9 | `services/movimientos_service.py` | anular movimiento | `SET stock = ?` | observa anulación | |
-| 10 | `repositories/inventario_repository.py` | `registrar_movimiento` | `SET stock = ?` | `movimientos_inventario` | Segundo kardex. Incluye `ENTRADA_COMPRA`. |
-| 11 | `repositories/inventario_repository.py` | ajustar stock | `SET stock = ?` | `movimientos_inventario` | |
-| 12 | `repositories/inventario_repository.py` | `eliminar_movimiento` | `SET stock = ?` | borra `movimientos_inventario` | |
-| 13 | `services/mezclas_service.py` | descontar componentes | `stock = stock - ?` **sin** guard | `SALIDA_VENTA` (tipo reutilizado) | |
-| 14 | `local_server.py` | `create_sale` | `stock = stock - ?` **sin** `stock >=` | `SALIDA_VENTA` | POS LAN. |
-| 15 | `ui/dashboard_ui.py` | editar línea de factura | `stock = stock - ?` | no necesariamente | Writer en UI. |
-| 16 | `ui/dashboard_ui.py` | quitar línea de factura | `stock = stock + ?` | DELETE `movimientos` | Writer en UI. |
+| 22 | 5 | 5 | 8 | 4 | 0 |
 
-## Escritura de stock sin UPDATE (insert de producto)
+Directos (W01–W18) = 18. Derivados (D01–D04) = 4.
 
-| # | Archivo | Función | Notas |
+## Writers directos
+
+| ID | Archivo | Función | Tipo | Signo | TX | `productos.stock` | Movimiento | Outbox | Offline | Callers | Riesgo |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| W01 | `repositories/compras_repo.py` | `ComprasRepository.crear_compra` | POSITIVO | + | sí | `stock = stock + ?` | `movimientos.ENTRADA_COMPRA` | sí | sí | `ui/compras_ui.py` | Tercer camino de ingreso (INV-03). |
+| W02 | `repositories/compras_repo.py` | `ComprasRepository.eliminar_compra` | NEGATIVO | − | sí | `stock = stock - ?` sin `stock>=` | `SALIDA_AJUSTE` (asiento nuevo) | sí | sí | *ninguno en UI* | Puede ir negativo. Código vivo sin caller. |
+| W03 | `services/ventas_service.py` | `VentasService.registrar_venta` | NEGATIVO | − | sí | `stock = stock - ? WHERE stock >= ?` | `SALIDA_VENTA` | sí | sí | `ui/ventas_ui_modern.py` | Guard local; no serializa dos SQLite. Mezclas descuentan por aquí. |
+| W04 | `services/ventas_service.py` | `VentasService.cancelar_venta` | POSITIVO | + | sí | `stock = stock + ?` | `ENTRADA_DEVOLUCION` | sí | sí | *ninguno* | `ui/ventas_ui_modern.cancelar_venta` solo vacía el carrito. |
+| W05 | `services/ventas_service.py` | `VentasService.registrar_devolucion` | POSITIVO | + | sí | `stock = stock + ?` | `ENTRADA_DEVOLUCION` | sí | sí | *ninguno en UI* | `devoluciones` fuera de SYNC. |
+| W06 | `services/ventas_service.py` | `VentasService.agregar_productos_a_factura` | NEGATIVO | − | sí | `stock = stock - ?` **sin** `stock>=` | `SALIDA_VENTA` | sí | sí | `ventas_ui_modern`, `dashboard_ui` | Check previo no atómico; puede ir negativo. |
+| W07 | `repositories/productos_repo.py` | `ProductosRepository.actualizar_stock` | MIXTO | ± | sí | `SET stock = ?` | ninguno | sí | sí | *ninguno* | Sin kardex. Writer genérico. |
+| W08 | `repositories/productos_repo.py` | `ProductosRepository.actualizar_producto` | MIXTO | ± (ficha) | sí | `SET stock = ?` | ninguno | sí | sí | `ui/productos_ui.py` | Editar ficha publica LWW de stock. |
+| W09 | `repositories/productos_repo.py` | `ProductosRepository.crear_producto` | POSITIVO | + INSERT | sí | `INSERT … stock` | `ENTRADA_AJUSTE` si stock>0 | sí | sí | `ui/productos_ui.py` | SKU nuevo puede nacer con stock>0. |
+| W10 | `services/movimientos_service.py` | `MovimientosService.registrar_movimiento` | MIXTO | ± | sí | `SET stock = ?` | `movimientos` | sí | sí | `ui/movimientos_ui.py` | Incluye `ENTRADA_COMPRA` (INV-03). |
+| W11 | `services/movimientos_service.py` | `MovimientosService.anular_movimiento` | MIXTO | ± inverso | sí | `SET stock = ?` | marca `[ANULADO]` | sí | sí | *ninguno en UI* | Piso `<0` en Python. |
+| W12 | `repositories/inventario_repository.py` | `InventarioRepository.registrar_movimiento` | MIXTO | ± | sí | `SET stock = ?` | `movimientos_inventario` | sí | sí | `ui/entrada_inventario_ui.py` | Segundo kardex; incluye `ENTRADA_COMPRA`. |
+| W13 | `repositories/inventario_repository.py` | `InventarioRepository.ajustar_stock_directo` | MIXTO | ± | sí | `SET stock = ?` | `movimientos_inventario` ajuste | sí | sí | *ninguno en UI* | Pisa a un entero arbitrario. |
+| W14 | `repositories/inventario_repository.py` | `InventarioRepository.eliminar_movimiento` | MIXTO | ± inverso | sí | `SET stock = ?` | DELETE `movimientos_inventario` | sí | sí | *ninguno en UI* | Piso `<0` en Python. |
+| W15 | `services/mezclas_service.py` | `MezclasService.descontar_stock_mezcla` | NEGATIVO | − | sí | `stock = stock - ?` **sin** guard SQL | `SALIDA_VENTA` reutilizado | sí | sí | *ninguno* | UI de mezclas usa W03. Writer huérfano. |
+| W16 | `local_server.py` | `LocalFerreteriaAPI.create_sale` | NEGATIVO | − | sí | `stock = stock - ?` **sin** `stock>=` | `SALIDA_VENTA` | sí | sí | `local_api_client`, `remote_adapters` | POS LAN. Check previo no atómico. |
+| W17 | `ui/dashboard_ui.py` | `editar_producto_factura` | MIXTO | ± `dif_cant` | sí | `stock = stock - ?` | no | no | sí | self | Writer en UI. Sin kardex/outbox. |
+| W18 | `ui/dashboard_ui.py` | `eliminar_producto_factura` | POSITIVO | + | sí | `stock = stock + ?` | DELETE `movimientos` | no | sí | self | Writer en UI. Sin outbox. |
+
+## Sync que puede **pisar** stock sin vender (DERIVADO)
+
+| ID | Archivo | Función | Notas |
 |---|---|---|---|
-| 17 | `repositories/productos_repo.py` | `crear_producto` | `INSERT` con `producto.stock`. Si stock > 0 escribe `movimientos.ENTRADA_AJUSTE`. Viola “producto nuevo nace en 0” para el flujo de recepción futuro. |
+| D01 | `local_first_db.py` | `enqueue_entity` | Payload = `SELECT *` de `productos` (incluye `stock`). No hace `SET stock`. |
+| D02 | `local_sync.py` | `_upsert` / `build_remote_upsert_sql` | Push: `ON CONFLICT (local_id) DO UPDATE SET … stock=EXCLUDED.stock`. |
+| D03 | `local_sync.py` | `pull_from_remote` | Mismo patrón LWW sobre SQLite local. **Sí pisa** `productos.stock`. |
+| D04 | `repositories/_outbox.py` | `encolar()` / `encolar_borrado()` | No muta stock. Traga excepciones (INV-13). |
 
-## Sync que puede **pisar** stock sin vender
+## UI que dispara writers (no UPDATE directo)
 
-| # | Archivo | Función | Notas |
-|---|---|---|---|
-| 18 | `local_first_db.py` | `enqueue_entity` | Payload = `SELECT *` de `productos` (incluye `stock`). |
-| 19 | `local_sync.py` | `_upsert` (push) | `ON CONFLICT (local_id) DO UPDATE SET … stock=EXCLUDED.stock`. |
-| 20 | `local_sync.py` | `pull_from_remote` | Mismo patrón LWW sobre SQLite local. |
+- `ui/movimientos_ui.py` — alta con tipo `ENTRADA_COMPRA` → W10
+- `ui/entrada_inventario_ui.py` — combo incluye `ENTRADA_COMPRA` → W12
+- `ui/productos_ui.py` — `stock=stock_total` al crear/editar → W09 / W08
 
-## UI que ofrece `ENTRADA_COMPRA` (dispara writers 8 o 10)
+## Hallazgos de callers (1E.0)
 
-- `ui/movimientos_ui.py` — alta con tipo `ENTRADA_COMPRA`.
-- `ui/entrada_inventario_ui.py` — combo incluye `ENTRADA_COMPRA`.
+Métodos **sin caller de UI/producción** (siguen siendo writers; no se borran):
+
+- W02 `eliminar_compra`
+- W04 `VentasService.cancelar_venta` (el botón “cancelar” de POS vacía el carrito)
+- W05 `registrar_devolucion`
+- W07 `actualizar_stock`
+- W11 `anular_movimiento`
+- W13 `ajustar_stock_directo`
+- W14 `eliminar_movimiento`
+- W15 `descontar_stock_mezcla` (la venta de mezcla usa W03)
+
+## Dual authority — cómo se evita en 1E.0
+
+Mientras exista un writer que altere inventario solo vía `productos.stock`,
+**ningún** writer migrado puede entrar en modo autoritativo real de forma
+aislada. El gateway existe con cutover **OFF**. No hay dual-write
+(PostgreSQL APPLY + `UPDATE productos.stock` independiente). No hay shadow
+mutante. La activación será un **cutover único** en 1E.3.
+
+Tras APPLIED futuro, `productos.stock` sería proyección/caché reconstruible.
+Eso **no** está implementado en writers en 1E.0.
 
 ## Outbox
 
@@ -64,6 +109,7 @@ TX de stock.
 | `FK_MAP` | `local_sync.py` | Derivado: `fk_map()`. Traducción FKs. |
 | `TOPO_ORDER` | `local_sync.py` | Derivado: `topo_order()`. Orden de pull **usado**. |
 | `PULL_ORDER` | `local_sync.py` | Alias de `TOPO_ORDER`. Ya no es lista independiente. |
+| `COORDINATOR_REMOTE_TABLES` | `sync_registry.py` | `inventory_balances` y tablas de init. **No LWW. No SYNC_REGISTRY.** |
 
 `formulas_mezcla`, `formula_detalle`, `devoluciones` están fuera de sync
 (`NON_SYNC_TABLES`). `productos.stock` está declarado como proyección /
