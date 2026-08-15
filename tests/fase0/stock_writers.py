@@ -4,9 +4,9 @@
 El scanner de `test_stock_writers.py` (y `tests/fase1e`) falla si aparece un
 UPDATE/INSERT directo de `productos.stock` que no esté listado.
 
-Ninguna de estas rutas es la autoridad futura. Todas mutan la proyección
-local y (casi todas) encolan un snapshot LWW. Cutover 1E.2 = OFF.
-W01–W18 preparados (código listo, no activados).
+Ninguna de estas rutas es la autoridad futura. W01–W18 mutan la proyección
+local en legacy. D05 proyecta caché tras APPLIED. Cutover 1E.3 implementa
+el mecanismo; el default de fuente sigue OFF.
 """
 from __future__ import annotations
 
@@ -359,7 +359,7 @@ STOCK_WRITERS: Tuple[dict, ...] = (
         "outbox": False,
         "offline_possible": False,
         "callers": ("local_sync.py",),
-        "risk": "Pisa stock remoto. APPLY_AUTHORITATIVE_EXCLUDE sigue False.",
+        "risk": "Pisa stock remoto en PRE_CUTOVER. En AUTHORITATIVE se excluye stock del UPSERT.",
         "kind": "derived",
     },
     {
@@ -395,6 +395,24 @@ STOCK_WRITERS: Tuple[dict, ...] = (
         "callers": ("repositories/*.py", "services/*.py"),
         "risk": "Fallo de cola no aborta la TX de stock (INV-13).",
         "kind": "derived",
+    },
+    {
+        "id": "D05",
+        "file": "inventory_cutover.py",
+        "function": "project_local_stock",
+        "business": "proyección post-APPLY de inventory_balances",
+        "sign": "n/a",
+        "classification": "DERIVADO",
+        "sql": "UPDATE productos SET stock = ? WHERE local_id = ?",
+        "transaction": False,
+        "updates_productos_stock": True,
+        "kardex": None,
+        "outbox": False,
+        "offline_possible": False,
+        "callers": ("inventory_gateway.py",),
+        "risk": "Caché reconstruible. No es autoridad. No participa LWW post-cutover.",
+        "kind": "derived",
+        "scan_sql": True,
     },
 )
 
@@ -444,6 +462,10 @@ INSERT_STOCK_FILES: FrozenSet[str] = frozenset(
 )
 
 DIRECT_STOCK_WRITER_FILES: FrozenSet[str] = UPDATE_STOCK_FILES | INSERT_STOCK_FILES
+
+PROJECTION_STOCK_FILES: FrozenSet[str] = frozenset(
+    w["file"] for w in STOCK_WRITERS if w.get("scan_sql")
+)
 
 # Publicación LWW del snapshot de stock.
 SYNC_STOCK_SNAPSHOT_FILES: FrozenSet[str] = frozenset(

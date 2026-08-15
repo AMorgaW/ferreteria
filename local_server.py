@@ -431,12 +431,30 @@ class LocalFerreteriaAPI(BaseHTTPRequestHandler):
         if not items:
             return json_response(self, 400, {"error": "La venta no tiene productos"})
 
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
+        from inventory_ledger import get_inventory_command_or_none
 
-        command_id = inventory_command_id or data.get("inventory_command_id")
-        # inventory_mode solo por inyección de test/kwargs. El body HTTP no
-        # puede activar autoridad writer-por-writer (cutover único = 1E.3).
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        requested = inventory_command_id
+        http_id = data.get("inventory_command_id")
+        conn = connect(self.db_path)
+        try:
+            mode, frozen = resolve_writer_mode_or_frozen(
+                inventory_mode, sqlite_conn=conn,
+                connection_factory=inventory_connection_factory,
+            )
+            if requested is None and http_id:
+                try:
+                    existing_requested = get_inventory_command_or_none(conn, http_id)
+                except Exception:
+                    existing_requested = None
+                if existing_requested is not None:
+                    requested = http_id
+        finally:
+            conn.close()
+        if frozen:
+            return json_response(self, 503, {"error": frozen, "retryable": False})
+        command_id = requested
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return LocalFerreteriaAPI._create_sale_authoritative(
                 self,
                 user,
@@ -594,7 +612,11 @@ class LocalFerreteriaAPI(BaseHTTPRequestHandler):
                 enqueue_sync(conn, "inventory_movement", mov_id, "create", mov_payload, "movimientos")
                 movements.append(mov_payload)
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             return json_response(
                 self,
                 201,
@@ -622,8 +644,6 @@ class LocalFerreteriaAPI(BaseHTTPRequestHandler):
         inventory_transport,
         inventory_connection_factory,
     ):
-        import uuid as _uuid
-
         from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
         from inventory_ledger import QuantityScaleError, UnknownProductError
         from inventory_writer_support import (
@@ -633,6 +653,12 @@ class LocalFerreteriaAPI(BaseHTTPRequestHandler):
             build_negative_operations,
             unknown_writer_message,
         )
+        from inventory_cutover import (
+            ACT_KIND_LAN_SALE,
+            begin_or_resume_open_act,
+            complete_open_act,
+            sale_items_fingerprint,
+        )
 
         metodo_pago = data.get("metodo_pago") or "EFECTIVO"
         cliente_id = data.get("cliente_id")
@@ -641,8 +667,20 @@ class LocalFerreteriaAPI(BaseHTTPRequestHandler):
         if descuento < 0:
             return json_response(self, 400, {"error": "El descuento no puede ser negativo"})
 
-        command_id = inventory_command_id or str(_uuid.uuid4())
+        lan_fp = sale_items_fingerprint(items)
+        used_open_act = not inventory_command_id
         conn = connect(self.db_path)
+        if used_open_act:
+            command_id = begin_or_resume_open_act(
+                conn, ACT_KIND_LAN_SALE, fingerprint=lan_fp
+            )
+        else:
+            command_id = inventory_command_id
+
+        def _finish_open_act():
+            if used_open_act:
+                complete_open_act(conn, ACT_KIND_LAN_SALE, fingerprint=lan_fp)
+
         try:
             product_ids = sorted({int(item["producto_id"]) for item in items})
             placeholders = ",".join("?" for _ in product_ids)
@@ -721,6 +759,7 @@ class LocalFerreteriaAPI(BaseHTTPRequestHandler):
                 )
 
             if result.outcome == OUTCOME_REJECTED:
+                _finish_open_act()
                 return json_response(
                     self,
                     409,
@@ -764,6 +803,7 @@ class LocalFerreteriaAPI(BaseHTTPRequestHandler):
                             (venta_payload["numero_factura"],),
                         ).fetchall()
                     ]
+                    _finish_open_act()
                     return json_response(
                         self,
                         201,
@@ -868,6 +908,7 @@ class LocalFerreteriaAPI(BaseHTTPRequestHandler):
                 movements.append(mov_payload)
 
             conn.commit()
+            _finish_open_act()
             return json_response(
                 self,
                 201,

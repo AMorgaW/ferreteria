@@ -56,6 +56,44 @@ FK_MAP = fk_map()
 TOPO_ORDER = topo_order()
 
 
+def _lww_excluded_fields(local, table, remote=None):
+    """Tras AUTHORITATIVE, productos.stock no viaja como autoridad LWW.
+
+    Si el estado global no se puede leer mientras hay remoto, fail-closed:
+    no publica ni pisa stock. Metadata sí puede seguir.
+    """
+    from sync_registry import declared_authoritative_exclude, fields_excluded_from_authoritative_write
+
+    try:
+        from inventory_cutover import (
+            CutoverStateUnavailableError,
+            observe_cutover_state,
+        )
+        from schema_bootstrap import is_sqlite_connection
+
+        pg_conn = None
+        if remote is not None and not is_sqlite_connection(remote):
+            pg_conn = remote
+        require_remote = pg_conn is not None
+        if local is not None:
+            try:
+                state = observe_cutover_state(
+                    local,
+                    pg_conn=pg_conn,
+                    require_remote=require_remote,
+                )
+            except CutoverStateUnavailableError:
+                return set(declared_authoritative_exclude(table))
+            if state.is_authoritative:
+                return set(declared_authoritative_exclude(table))
+    except Exception:
+        if remote is not None:
+            from sync_registry import declared_authoritative_exclude as _decl
+
+            return set(_decl(table))
+    return set(fields_excluded_from_authoritative_write(table))
+
+
 def build_remote_upsert_sql(table, columns):
     """UPSERT remoto por local_id. RETURNING usa la PK declarada en el registry.
 
@@ -654,6 +692,8 @@ class SupabaseSyncService:
                     remote_id_val = r.get("id") if has_surrogate_integer_pk(table) else None
                     campos = {k: v for k, v in r.items()
                               if k in cols_local and k != "id"}
+                    for field in _lww_excluded_fields(local, table, remote):
+                        campos.pop(field, None)
                     if "remote_id" in cols_local and remote_id_val is not None:
                         campos["remote_id"] = str(remote_id_val)
                     if "local_id" not in campos:
@@ -689,6 +729,8 @@ class SupabaseSyncService:
                     ph = ",".join(["?"] * len(cols))
                     collist = ",".join(cols)
                     upd = ",".join([f"{c}=excluded.{c}" for c in cols if c != "local_id"])
+                    if not upd:
+                        upd = "local_id=excluded.local_id"
                     sql = (f"INSERT INTO {table} ({collist}) VALUES ({ph}) "
                            f"ON CONFLICT(local_id) DO UPDATE SET {upd}")
                     try:
@@ -827,6 +869,8 @@ class SupabaseSyncService:
 
         # Excluir el id local surrogate. La PK de negocio (clave) SÍ viaja.
         clean = {k: v for k, v in payload.items() if v is not None and k != "id"}
+        for field in _lww_excluded_fields(local, table, remote):
+            clean.pop(field, None)
         if "local_id" not in clean:
             return None  # sin local_id no hay identidad (no debería pasar tras Fase 1)
         columns = list(clean.keys())

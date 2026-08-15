@@ -18,6 +18,7 @@ from tests.fase0.stock_writers import (
     INSERT_STOCK_FILES,
     NEGATIVE_WRITER_IDS,
     PRE_CUTOVER_SQL_ALLOWED,
+    PROJECTION_STOCK_FILES,
     STOCK_WRITERS,
     UNTRACKED_DIRECT_WRITER,
     UPDATE_STOCK_FILES,
@@ -29,16 +30,18 @@ class Fase1EScannerTest(unittest.TestCase):
         self.assertEqual(CLASSIFICATION_COUNTS["NEGATIVO"], 5)
         self.assertEqual(CLASSIFICATION_COUNTS["POSITIVO"], 5)
         self.assertEqual(CLASSIFICATION_COUNTS["MIXTO"], 8)
-        self.assertEqual(CLASSIFICATION_COUNTS["DERIVADO"], 4)
+        self.assertEqual(CLASSIFICATION_COUNTS["DERIVADO"], 5)
         self.assertEqual(CLASSIFICATION_COUNTS["UNKNOWN"], 0)
-        self.assertEqual(len(STOCK_WRITERS), 22)
+        self.assertEqual(len(STOCK_WRITERS), 23)
         self.assertEqual(len(UPDATE_STOCK_FILES), 7)
         self.assertEqual(INSERT_STOCK_FILES, frozenset({"repositories/productos_repo.py"}))
         self.assertEqual(len(DIRECT_STOCK_WRITER_FILES), 7)
 
     def test_scan_no_deja_archivos_fuera(self):
         update_found, insert_found, _ = _scan_direct_stock_files()
-        extra = (update_found | insert_found) - DIRECT_STOCK_WRITER_FILES
+        extra = (update_found | insert_found) - (
+            DIRECT_STOCK_WRITER_FILES | PROJECTION_STOCK_FILES
+        )
         missing_update = UPDATE_STOCK_FILES - update_found
         missing_insert = INSERT_STOCK_FILES - insert_found
         self.assertFalse(extra, msg=f"writers no inventariados: {sorted(extra)}")
@@ -48,7 +51,7 @@ class Fase1EScannerTest(unittest.TestCase):
         self.assertFalse(
             missing_insert, msg=f"INSERT citados sin match: {sorted(missing_insert)}"
         )
-        self.assertEqual(len(STOCK_WRITERS), 22)
+        self.assertEqual(len(STOCK_WRITERS), 23)
 
     def test_scanner_funcion_negativos_legacy_allowed(self):
         hits = scan_stock_writes_by_function()

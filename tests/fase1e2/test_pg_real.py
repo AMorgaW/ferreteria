@@ -47,6 +47,18 @@ class Fase1E2PostgresTest(unittest.TestCase):
 
     def setUp(self):
         self.pg = connect()
+        try:
+            with self.pg.cursor() as cur:
+                cur.execute(
+                    "UPDATE inventory_cutover_control SET status = 'PRE_CUTOVER', "
+                    "epoch = 0 WHERE id = 1"
+                )
+            self.pg.commit()
+        except Exception:
+            try:
+                self.pg.rollback()
+            except Exception:
+                pass
 
     def tearDown(self):
         try:

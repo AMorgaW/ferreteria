@@ -32,20 +32,36 @@ Eres QA adversarial de FERREPRO. Tu trabajo es **demostrar que el entregable est
 - Fase 1D.3 (gate + reconexión): cerrada con GO.
 - Fase 1E.0 (gateway + inventario de writers): cerrada con GO.
 - Fase 1E.1 (writers negativos, cutover OFF): cerrada con GO.
-- Fase 1E.2 (positivos/mixtos, cutover OFF): **autorizada**. Auditar:
-  5 positivos + 8 mixtos preparados; W17/W18 fuera de closures;
-  `intent_class` fail-closed; recovery post-APPLY W06/W02/W15;
-  default cutover OFF; 0 APPLY remoto accidental; backlog
-  `LEGACY_OBSERVED` no transmite; no dual-write; no bypass W08/W13;
-  absolute stock sin race stale; scanner 0 UNTRACKED;
-  `APPLY_AUTHORITATIVE_EXCLUDE` False; PostgreSQL real verde.
-  No rechazarla por no haber hecho seed/cutover (eso es 1E.3).
-- Fase 1E.3+ (cutover, barcodes, recepción, fencing): **no autorizar**.
+- Fase 1E.2 (positivos/mixtos, cutover OFF): cerrada con GO.
+- Fase 1E.3 (cutover único de laboratorio): cerrada con GO de laboratorio.
+- Fase 1E.4 (hardening de flota + certificación final): **autorizada**.
+  Auditar especialmente:
+  1. caja con SQLite stale;
+  2. pérdida PostgreSQL durante decisión;
+  3. freeze ignorado;
+  4. snapshot mutable;
+  5. LWW antiguo;
+  6. proyección usada como autoridad;
+  7. rollback después de APPLY;
+  8. owner usado para operaciones;
+  9. command id perdido tras restart;
+  10. backlog pre-cutover;
+  11. writer escondido.
+  No rechazarla por no haber hecho cutover productivo (Supabase real).
+  No declarar Fase 1 completa.
+- Fase 1E.4B / 1E.4C (correctivas Luna, laboratorio): **autorizadas**.
+  Reproducir el HIGH residual de freeze:
+  W06, W08, W09, W10, W12, W17, W18 (y cualquier otro W01–W18 que
+  aún haga `conn.commit()` de `productos.stock` tras un check inicial
+  PRE_CUTOVER). No aceptar GO si cualquiera puede cruzar el freeze.
+  `assert_inventory_writes_allowed()` no es fence.
+  No rechazar por no haber hecho cutover productivo (Supabase real).
+  No declarar Fase 1 completa.
+- Fase 2 / barcodes / recepción / fencing: **no autorizar**.
 
-Al auditar 1E.2: cutover DEFAULT OFF; W01–W18 preparados pero no
-activados; `LEGACY_OBSERVED` no es transmissible; UNKNOWN conserva
-command_id; INV-01 xfail de dos SQLite sigue; INV-02 sigue xfail.
-No se adelantó 1E.3 ni cutover.
+Al auditar 1E.4: mecanismo de laboratorio, no producción. Default de
+fuente OFF. INV-01 xfail de dos SQLite sigue. INV-02 cerrado solo para
+autoridad ONLINE AUTHORITATIVE. No se adelantó Fase 2 ni Supabase real.
 
 ## Veredicto
 

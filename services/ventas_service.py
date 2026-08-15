@@ -119,9 +119,15 @@ class VentasService:
         if not usuario_id:
             return False, "Error: Usuario no autenticado. No se puede registrar venta", None
 
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen, None
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._registrar_venta_authoritative(
                 items,
                 cliente_id=cliente_id,
@@ -301,7 +307,11 @@ class VentasService:
                 enqueue_sync(conn, "customer", cliente_id, "update",
                              cliente_payload, "clientes")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             conn.close()
 
             if hasattr(self.productos_repo, 'invalidar_cache'):
@@ -344,8 +354,6 @@ class VentasService:
         inventory_connection_factory,
     ) -> Tuple[bool, str, Optional[Venta]]:
         """Camino futuro: un InventoryCommand por venta. Sin UPDATE productos.stock."""
-        import uuid as _uuid
-
         from inventory_gateway import (
             OUTCOME_APPLIED,
             OUTCOME_REJECTED,
@@ -361,12 +369,29 @@ class VentasService:
         from inventory_ledger import QuantityScaleError, UnknownProductError
 
         usuario_id = self.auth.usuario_actual.id if self.auth.usuario_actual else None
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
-
         conn = self.db.conectar()
         cursor = conn.cursor()
+        used_open_act = inventory_command_id is None
+        command_id = None
+
+        def _finish_open_act(sqlite_conn):
+            if not used_open_act:
+                return
+            from inventory_cutover import ACT_KIND_POS_CHECKOUT, complete_open_act
+
+            complete_open_act(sqlite_conn, ACT_KIND_POS_CHECKOUT)
+
         try:
+            if used_open_act:
+                from inventory_cutover import (
+                    ACT_KIND_POS_CHECKOUT,
+                    begin_or_resume_open_act,
+                )
+
+                command_id = begin_or_resume_open_act(conn, ACT_KIND_POS_CHECKOUT)
+            else:
+                command_id = inventory_command_id
+            self.last_inventory_command_id = command_id
             producto_ids = sorted({item['producto_id'] for item in items})
             placeholders = ",".join("?" for _ in producto_ids)
             cursor.execute(
@@ -444,6 +469,7 @@ class VentasService:
 
             self.last_gateway_result = result
             if result.outcome == OUTCOME_REJECTED:
+                _finish_open_act(conn)
                 conn.close()
                 return False, (
                     result.error or "Inventario rechazado por el coordinador"
@@ -468,6 +494,7 @@ class VentasService:
                     (bound_id,),
                 ).fetchone()
                 if row:
+                    _finish_open_act(conn)
                     conn.close()
                     venta = Venta(
                         id=row["id"],
@@ -587,7 +614,9 @@ class VentasService:
                              cliente_payload, "clientes")
 
             conn.commit()
+            _finish_open_act(conn)
             conn.close()
+
 
             if hasattr(self.productos_repo, 'invalidar_cache'):
                 self.productos_repo.invalidar_cache()
@@ -739,9 +768,15 @@ class VentasService:
         No confundir con ui/ventas_ui_modern.cancelar_venta, que solo vacía
         el carrito y no llama este método. W04 permanece preparado; no se borra.
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._cancelar_venta_authoritative(
                 venta_id,
                 motivo,
@@ -837,7 +872,11 @@ class VentasService:
             except Exception as _sync_exc:
                 print(f"[SYNC] No se pudo encolar la cancelacion: {_sync_exc}")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             
             # Registrar auditoría
             if self.auth.usuario_actual:
@@ -884,11 +923,18 @@ class VentasService:
         venta = self.obtener_venta(venta_id)
         if not venta:
             return False, "Venta no encontrada"
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
+        from inventory_cutover import ACT_KIND_SALE_CANCEL
+        from inventory_writer_support import durable_act_command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_SALE_CANCEL,
+                act_key=str(venta_id),
+                explicit_command_id=inventory_command_id,
+            )
+            self.last_inventory_command_id = command_id
             already = command_already_applied(conn, command_id)
             if venta['estado'] == 'CANCELADA':
                 conn.close()
@@ -1038,9 +1084,15 @@ class VentasService:
         registra kardex (ENTRADA_DEVOLUCION), auditoría y sincronización.
         Valida: no devolver más de lo vendido ni duplicar devoluciones.
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen, None
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._registrar_devolucion_authoritative(
                 venta_id,
                 items,
@@ -1166,7 +1218,11 @@ class VentasService:
             from local_first_db import enqueue_entity as _eq
             _eq(conn, "audit_log", cursor.lastrowid, "create", "auditoria")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             conn.close()
 
             if hasattr(self.productos_repo, 'invalidar_cache'):
@@ -1216,8 +1272,6 @@ class VentasService:
         if not usuario_id:
             return False, "Error: Usuario no autenticado", None
 
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         vendido, precio, nombre = {}, {}, {}
         for d in venta['detalles']:
             pid = d['producto_id']
@@ -1228,6 +1282,16 @@ class VentasService:
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            from inventory_cutover import ACT_KIND_RETURN
+            from inventory_writer_support import durable_act_command_id
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_RETURN,
+                fingerprint=f"{venta_id}:{repr(sorted((i.get('producto_id'), str(i.get('cantidad'))) for i in (items or [])))}",
+                explicit_command_id=inventory_command_id,
+                open_act=True,
+            )
+            self.last_inventory_command_id = command_id
             already = command_already_applied(conn, command_id)
             marked = find_rows_marked_for_command(conn, command_id, table="movimientos")
             if already is not None and marked:
@@ -1389,9 +1453,15 @@ class VentasService:
         if not nuevos_items:
             return False, "No hay productos para agregar"
 
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._agregar_productos_a_factura_authoritative(
                 venta_id,
                 nuevos_items,
@@ -1552,7 +1622,11 @@ class VentasService:
                 if _pr:
                     enqueue_sync(conn, "product", detalle['producto_id'], "update", dict(_pr), "productos")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
 
             # Registrar auditoría
             if self.auth.usuario_actual:
@@ -1584,7 +1658,8 @@ class VentasService:
         import uuid as _uuid
 
         from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
-        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_cutover import ACT_KIND_INVOICE_LINE_ADD
+        from inventory_ledger import IdempotencyConflictError, QuantityScaleError, UnknownProductError
         from inventory_writer_support import (
             DOCUMENTO_TIPO_VENTA,
             MissingProductLocalIdError,
@@ -1592,23 +1667,22 @@ class VentasService:
             build_negative_operations,
             command_already_applied,
             command_motivo_marker,
+            durable_act_command_id,
             find_rows_marked_for_command,
             unknown_writer_message,
         )
 
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
-            already = command_already_applied(conn, command_id)
-            if already is not None:
-                marked = find_rows_marked_for_command(
-                    conn, command_id, table="movimientos"
-                )
-                if marked:
-                    conn.close()
-                    return True, "Productos agregados exitosamente (comando ya APPLIED)"
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_INVOICE_LINE_ADD,
+                fingerprint=f"{venta_id}:{repr(sorted((i.get('producto_id'), str(i.get('cantidad')), str(i.get('precio_unitario'))) for i in nuevos_items))}",
+                explicit_command_id=inventory_command_id,
+                open_act=True,
+            )
+            self.last_inventory_command_id = command_id
 
             cursor.execute('''
                 SELECT id, numero_factura, metodo_pago, total, estado_pago, cliente_id, local_id
@@ -1648,18 +1722,37 @@ class VentasService:
                 })
                 total_nuevo += subtotal
 
-            if already is None:
-                try:
-                    operations = build_negative_operations(
-                        conn, nuevos_items, command_id=command_id
-                    )
-                except MissingProductLocalIdError as exc:
-                    conn.close()
-                    return False, str(exc)
-                except (QuantityScaleError, UnknownProductError) as exc:
-                    conn.close()
-                    return False, str(exc)
+            try:
+                operations = build_negative_operations(
+                    conn, nuevos_items, command_id=command_id
+                )
+                already = command_already_applied(
+                    conn,
+                    command_id,
+                    tipo="VENTA",
+                    operations=operations,
+                    documento_tipo=DOCUMENTO_TIPO_VENTA,
+                    documento_local_id=venta["local_id"],
+                )
+            except IdempotencyConflictError as exc:
+                conn.close()
+                return False, str(exc)
+            except MissingProductLocalIdError as exc:
+                conn.close()
+                return False, str(exc)
+            except (QuantityScaleError, UnknownProductError) as exc:
+                conn.close()
+                return False, str(exc)
 
+            if already is not None:
+                marked = find_rows_marked_for_command(
+                    conn, command_id, table="movimientos"
+                )
+                if marked:
+                    conn.close()
+                    return True, "Productos agregados exitosamente (comando ya APPLIED)"
+
+            if already is None:
                 gw = bind_inventory_gateway(
                     conn,
                     gateway=inventory_gateway,
@@ -1795,9 +1888,15 @@ class VentasService:
         inventory_connection_factory=None,
     ) -> Tuple[bool, str]:
         """W17: editar cantidad/precio de una línea de factura. MIXTO."""
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._editar_linea_factura_authoritative(
                 venta_id, detalle_id, nueva_cantidad, nuevo_precio,
                 inventory_command_id=inventory_command_id,
@@ -1833,7 +1932,14 @@ class VentasService:
                 "UPDATE ventas SET total = total + ?, subtotal = subtotal + ? WHERE id = ?",
                 (dif_subtotal, dif_subtotal, venta_id),
             )
-            conn.commit()
+            if dif_cant != 0:
+                from inventory_cutover import commit_legacy_inventory
+
+                commit_legacy_inventory(
+                    conn, connection_factory=inventory_connection_factory
+                )
+            else:
+                conn.commit()
             conn.close()
             return True, "Producto actualizado"
         except Exception as e:
@@ -1849,19 +1955,25 @@ class VentasService:
         inventory_command_id, inventory_gateway, inventory_transport,
         inventory_connection_factory,
     ) -> Tuple[bool, str]:
-        import uuid as _uuid
+        from inventory_cutover import ACT_KIND_INVOICE_LINE_EDIT
         from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
-        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_ledger import IdempotencyConflictError, QuantityScaleError, UnknownProductError
         from inventory_writer_support import (
             DOCUMENTO_TIPO_VENTA, NO_INVENTORY_CHANGE, MissingProductLocalIdError,
             bind_inventory_gateway, build_signed_operations, command_already_applied,
-            unknown_writer_message,
+            durable_act_command_id, unknown_writer_message,
         )
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_INVOICE_LINE_EDIT,
+                fingerprint=f"{venta_id}:{detalle_id}:{nueva_cantidad}:{nuevo_precio}",
+                explicit_command_id=inventory_command_id,
+                open_act=True,
+            )
+            self.last_inventory_command_id = command_id
             detalle = cursor.execute(
                 "SELECT * FROM detalle_ventas WHERE id = ? AND venta_id = ?",
                 (detalle_id, venta_id),
@@ -1877,44 +1989,65 @@ class VentasService:
             subtotal_anterior = detalle["subtotal"]
             nuevo_subtotal = nueva_cantidad * nuevo_precio
             dif_cant = nueva_cantidad - cant_anterior
-            already = command_already_applied(conn, command_id)
-            if already is None and dif_cant != 0:
-                try:
+            operations = []
+            try:
+                if dif_cant != 0:
                     operations = build_signed_operations(
                         conn,
                         [{"producto_id": detalle["producto_id"], "delta": -dif_cant}],
                         command_id=command_id,
                     )
-                except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
-                    conn.close()
-                    return False, str(exc)
+                already = None
                 if operations:
-                    gw = bind_inventory_gateway(
-                        conn, gateway=inventory_gateway, transport=inventory_transport,
-                        connection_factory=inventory_connection_factory, cutover_enabled=True,
+                    already = command_already_applied(
+                        conn,
+                        command_id,
+                        tipo="AJUSTE",
+                        operations=operations,
+                        documento_tipo=DOCUMENTO_TIPO_VENTA,
+                        documento_local_id=(
+                            venta["local_id"] if "local_id" in venta.keys() else None
+                        ),
                     )
-                    try:
-                        result = gw.submit(
-                            tipo="AJUSTE", operations=operations, command_id=command_id,
-                            documento_tipo=DOCUMENTO_TIPO_VENTA,
-                            documento_local_id=venta["local_id"] if "local_id" in venta.keys() else None,
-                            device_id=None,
-                            usuario_id=self.auth.usuario_actual.id if self.auth.usuario_actual else None,
-                        )
-                    except Exception as exc:
-                        conn.close()
-                        return False, unknown_writer_message(command_id, str(exc))
-                    self.last_gateway_result = result
-                    if result.outcome == OUTCOME_REJECTED:
-                        conn.close()
-                        return False, result.error or "Inventario rechazado por el coordinador"
-                    if result.outcome != OUTCOME_APPLIED:
-                        conn.close()
-                        return False, unknown_writer_message(result.command_id, result.error or result.outcome)
-                else:
-                    self.last_gateway_result = NO_INVENTORY_CHANGE
+            except IdempotencyConflictError as exc:
+                conn.close()
+                return False, str(exc)
+            except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+                conn.close()
+                return False, str(exc)
+            if already is None and operations:
+                gw = bind_inventory_gateway(
+                    conn, gateway=inventory_gateway, transport=inventory_transport,
+                    connection_factory=inventory_connection_factory, cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo="AJUSTE", operations=operations, command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_VENTA,
+                        documento_local_id=venta["local_id"] if "local_id" in venta.keys() else None,
+                        device_id=None,
+                        usuario_id=self.auth.usuario_actual.id if self.auth.usuario_actual else None,
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc))
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador"
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(result.command_id, result.error or result.outcome)
             elif already is None:
                 self.last_gateway_result = NO_INVENTORY_CHANGE
+            elif already is not None and operations:
+                stored_delta = int(already.operations[0].delta_scaled) if already.operations else None
+                new_delta = int(operations[0]["delta_scaled"])
+                if stored_delta is not None and stored_delta != new_delta:
+                    conn.close()
+                    return False, (
+                        f"command_id {command_id} ya APPLIED con payload distinto"
+                    )
             cursor.execute(
                 "UPDATE detalle_ventas SET cantidad = ?, precio_unitario = ?, subtotal = ? WHERE id = ?",
                 (nueva_cantidad, nuevo_precio, nuevo_subtotal, detalle_id),
@@ -1946,9 +2079,15 @@ class VentasService:
         inventory_connection_factory=None,
     ) -> Tuple[bool, str]:
         """W18: quitar una línea de factura y restituir stock. POSITIVO."""
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._eliminar_linea_factura_authoritative(
                 venta_id, detalle_id,
                 inventory_command_id=inventory_command_id,
@@ -1998,7 +2137,11 @@ class VentasService:
                 "UPDATE ventas SET total = total - ?, subtotal = subtotal - ? WHERE id = ?",
                 (sub, sub, venta_id),
             )
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             conn.close()
             return True, "Producto eliminado"
         except Exception as e:
@@ -2013,19 +2156,24 @@ class VentasService:
         self, venta_id, detalle_id, *, inventory_command_id, inventory_gateway,
         inventory_transport, inventory_connection_factory,
     ) -> Tuple[bool, str]:
-        import uuid as _uuid
+        from inventory_cutover import ACT_KIND_INVOICE_LINE_DELETE
         from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
         from inventory_ledger import QuantityScaleError, UnknownProductError
         from inventory_writer_support import (
             DOCUMENTO_TIPO_VENTA, MissingProductLocalIdError,
             bind_inventory_gateway, build_positive_operations, command_already_applied,
-            unknown_writer_message,
+            durable_act_command_id, unknown_writer_message,
         )
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_INVOICE_LINE_DELETE,
+                act_key=f"{venta_id}:{detalle_id}",
+                explicit_command_id=inventory_command_id,
+            )
+            self.last_inventory_command_id = command_id
             detalle = cursor.execute(
                 "SELECT * FROM detalle_ventas WHERE id = ? AND venta_id = ?",
                 (detalle_id, venta_id),

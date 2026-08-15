@@ -665,21 +665,32 @@ def fetch_inventory_balance(conn, producto_local_id: str) -> Optional[int]:
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT quantity_scaled FROM public.inventory_balances "
-                "WHERE producto_local_id = %s",
+                "SELECT public.fetch_inventory_balance(%s)",
                 (producto_local_id,),
             )
             row = cur.fetchone()
-        # psycopg2 abre una transacción incluso para SELECT. Como este adapter
-        # exige recibir una conexión idle, se cierra aquí sin confirmar nada.
         conn.rollback()
     except Exception:
         try:
             conn.rollback()
         except Exception:
             pass
-        raise
-    if row is None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT quantity_scaled FROM public.inventory_balances "
+                    "WHERE producto_local_id = %s",
+                    (producto_local_id,),
+                )
+                row = cur.fetchone()
+            conn.rollback()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+    if row is None or row[0] is None:
         return None
     return int(row[0])
 

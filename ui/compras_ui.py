@@ -17,6 +17,7 @@ from ui_config import COLORS, FONTS, make_font
 from ui.widgets import ShadowCard, KpiCard, ActionButton
 from models import Abono
 from datetime import datetime
+from repositories.compras_repo import registrar_compra_desde_ui
 
 
 class AutocompleteEntry(QWidget):
@@ -1943,7 +1944,8 @@ class FormularioCompra(QDialog):
             if ret != QMessageBox.Yes:
                 return
 
-            exito, mensaje, compra_id = self.compras_repo.crear_compra(
+            exito, mensaje, compra_id = registrar_compra_desde_ui(
+                self.compras_repo,
                 proveedor_id=proveedor_id,
                 productos=productos,
                 numero_factura=numero_factura,

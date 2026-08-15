@@ -25,7 +25,15 @@ POSTGRES_SKIP_REASON = (
 
 
 def postgres_dsn() -> str:
-    return (os.environ.get("FERREPRO_PG_TEST_DSN") or "").strip()
+    current = (os.environ.get("FERREPRO_PG_TEST_DSN") or "").strip()
+    if current:
+        return current
+    try:
+        from tests.fase1e1.pg_dsn import ensure_pg_test_dsn
+
+        return (ensure_pg_test_dsn() or "").strip()
+    except Exception:
+        return ""
 
 
 def postgres_available() -> bool:
@@ -166,6 +174,10 @@ def apply_coordinator_schema(conn) -> None:
         )
     apply_postgres_ledger_sql(conn, postgres_ledger_sql())
     apply_postgres_coordinator_sql(conn, postgres_coordinator_sql())
+    from inventory_cutover import postgres_cutover_sql
+
+    with conn.cursor() as cur:
+        cur.execute(postgres_cutover_sql())
     conn.commit()
 
 

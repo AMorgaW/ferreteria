@@ -1,23 +1,23 @@
 # Writers actuales de `productos.stock`
 
 Re-inventario **Fase 1E.0** (verificado contra código). Writers negativos **preparados en 1E.1**; positivos y mixtos **preparados
-en 1E.2** (código listo, cutover OFF). La lista canónica
-ejecutable está en `tests/fase0/stock_writers.py`.
+en 1E.2** (código listo). 1E.3 implementa el cutover único en laboratorio. 1E.4 endurece el control
+de flota PostgreSQL, fail-closed y snapshot reconciliado. Ver [FASE1E4.md](FASE1E4.md).
+La lista canónica ejecutable está en `tests/fase0/stock_writers.py`.
 El scanner (`tests/fase0/test_stock_writers.py`, `tests/fase1e`,
-`tests/fase1e2`) falla si aparece un `UPDATE`/`INSERT` directo de
+`tests/fase1e2`, `tests/fase1e3`) falla si aparece un `UPDATE`/`INSERT` directo de
 `productos.stock` que no esté listado, ahora a **nivel función + SQL**.
+1E.4B cierra hallazgos Luna del freeze/identidad; ver [FASE1E4B.md](FASE1E4B.md).
+1E.4C cierra el HIGH residual de freeze (fleet fence); ver [FASE1E4C.md](FASE1E4C.md).
 
-Cutover OFF: el SQL legacy de writers inventariados es
-`LEGACY_ALLOWED_PRE_CUTOVER`. Un UPDATE en una función no inventariada es
-`UNTRACKED_DIRECT_WRITER`.
+El default de fuente sigue OFF (`INVENTORY_CUTOVER_ENABLED = False`).
+La autoridad ONLINE se activa por estado persistente `AUTHORITATIVE`,
+no por esa constante. `APPLY_AUTHORITATIVE_EXCLUDE` sigue `False` en
+fuente; en AUTHORITATIVE el runtime excluye `productos.stock` del LWW.
 
-**Ninguna de estas rutas es la autoridad futura.** Todas mutan la
-proyección local y (casi todas) encolan un snapshot LWW.
-`inventory_balances.quantity_scaled` es la autoridad online diseñada.
-`productos.stock` sigue legacy/LWW hasta el cutover único (1E.3).
-`APPLY_AUTHORITATIVE_EXCLUDE = False` (no cambiar en 1E.0).
-`INVENTORY_CUTOVER_ENABLED = False` (gateway creado; W01–W18
-preparados en 1E.1/1E.2, **no** activados). Ver [FASE1E2.md](FASE1E2.md).
+**Ninguna de las rutas W01–W18 es autoridad ONLINE tras el cutover.**
+`inventory_balances.quantity_scaled` es la autoridad. `productos.stock`
+es proyección/caché (D05). Ver [FASE1E3.md](FASE1E3.md).
 
 Clasificación:
 
@@ -34,9 +34,9 @@ No hay importaciones masivas de stock.
 
 | Total | Negativos | Positivos | Mixtos | Derivados | Unknown |
 |---|---|---|---|---|---|
-| 22 | 5 | 5 | 8 | 4 | 0 |
+| 23 | 5 | 5 | 8 | 5 | 0 |
 
-Directos (W01–W18) = 18. Derivados (D01–D04) = 4.
+Directos (W01–W18) = 18. Derivados (D01–D05) = 5.
 
 ## Writers directos
 
@@ -69,6 +69,7 @@ Directos (W01–W18) = 18. Derivados (D01–D04) = 4.
 | D02 | `local_sync.py` | `_upsert` / `build_remote_upsert_sql` | Push: `ON CONFLICT (local_id) DO UPDATE SET … stock=EXCLUDED.stock`. |
 | D03 | `local_sync.py` | `pull_from_remote` | Mismo patrón LWW sobre SQLite local. **Sí pisa** `productos.stock`. |
 | D04 | `repositories/_outbox.py` | `encolar()` / `encolar_borrado()` | No muta stock. Traga excepciones (INV-13). |
+| D05 | `inventory_cutover.py` | `project_local_stock` | Proyección post-APPLY desde `inventory_balances`. Caché reconstruible, no autoridad. En AUTHORITATIVE no viaja por LWW. |
 
 ## UI que dispara writers (no UPDATE directo)
 
@@ -94,13 +95,13 @@ Métodos **sin caller de UI/producción** (siguen siendo writers; no se borran):
 W01–W18 tienen código autoritativo **inyectable**, no activado.
 El default es legacy. No hay dual-write (APPLY + `UPDATE productos.stock`
 independiente) en el camino autoritativo. Cutover OFF. La activación
-sigue siendo un **cutover único** en 1E.3.
+sigue siendo un **cutover único** (1E.3 laboratorio).
 
 Commands `LEGACY_OBSERVED` no pueden aplicarse tras el seed.
 No hay replay de backlog.
 
-Tras APPLIED futuro, `productos.stock` sería proyección/caché reconstruible.
-Eso **no** está implementado en writers en 1E.0.
+Tras APPLIED en AUTHORITATIVE, `productos.stock` es proyección/caché
+reconstruible (D05 `project_local_stock`). No es segunda autoridad.
 
 ## Outbox
 
@@ -122,5 +123,6 @@ TX de stock.
 
 `formulas_mezcla`, `formula_detalle`, `devoluciones` están fuera de sync
 (`NON_SYNC_TABLES`). `productos.stock` está declarado como proyección /
-`authoritative_exclude`, pero `APPLY_AUTHORITATIVE_EXCLUDE = False`: el UPSERT
-LWW de stock **sigue vigente** (INV-02 xfail).
+`authoritative_exclude`. `APPLY_AUTHORITATIVE_EXCLUDE` sigue `False` en
+fuente: PRE_CUTOVER conserva UPSERT LWW (INV-02 xfail default). En
+AUTHORITATIVE el runtime excluye `stock` de push/pull LWW.

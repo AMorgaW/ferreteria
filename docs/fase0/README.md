@@ -3,13 +3,10 @@
 **Estado:** ejecutada. **Producción (Fase 0): no modificada.**  
 Fase 1A (bootstrap SQLite) se implementó después, con GO humano, en
 `schema_bootstrap.py` + DDL por motor. No reabre este contrato.
-**Siguiente paso de inventario/recepción:** Fase 1E.2 (positivos y mixtos
-preparados) está **implementada**; ver [FASE1E2.md](FASE1E2.md). Cutover
-**OFF**. **No autoriza 1E.3, cutover, ni seed.** Fase 1D
-(coordinador PostgreSQL de stock) está hecha. La certificación PostgreSQL
-real de laboratorio está en [FASE1D1.md](FASE1D1.md). El gate de
-autorización y la reconexión post-desconexión están en
-[FASE1D3.md](FASE1D3.md).
+**Siguiente paso de inventario/recepción:** Fase 1E.4C (fleet fence)
+está **implementada en laboratorio**; ver [FASE1E4C.md](FASE1E4C.md).
+El NO-GO histórico de Luna sobre 1E.4 **no se revoca**. **No declara
+Fase 1 completa.** Cutover de fuente **OFF**. No cutover en Supabase real.
 
 ## Qué es Fase 0
 
@@ -52,9 +49,13 @@ Prohibido (y no se hizo):
 | [FASE1D.md](FASE1D.md) | Coordinador PostgreSQL / inventory_balances (implementada; no migra writers) |
 | [FASE1D1.md](FASE1D1.md) | Certificación PostgreSQL real en Docker local (no migra writers) |
 | [FASE1D3.md](FASE1D3.md) | Gate `session_user` + reconexión post-desconexión (no migra writers) |
-| [FASE1E.md](FASE1E.md) | 1E.0–1E.2: gateway + writers preparados. Cutover OFF. |
+| [FASE1E.md](FASE1E.md) | 1E.0–1E.4: gateway + writers + cutover de laboratorio. No producción. |
 | [FASE1E1.md](FASE1E1.md) | 1E.1 implementada: writers negativos preparados. Cutover OFF. |
-| [FASE1E2.md](FASE1E2.md) | 1E.2 implementada: positivos y mixtos preparados. Cutover OFF. No autoriza 1E.3. |
+| [FASE1E2.md](FASE1E2.md) | 1E.2 implementada: positivos y mixtos preparados. Cutover OFF. |
+| [FASE1E3.md](FASE1E3.md) | 1E.3 laboratorio: cutover único, freeze, seed, proyección, LWW. |
+| [FASE1E4.md](FASE1E4.md) | 1E.4 laboratorio: flota PG, fail-closed, snapshot. NO-GO Luna histórico. |
+| [FASE1E4B.md](FASE1E4B.md) | 1E.4B correctiva: freeze fence, sets, identidad, CAS, Decimal, DSN. |
+| [FASE1E4C.md](FASE1E4C.md) | 1E.4C correctiva: fleet fence W01–W18. HIGH residual de freeze cerrado. |
 
 Código de ruptura: `tests/fase0/`.
 

@@ -29,6 +29,8 @@ from schema_bootstrap import SchemaBootstrapError
 
 
 QUANTITY_SCALE = 1000
+SCALED_BIGINT_MIN = -(2**63)
+SCALED_BIGINT_MAX = (2**63) - 1
 
 COMMAND_TYPES = (
     "VENTA",
@@ -150,7 +152,12 @@ def quantity_to_scaled(value: QuantityInput) -> int:
         raise QuantityScaleError(
             f"No se pudo convertir exactamente a entero escalado: {value!r}"
         )
-    return int(scaled)
+    as_int = int(scaled)
+    if as_int < SCALED_BIGINT_MIN or as_int > SCALED_BIGINT_MAX:
+        raise QuantityScaleError(
+            f"quantity_scaled desborda BIGINT: {value!r}"
+        )
+    return as_int
 
 
 def _canonical_json(payload: Mapping[str, Any]) -> str:
@@ -492,6 +499,9 @@ def ensure_inventory_ledger_schema(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_inventory_commands_intent "
         "ON inventory_commands(intent_class)"
     )
+    from inventory_cutover import ensure_cutover_schema
+
+    ensure_cutover_schema(conn)
 
 
 def _ensure_intent_class_column(conn) -> None:

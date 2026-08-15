@@ -8,6 +8,12 @@ from datetime import datetime
 from database import obtener_fecha_actual
 
 
+def registrar_compra_desde_ui(repo: "ComprasRepository", **kwargs):
+    """Caller de ui/compras_ui.py. Nunca genera ni acepta inventory_command_id."""
+    kwargs.pop("inventory_command_id", None)
+    return repo.crear_compra(**kwargs)
+
+
 class ComprasRepository:
     """Repositorio de compras"""
 
@@ -45,9 +51,15 @@ class ComprasRepository:
         Returns:
             (éxito, mensaje, id_compra)
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen, None
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._crear_compra_authoritative(
                 proveedor_id,
                 productos,
@@ -185,7 +197,11 @@ class ComprasRepository:
                   f"Compra #{compra_id} a proveedor {proveedor_id} por ${total:,.0f}", None))
             encolar(conn, "audit_log", cursor.lastrowid, "create", "auditoria")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             conn.close()
 
             return True, f"Compra registrada exitosamente (Total: ${total:,.0f})", compra_id
@@ -221,12 +237,19 @@ class ComprasRepository:
             bind_inventory_command_documento,
             get_inventory_command_or_none,
         )
+        from inventory_cutover import (
+            ACT_KIND_PURCHASE_CREATE,
+            complete_open_act,
+            purchase_create_fingerprint,
+        )
         from inventory_writer_support import (
             DOCUMENTO_TIPO_COMPRA,
             MissingProductLocalIdError,
             bind_inventory_gateway,
             build_positive_operations,
             command_already_applied,
+            durable_act_command_id,
+            notify_after_remote_apply,
             operations_from_command_record,
             unknown_writer_message,
         )
@@ -236,10 +259,26 @@ class ComprasRepository:
         if not productos:
             return False, "Debe agregar al menos un producto a la compra", None
 
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
+        purchase_fp = purchase_create_fingerprint(
+            proveedor_id, numero_factura, productos
+        )
+        used_open_act = False
+        try:
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_PURCHASE_CREATE,
+                act_key=purchase_fp,
+                explicit_command_id=inventory_command_id,
+            )
+        except Exception as exc:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, str(exc), None
+        self.last_inventory_command_id = command_id
         try:
             existing = get_inventory_command_or_none(conn, command_id)
             already = command_already_applied(conn, command_id)
@@ -257,6 +296,10 @@ class ComprasRepository:
                         (row["id"],),
                     ).fetchone()[0]
                     if n_det:
+                        if used_open_act:
+                            complete_open_act(
+                                conn, ACT_KIND_PURCHASE_CREATE, fingerprint=purchase_fp
+                            )
                         conn.close()
                         return True, "Compra registrada exitosamente", row["id"]
                     compra_id = row["id"]
@@ -316,6 +359,8 @@ class ComprasRepository:
                     return False, unknown_writer_message(
                         result.command_id, result.error or result.outcome
                     ), None
+
+                notify_after_remote_apply(command_id)
 
                 bound_id = result.record.documento_local_id if result.record else None
                 if bound_id:
@@ -418,6 +463,10 @@ class ComprasRepository:
             encolar(conn, "audit_log", cursor.lastrowid, "create", "auditoria")
 
             conn.commit()
+            if used_open_act:
+                complete_open_act(
+                    conn, ACT_KIND_PURCHASE_CREATE, fingerprint=purchase_fp
+                )
             conn.close()
             return True, f"Compra registrada exitosamente (Total: ${total:,.0f})", compra_id
         except Exception as e:
@@ -675,9 +724,15 @@ class ComprasRepository:
         Returns:
             (éxito, mensaje)
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._eliminar_compra_authoritative(
                 compra_id,
                 inventory_command_id=inventory_command_id,
@@ -738,7 +793,11 @@ class ComprasRepository:
             ''', (compra_id,))
             encolar(conn, "purchase", compra_id, "update", "compras")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             conn.close()
 
             return True, "Compra cancelada y stock revertido exitosamente"
@@ -772,12 +831,19 @@ class ComprasRepository:
         )
         from local_first_db import ensure_local_id
         from repositories._outbox import encolar
+        from inventory_cutover import ACT_KIND_PURCHASE_DELETE
+        from inventory_writer_support import durable_act_command_id
 
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_PURCHASE_DELETE,
+                act_key=str(compra_id),
+                explicit_command_id=inventory_command_id,
+            )
+            self.last_inventory_command_id = command_id
             already = command_already_applied(conn, command_id)
             cursor.execute('SELECT estado, local_id FROM compras WHERE id = ?', (compra_id,))
             fila = cursor.fetchone()

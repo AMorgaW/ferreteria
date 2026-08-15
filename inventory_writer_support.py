@@ -46,16 +46,66 @@ W04_NO_UI_CALLER = (
 )
 
 
-def resolve_writer_mode(explicit: Optional[str] = None) -> str:
-    """Default = legacy mientras INVENTORY_CUTOVER_ENABLED es False."""
-    if explicit is not None and str(explicit).strip() != "":
-        mode = str(explicit).strip().lower()
-        if mode not in (WRITER_MODE_LEGACY, WRITER_MODE_AUTHORITATIVE):
-            raise ValueError(f"inventory_mode desconocido: {explicit!r}")
-        return mode
-    if INVENTORY_CUTOVER_ENABLED:
-        return WRITER_MODE_AUTHORITATIVE
-    return WRITER_MODE_LEGACY
+def resolve_writer_mode(
+    explicit: Optional[str] = None,
+    *,
+    db=None,
+    sqlite_conn=None,
+    connection_factory=None,
+    pg_conn=None,
+    require_remote: Optional[bool] = None,
+) -> str:
+    """Default = legacy mientras el cutover persistente no es AUTHORITATIVE.
+
+    INVENTORY_CUTOVER_ENABLED sigue False en fuente. ONLINE observa
+    PostgreSQL; SQLite es cache. Durante CUTOVER_IN_PROGRESS o si el
+    estado global no se puede leer, falla cerrado.
+    """
+    conn = sqlite_conn
+    owned = False
+    if conn is None and db is not None and hasattr(db, "conectar"):
+        conn = db.conectar()
+        owned = True
+    try:
+        if conn is not None:
+            from inventory_cutover import (
+                InventoryCutoverError,
+                assert_inventory_writes_allowed,
+            )
+
+            state = assert_inventory_writes_allowed(
+                conn,
+                pg_conn=pg_conn,
+                connection_factory=connection_factory,
+                require_remote=require_remote,
+            )
+            persistent_auth = state.is_authoritative
+        else:
+            persistent_auth = False
+        if explicit is not None and str(explicit).strip() != "":
+            mode = str(explicit).strip().lower()
+            if mode not in (WRITER_MODE_LEGACY, WRITER_MODE_AUTHORITATIVE):
+                raise ValueError(f"inventory_mode desconocido: {explicit!r}")
+            if mode == WRITER_MODE_LEGACY and persistent_auth:
+                raise InventoryCutoverError(
+                    "inventory_mode=legacy no está permitido en AUTHORITATIVE"
+                )
+            return mode
+        if INVENTORY_CUTOVER_ENABLED:
+            return WRITER_MODE_AUTHORITATIVE
+        if persistent_auth:
+            return WRITER_MODE_AUTHORITATIVE
+        return WRITER_MODE_LEGACY
+    finally:
+        if owned and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def scaled_to_commercial(quantity_scaled: int) -> float:
+    return int(quantity_scaled) / float(QUANTITY_SCALE)
 
 
 def commercial_quantity_to_scaled(value: Any) -> int:
@@ -318,14 +368,115 @@ def unknown_writer_message(command_id: str, detail: Optional[str] = None) -> str
     )
 
 
-def command_already_applied(conn, command_id: Optional[str]):
-    """Command local ya APPLIED: el documento no debe mutarse otra vez."""
-    from inventory_ledger import LEDGER_STATE_APPLIED, get_inventory_command_or_none
+after_remote_apply_hook = None
+
+
+def notify_after_remote_apply(command_id: str) -> None:
+    """Hook de test: crash entre APPLY remoto y persistencia local del documento."""
+    hook = after_remote_apply_hook
+    if callable(hook):
+        hook(command_id)
+
+
+def durable_act_command_id(
+    conn,
+    act_kind: str,
+    *,
+    fingerprint: str = "",
+    act_key: Optional[str] = None,
+    explicit_command_id: Optional[str] = None,
+    open_act: bool = False,
+) -> str:
+    """Identidad durable del acto de negocio ANTES del primer RPC.
+
+    open_act=True: begin_or_resume_open_act (no hay documento aún).
+    act_key: identidad derivada del documento (get_or_create_act_command_id).
+    """
+    from inventory_cutover import begin_or_resume_open_act, get_or_create_act_command_id
+
+    if open_act:
+        if explicit_command_id:
+            key = act_key or str(explicit_command_id)
+            return get_or_create_act_command_id(
+                conn, act_kind, key, command_id=explicit_command_id
+            )
+        return begin_or_resume_open_act(conn, act_kind, fingerprint=fingerprint)
+    key = str(act_key or fingerprint or explicit_command_id or "").strip()
+    if not key:
+        raise InventoryGatewayError(
+            f"acto {act_kind} requiere act_key durable antes del RPC"
+        )
+    return get_or_create_act_command_id(
+        conn, act_kind, key, command_id=explicit_command_id
+    )
+
+
+def command_already_applied(
+    conn,
+    command_id: Optional[str],
+    *,
+    tipo: Optional[str] = None,
+    operations: Optional[Sequence[Mapping[str, Any]]] = None,
+    documento_tipo: Optional[str] = None,
+    documento_local_id: Optional[str] = None,
+):
+    """Command local ya APPLIED: el documento no debe mutarse otra vez.
+
+    Si se presenta payload, debe coincidir (hash/ops/expected_base).
+    Si no coincide: IdempotencyConflictError. No hay shortcut ciego.
+    """
+    from inventory_ledger import (
+        IdempotencyConflictError,
+        LEDGER_STATE_APPLIED,
+        command_request_hash,
+        get_inventory_command_or_none,
+    )
 
     rec = get_inventory_command_or_none(conn, command_id)
-    if rec is not None and rec.estado == LEDGER_STATE_APPLIED:
+    if rec is None or rec.estado != LEDGER_STATE_APPLIED:
+        return None
+    if operations is None:
         return rec
-    return None
+    expected_hash = command_request_hash(
+        command_id=rec.command_id,
+        tipo=tipo or rec.tipo,
+        documento_tipo=documento_tipo if documento_tipo is not None else rec.documento_tipo,
+        documento_local_id=(
+            documento_local_id
+            if documento_local_id is not None
+            else rec.documento_local_id
+        ),
+        operations=operations,
+    )
+    if expected_hash != rec.request_hash:
+        raise IdempotencyConflictError(
+            f"command_id {rec.command_id} ya APPLIED con payload distinto"
+        )
+    stored = operations_from_command_record(rec)
+    if len(stored) != len(operations):
+        raise IdempotencyConflictError(
+            f"command_id {rec.command_id} ya APPLIED con operaciones distintas"
+        )
+    stored_by_op = {str(op["operation_id"]): op for op in stored}
+    for raw in operations:
+        sid = str(raw.get("operation_id") or "")
+        prev = stored_by_op.get(sid)
+        if prev is None:
+            raise IdempotencyConflictError(
+                f"command_id {rec.command_id} ya APPLIED con operation_id nuevo"
+            )
+        if int(prev["delta_scaled"]) != int(raw["delta_scaled"]):
+            raise IdempotencyConflictError(
+                f"command_id {rec.command_id} ya APPLIED con delta distinto"
+            )
+        prev_base = prev.get("expected_base_scaled")
+        new_base = raw.get("expected_base_scaled")
+        if prev_base is not None or new_base is not None:
+            if prev_base is None or new_base is None or int(prev_base) != int(new_base):
+                raise IdempotencyConflictError(
+                    f"command_id {rec.command_id} ya APPLIED con expected_base distinto"
+                )
+    return rec
 
 
 def find_rows_marked_for_command(
@@ -362,10 +513,38 @@ def bind_inventory_gateway(
     if connection_factory is not None:
         kwargs["connection_factory"] = connection_factory
     elif transport is None:
-        from inventory_gateway import connection_factory_from_env
+        from inventory_cutover import app_connection_factory_from_env
 
-        kwargs["connection_factory"] = connection_factory_from_env()
+        kwargs["connection_factory"] = app_connection_factory_from_env()
     return InventoryGateway(sqlite_conn, **kwargs)
+
+
+def resolve_writer_mode_or_frozen(
+    explicit: Optional[str] = None,
+    *,
+    db=None,
+    sqlite_conn=None,
+    connection_factory=None,
+    pg_conn=None,
+    require_remote: Optional[bool] = None,
+):
+    """Devuelve (mode, error). error no nulo = freeze o estado global ilegible."""
+    from inventory_cutover import CutoverStateUnavailableError, InventoryFrozenError
+
+    try:
+        return (
+            resolve_writer_mode(
+                explicit,
+                db=db,
+                sqlite_conn=sqlite_conn,
+                connection_factory=connection_factory,
+                pg_conn=pg_conn,
+                require_remote=require_remote,
+            ),
+            None,
+        )
+    except (InventoryFrozenError, CutoverStateUnavailableError) as exc:
+        return None, str(exc)
 
 
 assert QUANTITY_SCALE == 1000

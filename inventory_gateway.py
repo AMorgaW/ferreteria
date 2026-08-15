@@ -131,6 +131,9 @@ def connection_factory_from_env(
 
         conn = psycopg2.connect(dsn)
         conn.autocommit = False
+        from inventory_cutover import assert_non_owner_app_role
+
+        assert_non_owner_app_role(conn)
         return conn
 
     return factory
@@ -269,9 +272,17 @@ class InventoryGateway:
             )
         self.sqlite_conn = sqlite_conn
         self.connection_factory = connection_factory
-        self.cutover_enabled = (
-            INVENTORY_CUTOVER_ENABLED if cutover_enabled is None else bool(cutover_enabled)
-        )
+        if cutover_enabled is None:
+            from inventory_cutover import observe_cutover_state
+
+            state = observe_cutover_state(
+                sqlite_conn,
+                pg_conn=pg_conn,
+                connection_factory=connection_factory,
+            )
+            self.cutover_enabled = bool(INVENTORY_CUTOVER_ENABLED) or state.is_authoritative
+        else:
+            self.cutover_enabled = bool(cutover_enabled)
         self.coordinator_client = coordinator_client
         self._transport = transport
         self._pg_conn = pg_conn
@@ -492,6 +503,31 @@ class InventoryGateway:
             local = self._mark_local_outcome(
                 record.command_id, LEDGER_STATE_APPLIED, remote.motivo
             )
+            try:
+                from inventory_cutover import (
+                    observe_cutover_state,
+                    project_operations_from_authority,
+                )
+
+                state = observe_cutover_state(
+                    self.sqlite_conn,
+                    pg_conn=self._pg_conn,
+                    connection_factory=self.connection_factory,
+                )
+                if state.is_authoritative:
+                    project_operations_from_authority(
+                        self.sqlite_conn,
+                        prepared_ops,
+                        connection_factory=self.connection_factory,
+                        pg_conn=self._pg_conn,
+                    )
+                    self.sqlite_conn.commit()
+            except Exception:
+                # La autoridad ya está APPLIED. La proyección es caché reconstruible.
+                try:
+                    self.sqlite_conn.rollback()
+                except Exception:
+                    pass
             return GatewaySubmitResult(
                 command_id=local.command_id,
                 request_hash=local.request_hash,

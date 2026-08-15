@@ -35,7 +35,7 @@ El compañero `ferrepro-recepcion-qa` es QA adversarial. No eres QA. Tras implem
 - **Líneas no inventariables:** FLETE, DESCUENTO, SERVICIO, REDONDEO, IMPUESTO, OTRO.
 - Fencing/split-brain está especificado en `docs/fase0/ADR-0003-fencing-y-device-id.md`. No improvisar otro modelo.
 
-## Fase 0 (cerrada), Fase 1A–1D (cerradas), Fase 1E.0 (cerrada), Fase 1E.1 (autorizada)
+## Fase 0 (cerrada), Fase 1A–1D (cerradas), Fase 1E.0–1E.3 (cerradas), Fase 1E.4 (autorizada / laboratorio)
 
 Fase 0: documentación, ADRs, harness, tests de ruptura. Producción de inventario no se tocó ahí.
 
@@ -55,15 +55,29 @@ Cutover DEFAULT OFF. No migró writers.
 **Fase 1E.1 (cerrada):** writers **negativos** preparados, cutover OFF,
 barrera `LEGACY_OBSERVED`.
 
-**Fase 1E.2 (autorizada):** preparar writers **positivos y mixtos**
-(W01, W04, W05, W07–W14, W17, W18) **sin activar cutover**. Deudas 1E.1:
-`intent_class` fail-closed; recovery post-APPLY W06/W02/W15. Extraer
-W17/W18 de closures. Stock absoluto con CAS `expected_base_scaled`.
-No dual-write. No seed. No backlog replay.
+**Fase 1E.2 (cerrada):** writers positivos y mixtos preparados, cutover OFF.
 
-**Prohibido (1E.3+ no autorizada):** cutover ON, seed,
-`APPLY_AUTHORITATIVE_EXCLUDE = True`, barcodes múltiples, recepción, OCR,
-fencing/leases/`OFFLINE_INVENTORY_AUTHORITY`, UI nueva.
+**Fase 1E.3 (cerrada / laboratorio):** cutover único contra PostgreSQL
+Docker de pruebas. Estado persistente, freeze, seed one-shot,
+reconciliación exacta, proyección D05, LWW de stock excluido en
+AUTHORITATIVE, command_id estable POS/LAN, no-owner. **No** cutover
+en Supabase real. **No** `SUPABASE_URI`. **No** datos comerciales.
+`INVENTORY_CUTOVER_ENABLED` y `APPLY_AUTHORITATIVE_EXCLUDE` siguen
+`False` en fuente.
+
+**Fase 1E.4 (autorizada / última implementación de Fase 1):** hardening
+de flota + certificación final de cutover en laboratorio. Control
+PostgreSQL común, fail-closed, freeze de todas las estaciones, snapshot
+reconciliado, seed exacto. **No** cutover en Supabase real. **No**
+declara Fase 1 completa (auditoría Luna). **No** Fase 2, barcodes,
+recepción, OCR, fencing.
+
+**Fase 1E.4B / 1E.4C (correctivas Luna, laboratorio):** fence real de
+commit legacy (`commit_legacy_inventory` + `lock_legacy_cutover_fence`)
+en W01–W18. No reconstruye Fase 1. No cutover productivo.
+
+**Prohibido:** cutover productivo, barcodes múltiples, recepción, OCR,
+fencing/leases/`OFFLINE_INVENTORY_AUTHORITY`.
 
 Contrato canónico: `docs/fase0/`. Schema: `schema_bootstrap.py`. Registry: `sync_registry.py`. Coordinador: `inventory_coordinator.py`. Gateway: `inventory_gateway.py`.
 

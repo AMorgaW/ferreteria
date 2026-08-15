@@ -1531,6 +1531,7 @@ class VentasUIModern(QWidget):
             )
 
             if exito:
+                self._checkout_act_id = None
                 detalles_impresion = []
                 for item in self.carrito:
                     det = {
@@ -1576,6 +1577,14 @@ class VentasUIModern(QWidget):
                         print(f"[VENTAS] Error al llamar callback actualizar caja: {e}")
                 self.venta_completada.emit()
             else:
+                if mensaje and str(mensaje).startswith("INVENTORY_UNKNOWN"):
+                    QMessageBox.warning(
+                        self,
+                        "Inventario pendiente",
+                        "La venta no se confirmó en el coordinador. "
+                        "Reintente la misma operación; no cree otra venta.",
+                    )
+                    return
                 QMessageBox.critical(self, "Error", mensaje)
 
         except Exception as e:
@@ -1677,6 +1686,7 @@ class VentasUIModern(QWidget):
     def nueva_venta(self):
         self.carrito = []
         self.cliente_seleccionado = None
+        self._checkout_act_id = None
         self.cliente_label.setText("Cliente General")
         self.descuento_entry.setText("0")
         self.metodo_pago = "EFECTIVO"

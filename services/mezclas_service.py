@@ -151,9 +151,15 @@ class MezclasService:
         (tipo VENTA: solo consumo negativo; MEZCLA del ledger exige signos
         mixtos y no aplica a este writer).
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._descontar_stock_mezcla_authoritative(
                 componentes,
                 num_factura=num_factura,
@@ -210,7 +216,11 @@ class MezclasService:
                 encolar(conn, "inventory_movement", _mz_mov_id, "create", "movimientos")
                 encolar(conn, "product", comp['producto_id'], "update", "productos")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             return True, "Stock descontado exitosamente"
 
         except Exception as e:
@@ -244,12 +254,20 @@ class MezclasService:
             unknown_writer_message,
         )
         from repositories._outbox import encolar
+        from inventory_cutover import ACT_KIND_MEZCLA_DEPRECATED
+        from inventory_writer_support import durable_act_command_id
 
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_MEZCLA_DEPRECATED,
+                fingerprint=repr(sorted((c.get("producto_id"), str(c.get("cantidad"))) for c in componentes)),
+                explicit_command_id=inventory_command_id,
+                open_act=True,
+            )
+            self.last_inventory_command_id = command_id
             already = command_already_applied(conn, command_id)
             if already is not None:
                 marked = find_rows_marked_for_command(

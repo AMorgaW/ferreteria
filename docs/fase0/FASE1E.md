@@ -1,9 +1,9 @@
 # Fase 1E — Migración de writers al coordinador
 
-**Estado 1E.2:** implementada (positivos y mixtos preparados). Cutover **OFF**.
-**No autoriza 1E.3.** No activa autoridad. No seed.
-**No declara INV-01 resuelto en SQLite.** **No declara INV-02 resuelto.**
-`APPLY_AUTHORITATIVE_EXCLUDE` sigue `False`.
+**Estado 1E.4:** hardening de flota + certificación de cutover en
+laboratorio PostgreSQL. **Fase 1 técnicamente implementada.**
+**No declara Fase 1 completa** (falta auditoría final Luna).
+Ver [FASE1E4.md](FASE1E4.md). **No cutover productivo / Supabase real.**
 
 ## Subfases
 
@@ -11,9 +11,9 @@
 |---|---|---|
 | **1E.0** | Inventario definitivo de writers + `InventoryGateway`. Cutover default OFF. Writers productivos **no** llaman al gateway ni al coordinador. | **Cerrada.** |
 | **1E.1** | Migrar writers **negativos** (uno a uno) para que *puedan* usar el gateway, **sin activar autoridad**. Cutover sigue OFF. | **Cerrada.** Ver [FASE1E1.md](FASE1E1.md). |
-| **1E.2** | Migrar writers **positivos y mixtos**, mismo régimen: código listo, autoridad apagada. | **Esta fase. Implementada.** Ver [FASE1E2.md](FASE1E2.md). |
-| **1E.3** | **Cutover único.** Activar `INVENTORY_CUTOVER_ENABLED`. Semilla. Retirar writers legacy. Decisión sobre `productos.stock` / LWW. | **No autorizada.** Ver precondiciones abajo. |
-| **1E.4** | Certificación final (PostgreSQL real, no dual authority, scanners, rollback operativo documentado). | **No autorizada.** |
+| **1E.2** | Migrar writers **positivos y mixtos**, mismo régimen: código listo, autoridad apagada. | **Cerrada.** Ver [FASE1E2.md](FASE1E2.md). |
+| **1E.3** | **Cutover único.** Estado persistente. Seed. Freeze. `productos.stock` proyección. LWW de stock excluido en AUTHORITATIVE. Laboratorio PG. | **Cerrada en laboratorio.** Ver [FASE1E3.md](FASE1E3.md). |
+| **1E.4** | Hardening de flota + certificación final de cutover. Control PG común, fail-closed, snapshot reconciliado. | **Implementada en laboratorio. Pendiente auditoría Luna.** Ver [FASE1E4.md](FASE1E4.md). |
 
 Regla crítica (no negociable):
 
@@ -93,8 +93,9 @@ Cuando cutover está OFF: `submit` persiste el intent como
 No finge `APPLIED`. No llama al coordinador. Esos comandos **nunca**
 se transmiten, ni después del cutover. Ver [FASE1E1.md](FASE1E1.md).
 
-Tras APPLIED futuro (1E.3): `productos.stock` sería **proyección/caché**
-reconstruible desde `inventory_balances`. No implementado en writers en 1E.0.
+Tras APPLIED en 1E.3 laboratorio (`AUTHORITATIVE`): `productos.stock` es
+**proyección/caché** reconstruible desde `inventory_balances` (D05). No es
+segunda autoridad. Ver [FASE1E3.md](FASE1E3.md).
 
 ## Dual authority — cómo se evita
 
@@ -103,36 +104,24 @@ reconstruible desde `inventory_balances`. No implementado en writers en 1E.0.
   default **no** llama `submit()` ni `apply_inventory_command`.
 - No hay dual-write permanente. En camino autoritativo de tests no hay
   `UPDATE productos.stock`.
-- `APPLY_AUTHORITATIVE_EXCLUDE` sigue False: LWW de `productos.stock` sigue
-  vigente a propósito, hasta 1E.3.
+- `APPLY_AUTHORITATIVE_EXCLUDE` sigue False **en fuente**. En estado
+  `AUTHORITATIVE` el runtime excluye `productos.stock` de LWW. PRE_CUTOVER
+  conserva el UPSERT legacy.
 - `inventory_balances` está en `COORDINATOR_REMOTE_TABLES`, no en
   `SYNC_REGISTRY`. No entra a LWW.
 
-## Precondiciones explícitas para 1E.3 (cutover)
+## Precondiciones de 1E.3 (laboratorio)
 
-Todas deben cumplirse **antes** de autorizar 1E.3. 1E.0 no las cumple:
-
-1. Todos los writers conocidos (W01–W18) migrados al gateway.
-2. DSN no-owner (`FERREPRO_INVENTORY_DSN`); no usar `SUPABASE_URI` owner
-   como solución productiva.
-3. `connection_factory` en el camino productivo (reconnect 1D.3).
-4. `command_id` persistido antes de red, en todos los writers.
-5. Reconciliation (ledger local vs coordinador) definida y testeada.
-6. Seed completo de `inventory_balances` (`seed_inventory_balance` /
-   corte legacy one-shot, no arranque silencioso).
-7. Cobertura de `producto.local_id` en todo SKU que mueva stock.
-8. Ningún writer legacy capaz de alterar `productos.stock` como autoridad.
-9. Decisión explícita sobre `productos.stock` / LWW
-   (`APPLY_AUTHORITATIVE_EXCLUDE = True` o retiro del campo del UPSERT).
-10. Rollback operativo documentado y ensayable.
+Cerradas en laboratorio PostgreSQL. Ver [FASE1E3.md](FASE1E3.md).
+**No** equivalen a cutover productivo.
 
 ## Proyección vs autoridad
 
-| Recurso | Rol hasta 1E.3 |
-|---|---|
-| `inventory_balances.quantity_scaled` | Autoridad online **diseñada**. Vacía/sin writers. |
-| `productos.stock` | Legacy / LWW. Sigue siendo lo que las cajas mutan. |
-| `inventory_commands` local | Intent. 1E.0: `PERSISTED` (o APPLIED/REJECTED solo si un test enciende cutover contra fakes). |
+| Recurso | PRE_CUTOVER | AUTHORITATIVE (lab 1E.3) |
+|---|---|---|
+| `inventory_balances.quantity_scaled` | Autoridad diseñada; vacía hasta seed | Autoridad ONLINE |
+| `productos.stock` | Legacy / LWW | Proyección/caché (D05), no LWW |
+| `inventory_commands` local | `LEGACY_OBSERVED` no transmissible | Intent `AUTHORITATIVE` |
 
 Riesgo de dual authority: si un writer migrado aplicara en PostgreSQL
 **y** otro siguiera haciendo `UPDATE productos.stock`, el pull LWW
@@ -151,5 +140,5 @@ pisaría o divergería. Por eso el cutover es único y 1E.0 no activa nada.
 
 ## STOP
 
-**STOP — no implementar 1E.3.** No cutover. No seed.
-El detalle de 1E.2 está en [FASE1E2.md](FASE1E2.md).
+**STOP — no declarar FASE 1 COMPLETA.** El detalle de 1E.4 está en
+[FASE1E4.md](FASE1E4.md). No cutover en Supabase real. No Fase 2.

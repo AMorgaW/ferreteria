@@ -1,10 +1,7 @@
 # Fase 1E.2 — Writers positivos y mixtos preparados, cutover OFF
 
-**Estado:** implementada. Cutover **OFF**. No activa autoridad.
-**No autoriza 1E.3 ni cutover.** No seed. No `APPLY_AUTHORITATIVE_EXCLUDE`.
-**No declara INV-01 resuelto en SQLite.** **No declara INV-02 resuelto.**
-`INVENTORY_CUTOVER_ENABLED = False`.
-`APPLY_AUTHORITATIVE_EXCLUDE = False`.
+**Estado:** implementada. Cutover **OFF** en 1E.2. 1E.3 (laboratorio) en
+[FASE1E3.md](FASE1E3.md). **No autoriza 1E.4.**
 
 ## Qué es 1E.2
 
@@ -123,7 +120,8 @@ REJECTED remoto: no documento SUCCESS, no movimiento completado, no
 ## No dual-write
 
 Camino authoritative: PostgreSQL APPLY **sin** `UPDATE productos.stock`
-como segunda autoridad. La proyección/caché queda para 1E.3.
+como segunda autoridad. La proyección/caché (D05) se implementó en
+laboratorio 1E.3; ver [FASE1E3.md](FASE1E3.md).
 
 ## Scanner
 
@@ -131,19 +129,13 @@ como segunda autoridad. La proyección/caché queda para 1E.3.
 W15 DEPRECATED (preparado). W04 preparado, sin UI.
 0 `UNTRACKED_DIRECT_WRITER`. 0 unknown.
 
-## Condiciones para 1E.3 (no implementadas aquí)
+## Condiciones para 1E.3
 
-1. Seed one-shot de `inventory_balances` desde el corte legacy.
-2. Encender `INVENTORY_CUTOVER_ENABLED` (cutover **único**, no writer a writer).
-3. DSN no-owner `FERREPRO_INVENTORY_DSN` en el camino productivo.
-4. `connection_factory` productiva (reconnect 1D.3).
-5. UI/POS plombean `inventory_command_id` estable.
-6. Decisión sobre `productos.stock` / LWW (`APPLY_AUTHORITATIVE_EXCLUDE`
-   o retiro del campo).
-7. Proyección/caché de `productos.stock` desde `inventory_balances`.
-8. Rollback operativo documentado.
+Cerradas en laboratorio. Ver [FASE1E3.md](FASE1E3.md). El default de
+fuente sigue `INVENTORY_CUTOVER_ENABLED = False`; la autoridad se lee
+del estado persistente. **No autoriza 1E.4 ni cutover productivo.**
 
 ## STOP
 
-**STOP — no implementar 1E.3.** No cutover. No seed. No barcodes. No
-recepción. No fencing. No autoridad offline.
+**STOP — no implementar 1E.4 desde 1E.2.** El cutover de laboratorio está
+en [FASE1E3.md](FASE1E3.md).

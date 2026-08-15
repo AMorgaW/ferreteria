@@ -23,9 +23,15 @@ class InventarioRepository:
         Registra un movimiento de inventario (entrada o salida)
         Actualiza automáticamente el stock del producto
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._registrar_movimiento_authoritative(
                 movimiento,
                 inventory_command_id=inventory_command_id,
@@ -106,7 +112,11 @@ class InventarioRepository:
             encolar(conn, "inventory_movement2", movimiento_id, "create", "movimientos_inventario")
             encolar(conn, "product", movimiento.producto_id, "update", "productos")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             conn.close()
 
             return True, f"Movimiento registrado. Nuevo stock: {nuevo_stock}"
@@ -121,17 +131,15 @@ class InventarioRepository:
         inventory_command_id, inventory_gateway, inventory_transport,
         inventory_connection_factory,
     ) -> Tuple[bool, str]:
-        import uuid as _uuid
+        from inventory_cutover import ACT_KIND_INVENTORY_MOVEMENT
         from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
         from inventory_ledger import QuantityScaleError, UnknownProductError
         from inventory_writer_support import (
             DOCUMENTO_TIPO_MOVIMIENTO, MissingProductLocalIdError,
             bind_inventory_gateway, build_signed_operations, command_already_applied,
-            command_motivo_marker, find_rows_marked_for_command, movement_tipo_to_ledger,
-            unknown_writer_message,
+            command_motivo_marker, durable_act_command_id, find_rows_marked_for_command,
+            movement_tipo_to_ledger, unknown_writer_message,
         )
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         try:
             ledger_tipo, sign = movement_tipo_to_ledger(movimiento.tipo_movimiento)
         except QuantityScaleError as exc:
@@ -139,6 +147,17 @@ class InventarioRepository:
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_INVENTORY_MOVEMENT,
+                fingerprint=(
+                    f"{movimiento.producto_id}:{movimiento.tipo_movimiento}:"
+                    f"{movimiento.cantidad}:{movimiento.observaciones or ''}"
+                ),
+                explicit_command_id=inventory_command_id,
+                open_act=True,
+            )
+            self.last_inventory_command_id = command_id
             already = command_already_applied(conn, command_id)
             if already is not None and find_rows_marked_for_command(
                 conn, command_id, table="movimientos_inventario", column="observaciones"
@@ -538,9 +557,15 @@ class InventarioRepository:
         Ajusta el stock de un producto directamente
         Útil para correcciones o inventarios físicos
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._ajustar_stock_directo_authoritative(
                 producto_id, nuevo_stock, motivo, usuario_id,
                 inventory_command_id=inventory_command_id,
@@ -597,7 +622,11 @@ class InventarioRepository:
             encolar(conn, "inventory_movement2", _mov_aj_id, "create", "movimientos_inventario")
             encolar(conn, "product", producto_id, "update", "productos")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             conn.close()
 
             return True, f"Stock ajustado de {stock_actual} a {nuevo_stock}"
@@ -612,21 +641,27 @@ class InventarioRepository:
         inventory_command_id, inventory_gateway, inventory_transport,
         inventory_connection_factory, inventory_stock_base_scaled,
     ) -> Tuple[bool, str]:
-        import uuid as _uuid
+        from inventory_cutover import ACT_KIND_INVENTORY_ADJUSTMENT
         from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED, InventoryGatewayError
         from inventory_ledger import QuantityScaleError, UnknownProductError, get_inventory_command_or_none
         from inventory_writer_support import (
             DOCUMENTO_TIPO_AJUSTE, NO_INVENTORY_CHANGE, MissingProductLocalIdError,
             bind_inventory_gateway, build_absolute_operations, command_already_applied,
-            command_motivo_marker, find_rows_marked_for_command,
+            command_motivo_marker, durable_act_command_id, find_rows_marked_for_command,
             operations_from_command_record, require_producto_local_id,
             resolve_authoritative_base_scaled, unknown_writer_message,
         )
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_INVENTORY_ADJUSTMENT,
+                fingerprint=f"{producto_id}:{nuevo_stock}:{motivo}",
+                explicit_command_id=inventory_command_id,
+                open_act=True,
+            )
+            self.last_inventory_command_id = command_id
             already = command_already_applied(conn, command_id)
             if already is not None and find_rows_marked_for_command(
                 conn, command_id, table="movimientos_inventario", column="observaciones"
@@ -730,9 +765,15 @@ class InventarioRepository:
         Elimina un movimiento de inventario
         Si revertir_stock=True, ajusta el stock del producto
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._eliminar_movimiento_authoritative(
                 movimiento_id, revertir_stock,
                 inventory_command_id=inventory_command_id,
@@ -788,7 +829,14 @@ class InventarioRepository:
             cursor.execute('DELETE FROM movimientos_inventario WHERE id = ?',
                          (movimiento_id,))
 
-            conn.commit()
+            if revertir_stock:
+                from inventory_cutover import commit_legacy_inventory
+
+                commit_legacy_inventory(
+                    conn, connection_factory=inventory_connection_factory
+                )
+            else:
+                conn.commit()
             conn.close()
             
             return True, "Movimiento eliminado exitosamente"
@@ -803,19 +851,24 @@ class InventarioRepository:
         inventory_command_id, inventory_gateway, inventory_transport,
         inventory_connection_factory,
     ) -> Tuple[bool, str]:
-        import uuid as _uuid
+        from inventory_cutover import ACT_KIND_INVENTORY_MOVEMENT_DELETE
         from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
         from inventory_ledger import QuantityScaleError, UnknownProductError
         from inventory_writer_support import (
             DOCUMENTO_TIPO_MOVIMIENTO, MissingProductLocalIdError,
             bind_inventory_gateway, build_signed_operations, command_already_applied,
-            movement_tipo_to_ledger, unknown_writer_message,
+            durable_act_command_id, movement_tipo_to_ledger, unknown_writer_message,
         )
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_INVENTORY_MOVEMENT_DELETE,
+                act_key=str(movimiento_id),
+                explicit_command_id=inventory_command_id,
+            )
+            self.last_inventory_command_id = command_id
             already = command_already_applied(conn, command_id)
             cursor.execute(
                 "SELECT producto_id, tipo_movimiento, cantidad FROM movimientos_inventario WHERE id = ?",

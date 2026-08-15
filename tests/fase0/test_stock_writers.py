@@ -12,6 +12,7 @@ try:
         DIRECT_STOCK_WRITER_FILES,
         INSERT_STOCK_FILES,
         PRE_CUTOVER_SQL_ALLOWED,
+        PROJECTION_STOCK_FILES,
         STOCK_WRITERS,
         UNTRACKED_DIRECT_WRITER,
         UPDATE_STOCK_FILES,
@@ -23,6 +24,7 @@ except ImportError:
         DIRECT_STOCK_WRITER_FILES,
         INSERT_STOCK_FILES,
         PRE_CUTOVER_SQL_ALLOWED,
+        PROJECTION_STOCK_FILES,
         STOCK_WRITERS,
         UNTRACKED_DIRECT_WRITER,
         UPDATE_STOCK_FILES,
@@ -104,7 +106,7 @@ def scan_stock_writes_by_function():
     """
     declared = []
     for writer in STOCK_WRITERS:
-        if writer["kind"] == "derived":
+        if writer["kind"] == "derived" and not writer.get("scan_sql"):
             continue
         declared.append(
             (
@@ -188,11 +190,12 @@ def scan_stock_writes_by_function():
 class StockWritersStaticTest(unittest.TestCase):
     def test_scanner_coincide_con_inventario(self):
         update_found, insert_found, _set_found = _scan_direct_stock_files()
-        extra_update = update_found - UPDATE_STOCK_FILES
+        known_stock_files = DIRECT_STOCK_WRITER_FILES | PROJECTION_STOCK_FILES
+        extra_update = update_found - known_stock_files
         missing_update = UPDATE_STOCK_FILES - update_found
         extra_insert = insert_found - INSERT_STOCK_FILES
         missing_insert = INSERT_STOCK_FILES - insert_found
-        extra_direct = (update_found | insert_found) - DIRECT_STOCK_WRITER_FILES
+        extra_direct = (update_found | insert_found) - known_stock_files
         self.assertFalse(
             extra_update,
             msg="Writer UPDATE de stock no inventariado en "

@@ -122,6 +122,7 @@ class GatewayPersistenciaTest(unittest.TestCase):
                     conn,
                     connection_factory=factory,
                     transport=transport,
+                    cutover_enabled=False,
                 )
                 result = gw.submit(
                     tipo="VENTA",

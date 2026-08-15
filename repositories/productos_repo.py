@@ -212,9 +212,15 @@ class ProductosRepository:
         Crea un nuevo producto en la base de datos
         Returns: (éxito, mensaje, id_producto)
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen, None
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._crear_producto_authoritative(
                 producto,
                 inventory_command_id=inventory_command_id,
@@ -257,7 +263,7 @@ class ProductosRepository:
                 producto.proveedor_id,
                 producto.precio_compra,
                 producto.precio_venta,
-                producto.stock,
+                0,
                 producto.stock_minimo,
                 producto.ubicacion,
                 producto.descripcion,
@@ -284,9 +290,15 @@ class ProductosRepository:
                                (sku, producto_id))
 
             # 4) Trazabilidad (kardex): registrar el stock inicial como movimiento
+            initial_stock = producto.stock or 0
+            if initial_stock != 0:
+                cursor.execute(
+                    'UPDATE productos SET stock = ? WHERE id = ?',
+                    (initial_stock, producto_id),
+                )
             mov_id = None
             try:
-                if (producto.stock or 0) > 0:
+                if initial_stock > 0:
                     uid = (self.auth.usuario_actual.id
                            if (self.auth and getattr(self.auth, 'usuario_actual', None))
                            else None)
@@ -294,9 +306,9 @@ class ProductosRepository:
                         INSERT INTO movimientos (tipo, producto_id, usuario_id, cantidad,
                             precio_unitario, costo_total, motivo, fecha)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', ('ENTRADA_AJUSTE', producto_id, uid, producto.stock,
+                    ''', ('ENTRADA_AJUSTE', producto_id, uid, initial_stock,
                           producto.precio_compra or 0,
-                          (producto.precio_compra or 0) * (producto.stock or 0),
+                          (producto.precio_compra or 0) * initial_stock,
                           'Stock inicial al crear producto', _ahora()))
                     mov_id = cursor.lastrowid
             except Exception as _mov_exc:
@@ -308,7 +320,14 @@ class ProductosRepository:
                 self._encolar_sync(conn, "inventory_movement", mov_id,
                                    "create", "movimientos")
 
-            conn.commit()
+            if initial_stock != 0:
+                from inventory_cutover import commit_legacy_inventory
+
+                commit_legacy_inventory(
+                    conn, connection_factory=inventory_connection_factory
+                )
+            else:
+                conn.commit()
             conn.close()
             self.invalidar_cache()
 
@@ -336,8 +355,6 @@ class ProductosRepository:
         valido, msg_val = producto.validar()
         if not valido:
             return False, msg_val, None
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         local_id = producto_local_id or str(_uuid.uuid4())
         try:
             local_id = str(_uuid.UUID(str(local_id)))
@@ -347,6 +364,16 @@ class ProductosRepository:
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            from inventory_cutover import ACT_KIND_PRODUCT_INITIAL_STOCK
+            from inventory_writer_support import durable_act_command_id
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_PRODUCT_INITIAL_STOCK,
+                fingerprint=f"{local_id}:{producto.nombre}:{producto.stock}",
+                explicit_command_id=inventory_command_id,
+                open_act=True,
+            )
+            self.last_inventory_command_id = command_id
             existing_row = cursor.execute(
                 "SELECT id FROM productos WHERE local_id = ?", (local_id,)
             ).fetchone()
@@ -390,6 +417,10 @@ class ProductosRepository:
 
             if existing_row:
                 producto_id = existing_row["id"]
+                existing_cmd = get_inventory_command_or_none(conn, command_id)
+                if existing_cmd is None:
+                    conn.close()
+                    return True, "Producto creado exitosamente", producto_id
             else:
                 cursor.execute('''
                     INSERT INTO productos (
@@ -499,13 +530,21 @@ class ProductosRepository:
                             inventory_stock_base_scaled: Optional[int] = None) -> Tuple[bool, str]:
         """Actualiza un producto existente.
 
-        Legacy: metadata y stock viajan juntos (SET stock = ?).
+        Legacy: metadata y stock se commitean juntos solo si el stock cambia
+        (UPDATE de stock aparte + fence). Si el stock no cambia, el UPDATE
+        de ficha no escribe productos.stock.
         Autoritativo: UPDATE de metadata no puede mutar stock; un cambio de
         stock requiere InventoryCommand AJUSTE.
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._actualizar_producto_authoritative(
                 producto,
                 inventory_command_id=inventory_command_id,
@@ -530,11 +569,21 @@ class ProductosRepository:
 
         try:
             # Capturar precios anteriores para el historial de precios
-            cursor.execute('SELECT precio_venta, precio_compra FROM productos WHERE id = ?',
-                           (producto.id,))
+            cursor.execute(
+                'SELECT precio_venta, precio_compra, stock FROM productos WHERE id = ?',
+                (producto.id,),
+            )
             _ant = cursor.fetchone()
             precio_venta_ant = _ant['precio_venta'] if _ant else None
             precio_compra_ant = _ant['precio_compra'] if _ant else None
+            stock_actual = _ant['stock'] if _ant else None
+
+            stock_changed = True
+            if stock_actual is not None:
+                try:
+                    stock_changed = float(stock_actual) != float(producto.stock or 0)
+                except (TypeError, ValueError):
+                    stock_changed = stock_actual != producto.stock
 
             cursor.execute('''
                 UPDATE productos SET
@@ -546,7 +595,6 @@ class ProductosRepository:
                     proveedor_id = ?,
                     precio_compra = ?,
                     precio_venta = ?,
-                    stock = ?,
                     stock_minimo = ?,
                     ubicacion = ?,
                     descripcion = ?,
@@ -568,7 +616,6 @@ class ProductosRepository:
                 producto.proveedor_id,
                 producto.precio_compra,
                 producto.precio_venta,
-                producto.stock,
                 producto.stock_minimo,
                 producto.ubicacion,
                 producto.descripcion,
@@ -589,10 +636,23 @@ class ProductosRepository:
             self._registrar_cambio_precio(cursor, producto.id, 'compra',
                                           precio_compra_ant, producto.precio_compra)
 
+            if stock_changed:
+                cursor.execute(
+                    'UPDATE productos SET stock = ? WHERE id = ?',
+                    (producto.stock, producto.id),
+                )
+
             # Local-first: encolar la edición para sincronizar a Supabase.
             self._encolar_sync(conn, "product", producto.id, "update", "productos")
 
-            conn.commit()
+            if stock_changed:
+                from inventory_cutover import commit_legacy_inventory
+
+                commit_legacy_inventory(
+                    conn, connection_factory=inventory_connection_factory
+                )
+            else:
+                conn.commit()
             conn.close()
             self.invalidar_cache()
 
@@ -625,11 +685,19 @@ class ProductosRepository:
                                  exclude_id=producto.id):
             return False, ("Ya existe otro producto con el mismo nombre, marca, "
                            "presentación y unidad de medida.")
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
         try:
+            from inventory_cutover import ACT_KIND_PRODUCT_STOCK_EDIT
+            from inventory_writer_support import durable_act_command_id
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_PRODUCT_STOCK_EDIT,
+                fingerprint=f"{producto.id}:{producto.stock}:{inventory_stock_base_scaled}",
+                explicit_command_id=inventory_command_id,
+                open_act=True,
+            )
+            self.last_inventory_command_id = command_id
             current = cursor.execute(
                 "SELECT stock, local_id, precio_venta, precio_compra FROM productos WHERE id = ?",
                 (producto.id,),
@@ -638,30 +706,30 @@ class ProductosRepository:
                 conn.close()
                 return False, "Producto no encontrado"
             target_stock = producto.stock
-            stock_changed = int(current["stock"]) != int(target_stock)
             already = command_already_applied(conn, command_id)
+            try:
+                existing_cmd = get_inventory_command_or_none(conn, command_id)
+                if existing_cmd is not None:
+                    operations = operations_from_command_record(existing_cmd)
+                else:
+                    local_id = require_producto_local_id(conn, producto.id)
+                    base = resolve_authoritative_base_scaled(
+                        local_id,
+                        explicit_base_scaled=inventory_stock_base_scaled,
+                        connection_factory=inventory_connection_factory,
+                    )
+                    operations = build_absolute_operations(
+                        conn, command_id=command_id, producto_id=producto.id,
+                        target_qty=target_stock, base_scaled=base,
+                    )
+            except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+                conn.close()
+                return False, str(exc)
+            except InventoryGatewayError as exc:
+                conn.close()
+                return False, str(exc)
+            stock_changed = bool(operations) or already is not None
             if stock_changed and already is None:
-                try:
-                    existing_cmd = get_inventory_command_or_none(conn, command_id)
-                    if existing_cmd is not None:
-                        operations = operations_from_command_record(existing_cmd)
-                    else:
-                        local_id = require_producto_local_id(conn, producto.id)
-                        base = resolve_authoritative_base_scaled(
-                            local_id,
-                            explicit_base_scaled=inventory_stock_base_scaled,
-                            connection_factory=inventory_connection_factory,
-                        )
-                        operations = build_absolute_operations(
-                            conn, command_id=command_id, producto_id=producto.id,
-                            target_qty=target_stock, base_scaled=base,
-                        )
-                except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
-                    conn.close()
-                    return False, str(exc)
-                except InventoryGatewayError as exc:
-                    conn.close()
-                    return False, str(exc)
                 if operations:
                     gw = bind_inventory_gateway(
                         conn, gateway=inventory_gateway, transport=inventory_transport,
@@ -844,9 +912,15 @@ class ProductosRepository:
         Actualiza el stock de un producto
         operacion: 'sumar' o 'restar' (DELTA, no valor absoluto)
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._actualizar_stock_authoritative(
                 producto_id, cantidad, operacion,
                 inventory_command_id=inventory_command_id,
@@ -886,7 +960,11 @@ class ProductosRepository:
                          (nuevo_stock, producto_id))
             # Local-first: encolar el cambio de stock para sincronizar a Supabase.
             self._encolar_sync(conn, "product", producto_id, "update", "productos")
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             conn.close()
             self.invalidar_cache()
 
@@ -914,10 +992,18 @@ class ProductosRepository:
         if cantidad is None or cantidad <= 0:
             return False, "La cantidad debe ser mayor a 0"
         signed = cantidad if operacion == 'sumar' else -cantidad
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         try:
+            from inventory_cutover import ACT_KIND_PRODUCT_STOCK_SET
+            from inventory_writer_support import durable_act_command_id
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_PRODUCT_STOCK_SET,
+                fingerprint=f"{producto_id}:{operacion}:{cantidad}",
+                explicit_command_id=inventory_command_id,
+                open_act=True,
+            )
+            self.last_inventory_command_id = command_id
             already = command_already_applied(conn, command_id)
             if already is None:
                 try:

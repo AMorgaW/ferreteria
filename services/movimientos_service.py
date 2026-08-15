@@ -136,9 +136,15 @@ class MovimientosService:
         Registra un movimiento de inventario y actualiza el stock
         Returns: (éxito, mensaje)
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._registrar_movimiento_authoritative(
                 tipo, producto_id, cantidad, precio_unitario, proveedor_id,
                 num_factura, observaciones, en_cajas, num_cajas,
@@ -223,7 +229,11 @@ class MovimientosService:
             encolar(conn, "inventory_movement", movimiento_id, "create", "movimientos")
             encolar(conn, "product", producto_id, "update", "productos")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             
             # Registrar en auditoría
             self.auth.registrar_auditoria(
@@ -269,11 +279,20 @@ class MovimientosService:
             ledger_tipo, sign = movement_tipo_to_ledger(tipo)
         except QuantityScaleError as exc:
             return False, str(exc)
-        command_id = inventory_command_id or str(_uuid.uuid4())
-        self.last_inventory_command_id = command_id
         conn = self.db.conectar()
         cursor = conn.cursor()
+        command_id = None
         try:
+            from inventory_cutover import ACT_KIND_MOVEMENT
+            from inventory_writer_support import durable_act_command_id
+            command_id = durable_act_command_id(
+                conn,
+                ACT_KIND_MOVEMENT,
+                fingerprint=f"{producto_id}:{tipo}:{cantidad}:{observaciones or ''}",
+                explicit_command_id=inventory_command_id,
+                open_act=True,
+            )
+            self.last_inventory_command_id = command_id
             already = command_already_applied(conn, command_id)
             if already is not None:
                 marked = find_rows_marked_for_command(conn, command_id, table="movimientos")
@@ -565,9 +584,15 @@ class MovimientosService:
         Anula un movimiento y revierte el cambio en el stock
         NOTA: Usar con precaución
         """
-        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
-        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+        mode, frozen = resolve_writer_mode_or_frozen(
+            inventory_mode, db=self.db,
+            connection_factory=inventory_connection_factory,
+        )
+        if frozen:
+            return False, frozen
+        if mode == WRITER_MODE_AUTHORITATIVE:
             return self._anular_movimiento_authoritative(
                 movimiento_id, motivo,
                 inventory_command_id=inventory_command_id,
@@ -625,7 +650,11 @@ class MovimientosService:
             encolar(conn, "product", movimiento['producto_id'], "update", "productos")
             encolar(conn, "inventory_movement", movimiento_id, "update", "movimientos")
 
-            conn.commit()
+            from inventory_cutover import commit_legacy_inventory
+
+            commit_legacy_inventory(
+                conn, connection_factory=inventory_connection_factory
+            )
             
             # Registrar en auditoría
             self.auth.registrar_auditoria(
@@ -648,13 +677,13 @@ class MovimientosService:
         inventory_command_id, inventory_gateway, inventory_transport,
         inventory_connection_factory,
     ) -> Tuple[bool, str]:
-        import uuid as _uuid
+        from inventory_cutover import get_or_create_act_command_id
         from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
         from inventory_ledger import QuantityScaleError, UnknownProductError
         from inventory_writer_support import (
             DOCUMENTO_TIPO_MOVIMIENTO, MissingProductLocalIdError,
             bind_inventory_gateway, build_signed_operations, command_already_applied,
-            movement_tipo_to_ledger, unknown_writer_message,
+            command_motivo_marker, movement_tipo_to_ledger, unknown_writer_message,
         )
         if not self.auth.tiene_permiso('gestionar_movimientos'):
             return False, "No tiene permisos para anular movimientos"
@@ -662,17 +691,28 @@ class MovimientosService:
         if not movimiento:
             return False, "Movimiento no encontrado"
         obs = str(movimiento.get("observaciones") or "")
-        command_id = inventory_command_id or str(_uuid.uuid4())
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            command_id = get_or_create_act_command_id(
+                conn,
+                "anular_movimiento",
+                str(movimiento_id),
+                command_id=inventory_command_id,
+            )
+        except Exception as exc:
+            conn.close()
+            return False, str(exc)
         self.last_inventory_command_id = command_id
         if "[ANULADO]" in obs:
+            conn.close()
             return True, "Movimiento anulado"
         try:
             _tipo, sign = movement_tipo_to_ledger(movimiento["tipo"])
         except QuantityScaleError as exc:
+            conn.close()
             return False, str(exc)
         inverse = -sign * movimiento["cantidad"]
-        conn = self.db.conectar()
-        cursor = conn.cursor()
         try:
             already = command_already_applied(conn, command_id)
             if already is None:
@@ -700,7 +740,7 @@ class MovimientosService:
                 if result.outcome != OUTCOME_APPLIED:
                     conn.close()
                     return False, unknown_writer_message(result.command_id, result.error or result.outcome)
-            observacion_anulacion = f"[ANULADO] {motivo}"
+            observacion_anulacion = f"[ANULADO] {motivo} {command_motivo_marker(command_id)}"
             if movimiento.get("observaciones"):
                 observacion_anulacion = f"{movimiento['observaciones']} | {observacion_anulacion}"
             cursor.execute(

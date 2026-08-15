@@ -16,6 +16,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Tests locales no infieren ONLINE. Producción default ONLINE (HIGH 4).
+os.environ.setdefault("FERREPRO_INVENTORY_STATION_MODE", "OFFLINE")
+
 REPO_FERRETERIA_DB = REPO_ROOT / "ferreteria.db"
 
 

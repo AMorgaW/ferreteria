@@ -394,12 +394,19 @@ def declared_authoritative_exclude(table: str) -> Tuple[str, ...]:
     return tuple(spec.get("authoritative_exclude") or ())
 
 
-def fields_excluded_from_authoritative_write(table: str) -> Tuple[str, ...]:
+def fields_excluded_from_authoritative_write(
+    table: str, *, authoritative: Optional[bool] = None
+) -> Tuple[str, ...]:
     """Campos que el UPSERT LWW no debe tratar como autoridad.
 
-    En 1B devuelve vacío porque APPLY_AUTHORITATIVE_EXCLUDE es False.
+    APPLY_AUTHORITATIVE_EXCLUDE sigue False en fuente (1B–1E.2).
+    Tras cutover AUTHORITATIVE, ``authoritative=True`` aplica el exclude
+    declarado (productos.stock) sin mutar la constante.
     """
-    if not APPLY_AUTHORITATIVE_EXCLUDE:
+    apply = bool(APPLY_AUTHORITATIVE_EXCLUDE)
+    if authoritative is True:
+        apply = True
+    if not apply:
         return ()
     return declared_authoritative_exclude(table)
 

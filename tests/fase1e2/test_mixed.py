@@ -151,6 +151,11 @@ class W10W11W12W14Test(unittest.TestCase):
             self.assertTrue(ok3, msg3)
             self.assertEqual(transport2.calls[0]["tipo"], "COMPRA")
             self.assertEqual(transport2.calls[0]["operations"][0]["delta_scaled"], 1000)
+            conn = env.connect()
+            try:
+                self.assertEqual(stock_of(conn), 12)
+            finally:
+                conn.close()
 
     def test_w11_no_anula_dos_veces(self):
         with official_temp_db() as env:
