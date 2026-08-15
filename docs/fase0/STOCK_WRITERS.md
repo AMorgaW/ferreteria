@@ -1,11 +1,11 @@
 # Writers actuales de `productos.stock`
 
-Re-inventario **Fase 1E.0** (verificado contra código). Writers negativos
-**preparados en 1E.1** (código listo, cutover OFF). La lista canónica
+Re-inventario **Fase 1E.0** (verificado contra código). Writers negativos **preparados en 1E.1**; positivos y mixtos **preparados
+en 1E.2** (código listo, cutover OFF). La lista canónica
 ejecutable está en `tests/fase0/stock_writers.py`.
-El scanner (`tests/fase0/test_stock_writers.py` y `tests/fase1e`) falla si
-aparece un `UPDATE`/`INSERT` directo de `productos.stock` que no esté
-listado, ahora a **nivel función + SQL**.
+El scanner (`tests/fase0/test_stock_writers.py`, `tests/fase1e`,
+`tests/fase1e2`) falla si aparece un `UPDATE`/`INSERT` directo de
+`productos.stock` que no esté listado, ahora a **nivel función + SQL**.
 
 Cutover OFF: el SQL legacy de writers inventariados es
 `LEGACY_ALLOWED_PRE_CUTOVER`. Un UPDATE en una función no inventariada es
@@ -16,8 +16,8 @@ proyección local y (casi todas) encolan un snapshot LWW.
 `inventory_balances.quantity_scaled` es la autoridad online diseñada.
 `productos.stock` sigue legacy/LWW hasta el cutover único (1E.3).
 `APPLY_AUTHORITATIVE_EXCLUDE = False` (no cambiar en 1E.0).
-`INVENTORY_CUTOVER_ENABLED = False` (gateway creado; writers negativos
-preparados en 1E.1, **no** activados). Ver [FASE1E1.md](FASE1E1.md).
+`INVENTORY_CUTOVER_ENABLED = False` (gateway creado; W01–W18
+preparados en 1E.1/1E.2, **no** activados). Ver [FASE1E2.md](FASE1E2.md).
 
 Clasificación:
 
@@ -58,8 +58,8 @@ Directos (W01–W18) = 18. Derivados (D01–D04) = 4.
 | W14 | `repositories/inventario_repository.py` | `InventarioRepository.eliminar_movimiento` | MIXTO | ± inverso | sí | `SET stock = ?` | DELETE `movimientos_inventario` | sí | sí | *ninguno en UI* | Piso `<0` en Python. |
 | W15 | `services/mezclas_service.py` | `MezclasService.descontar_stock_mezcla` | NEGATIVO | − | sí | `stock = stock - ?` **sin** guard SQL | `SALIDA_VENTA` reutilizado | sí | sí | *ninguno* | 1E.1: DEPRECATED/DEAD + gateway. UI usa W03. No borrar. |
 | W16 | `local_server.py` | `LocalFerreteriaAPI.create_sale` | NEGATIVO | − | sí | `stock = stock - ?` **sin** `stock>=` | `SALIDA_VENTA` | sí | sí | `local_api_client`, `remote_adapters` | 1E.1: preparado. Mismo contrato que W03. Default legacy. |
-| W17 | `ui/dashboard_ui.py` | `editar_producto_factura` | MIXTO | ± `dif_cant` | sí | `stock = stock - ?` | no | no | sí | self | Writer en UI. Sin kardex/outbox. |
-| W18 | `ui/dashboard_ui.py` | `eliminar_producto_factura` | POSITIVO | + | sí | `stock = stock + ?` | DELETE `movimientos` | no | sí | self | Writer en UI. Sin outbox. |
+| W17 | `services/ventas_service.py` | `VentasService.editar_linea_factura` | MIXTO | ± `dif_cant` | sí | `stock = stock - ?` | no | no | sí | `dashboard_ui` | 1E.2: extraído de closure. Default legacy. |
+| W18 | `services/ventas_service.py` | `VentasService.eliminar_linea_factura` | POSITIVO | + | sí | `stock = stock + ?` | DELETE `movimientos` | no | sí | `dashboard_ui` | 1E.2: extraído de closure. Default legacy. |
 
 ## Sync que puede **pisar** stock sin vender (DERIVADO)
 
@@ -89,14 +89,15 @@ Métodos **sin caller de UI/producción** (siguen siendo writers; no se borran):
 - W14 `eliminar_movimiento`
 - W15 `descontar_stock_mezcla` (la venta de mezcla usa W03)
 
-## Dual authority — cómo se evita en 1E.1
+## Dual authority — cómo se evita en 1E.2
 
-Writers negativos tienen código autoritativo **inyectable**, no activado.
+W01–W18 tienen código autoritativo **inyectable**, no activado.
 El default es legacy. No hay dual-write (APPLY + `UPDATE productos.stock`
 independiente) en el camino autoritativo. Cutover OFF. La activación
 sigue siendo un **cutover único** en 1E.3.
 
 Commands `LEGACY_OBSERVED` no pueden aplicarse tras el seed.
+No hay replay de backlog.
 
 Tras APPLIED futuro, `productos.stock` sería proyección/caché reconstruible.
 Eso **no** está implementado en writers en 1E.0.

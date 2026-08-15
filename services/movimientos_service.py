@@ -126,11 +126,28 @@ class MovimientosService:
                             precio_unitario: float = 0, proveedor_id: Optional[int] = None,
                             num_factura: Optional[str] = None, 
                             observaciones: Optional[str] = None,
-                            en_cajas: bool = False, num_cajas: int = 0) -> Tuple[bool, str]:
+                            en_cajas: bool = False, num_cajas: int = 0,
+                            inventory_mode: Optional[str] = None,
+                            inventory_command_id: Optional[str] = None,
+                            inventory_gateway=None,
+                            inventory_transport=None,
+                            inventory_connection_factory=None) -> Tuple[bool, str]:
         """
         Registra un movimiento de inventario y actualiza el stock
         Returns: (éxito, mensaje)
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._registrar_movimiento_authoritative(
+                tipo, producto_id, cantidad, precio_unitario, proveedor_id,
+                num_factura, observaciones, en_cajas, num_cajas,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+
         # Verificar permisos
         if not self.auth.tiene_permiso('gestionar_movimientos'):
             return False, "No tiene permisos para gestionar movimientos"
@@ -225,6 +242,110 @@ class MovimientosService:
             conn.rollback()
             conn.close()
             return False, f"Error al registrar movimiento: {str(e)}"
+
+    def _registrar_movimiento_authoritative(
+        self, tipo, producto_id, cantidad, precio_unitario, proveedor_id,
+        num_factura, observaciones, en_cajas, num_cajas, *,
+        inventory_command_id, inventory_gateway, inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_MOVIMIENTO, MissingProductLocalIdError,
+            bind_inventory_gateway, build_signed_operations, command_already_applied,
+            command_motivo_marker, find_rows_marked_for_command, movement_tipo_to_ledger,
+            unknown_writer_message,
+        )
+        if not self.auth.tiene_permiso('gestionar_movimientos'):
+            return False, "No tiene permisos para gestionar movimientos"
+        producto = self.productos_repo.obtener_por_id(producto_id)
+        if not producto:
+            return False, "Producto no encontrado"
+        if cantidad <= 0:
+            return False, "La cantidad debe ser mayor a cero"
+        try:
+            ledger_tipo, sign = movement_tipo_to_ledger(tipo)
+        except QuantityScaleError as exc:
+            return False, str(exc)
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            already = command_already_applied(conn, command_id)
+            if already is not None:
+                marked = find_rows_marked_for_command(conn, command_id, table="movimientos")
+                if marked:
+                    conn.close()
+                    return True, "Movimiento registrado"
+            else:
+                operations = build_signed_operations(
+                    conn, [{"producto_id": producto_id, "delta": sign * cantidad}],
+                    command_id=command_id,
+                )
+                gw = bind_inventory_gateway(
+                    conn, gateway=inventory_gateway, transport=inventory_transport,
+                    connection_factory=inventory_connection_factory, cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo=ledger_tipo, operations=operations, command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_MOVIMIENTO, device_id=None,
+                        usuario_id=self.auth.usuario_actual.id if self.auth.usuario_actual else None,
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc))
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador"
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(result.command_id, result.error or result.outcome)
+            marker = command_motivo_marker(command_id)
+            costo_total = cantidad * precio_unitario
+            cursor.execute('''
+                INSERT INTO movimientos (
+                    tipo, producto_id, proveedor_id, usuario_id, cantidad,
+                    precio_unitario, costo_total, motivo, num_factura,
+                    en_cajas, num_cajas, observaciones
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                tipo, producto_id, proveedor_id,
+                self.auth.usuario_actual.id if self.auth.usuario_actual else None,
+                cantidad, precio_unitario, costo_total, marker, num_factura,
+                1 if en_cajas else 0, num_cajas, observaciones,
+            ))
+            from repositories._outbox import encolar
+            encolar(conn, "inventory_movement", cursor.lastrowid, "create", "movimientos")
+            if tipo == 'ENTRADA_COMPRA' and precio_unitario > 0:
+                cursor.execute(
+                    "UPDATE productos SET precio_compra = ?, proveedor_id = ? WHERE id = ?",
+                    (precio_unitario, proveedor_id, producto_id),
+                )
+            conn.commit()
+            conn.close()
+            return True, f"{tipo.replace('_', ' ').title()} registrada exitosamente"
+        except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, str(exc)
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))
     
     def obtener_historial(self, producto_id: Optional[int] = None,
                          proveedor_id: Optional[int] = None,
@@ -434,11 +555,27 @@ class MovimientosService:
         conn.close()
         return stats
     
-    def anular_movimiento(self, movimiento_id: int, motivo: str) -> Tuple[bool, str]:
+    def anular_movimiento(self, movimiento_id: int, motivo: str,
+                         inventory_mode: Optional[str] = None,
+                         inventory_command_id: Optional[str] = None,
+                         inventory_gateway=None,
+                         inventory_transport=None,
+                         inventory_connection_factory=None) -> Tuple[bool, str]:
         """
         Anula un movimiento y revierte el cambio en el stock
         NOTA: Usar con precaución
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._anular_movimiento_authoritative(
+                movimiento_id, motivo,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+
         if not self.auth.tiene_permiso('gestionar_movimientos'):
             return False, "No tiene permisos para anular movimientos"
         
@@ -505,6 +642,92 @@ class MovimientosService:
             conn.rollback()
             conn.close()
             return False, f"Error al anular movimiento: {str(e)}"
+
+    def _anular_movimiento_authoritative(
+        self, movimiento_id: int, motivo: str, *,
+        inventory_command_id, inventory_gateway, inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_MOVIMIENTO, MissingProductLocalIdError,
+            bind_inventory_gateway, build_signed_operations, command_already_applied,
+            movement_tipo_to_ledger, unknown_writer_message,
+        )
+        if not self.auth.tiene_permiso('gestionar_movimientos'):
+            return False, "No tiene permisos para anular movimientos"
+        movimiento = self.obtener_movimiento_por_id(movimiento_id)
+        if not movimiento:
+            return False, "Movimiento no encontrado"
+        obs = str(movimiento.get("observaciones") or "")
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        if "[ANULADO]" in obs:
+            return True, "Movimiento anulado"
+        try:
+            _tipo, sign = movement_tipo_to_ledger(movimiento["tipo"])
+        except QuantityScaleError as exc:
+            return False, str(exc)
+        inverse = -sign * movimiento["cantidad"]
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            already = command_already_applied(conn, command_id)
+            if already is None:
+                operations = build_signed_operations(
+                    conn, [{"producto_id": movimiento["producto_id"], "delta": inverse}],
+                    command_id=command_id,
+                )
+                gw = bind_inventory_gateway(
+                    conn, gateway=inventory_gateway, transport=inventory_transport,
+                    connection_factory=inventory_connection_factory, cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo="AJUSTE", operations=operations, command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_MOVIMIENTO, device_id=None,
+                        usuario_id=self.auth.usuario_actual.id if self.auth.usuario_actual else None,
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc))
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador"
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(result.command_id, result.error or result.outcome)
+            observacion_anulacion = f"[ANULADO] {motivo}"
+            if movimiento.get("observaciones"):
+                observacion_anulacion = f"{movimiento['observaciones']} | {observacion_anulacion}"
+            cursor.execute(
+                "UPDATE movimientos SET observaciones = ? WHERE id = ?",
+                (observacion_anulacion, movimiento_id),
+            )
+            from repositories._outbox import encolar
+            encolar(conn, "inventory_movement", movimiento_id, "update", "movimientos")
+            conn.commit()
+            conn.close()
+            return True, "Movimiento anulado"
+        except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, str(exc)
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))
     
     def obtener_kardex_producto(self, producto_id: int, limite: int = 50) -> List[dict]:
         """

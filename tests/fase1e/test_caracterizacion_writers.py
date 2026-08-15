@@ -535,42 +535,74 @@ class CaracterizacionMezclasYLanTest(unittest.TestCase):
 
 
 class CaracterizacionDashboardSqlTest(unittest.TestCase):
-    """W17/W18 viven en closures PySide; se caracteriza el SQL extraído."""
+    """W17/W18 extraídos a VentasService; el SQL ya no vive en closures."""
 
     def test_w17_editar_cantidad_sql_mixto(self):
         with official_temp_db() as env:
             conn = env.connect()
             try:
                 seed_producto(conn, env, stock=10)
-                conn.execute(
-                    "UPDATE productos SET stock = stock - ? WHERE id = ?", (2, 1)
-                )
+                insert_usuario(conn)
                 conn.commit()
-                self.assertEqual(stock_of(conn), 8)
-                conn.execute(
-                    "UPDATE productos SET stock = stock - ? WHERE id = ?", (-3, 1)
-                )
-                conn.commit()
-                self.assertEqual(stock_of(conn), 11)
+            finally:
+                conn.close()
+            svc = _ventas_service(env)
+            ok, msg, venta = svc.registrar_venta(
+                items=[{"producto_id": 1, "cantidad": 2, "precio_unitario": 1000}],
+                metodo_pago="CREDITO",
+            )
+            self.assertTrue(ok, msg)
+            conn = env.connect()
+            try:
+                det = conn.execute(
+                    "SELECT id FROM detalle_ventas WHERE venta_id = ?", (venta.id,)
+                ).fetchone()
+            finally:
+                conn.close()
+            ok2, msg2 = svc.editar_linea_factura(venta.id, det["id"], 5, 1000)
+            self.assertTrue(ok2, msg2)
+            conn = env.connect()
+            try:
+                self.assertEqual(stock_of(conn), 5)
             finally:
                 conn.close()
         src = (REPO_ROOT / "ui" / "dashboard_ui.py").read_text(encoding="utf-8")
-        self.assertIn("UPDATE productos SET stock = stock - ? WHERE id = ?", src)
-        self.assertIn("dif_cant = nueva_cant - cant_anterior", src)
+        self.assertNotIn("UPDATE productos SET stock = stock - ? WHERE id = ?", src)
+        self.assertIn("editar_linea_factura", src)
+        svc_src = (REPO_ROOT / "services" / "ventas_service.py").read_text(encoding="utf-8")
+        self.assertIn("UPDATE productos SET stock = stock - ? WHERE id = ?", svc_src)
 
     def test_w18_quitar_linea_sql_positivo(self):
         with official_temp_db() as env:
             conn = env.connect()
             try:
-                seed_producto(conn, env, stock=4)
-                conn.execute(
-                    "UPDATE productos SET stock = stock + ? WHERE id = ?", (6, 1)
-                )
+                seed_producto(conn, env, stock=10)
+                insert_usuario(conn)
                 conn.commit()
+            finally:
+                conn.close()
+            svc = _ventas_service(env)
+            ok, msg, venta = svc.registrar_venta(
+                items=[{"producto_id": 1, "cantidad": 2, "precio_unitario": 1000}],
+                metodo_pago="CREDITO",
+            )
+            self.assertTrue(ok, msg)
+            conn = env.connect()
+            try:
+                det = conn.execute(
+                    "SELECT id FROM detalle_ventas WHERE venta_id = ?", (venta.id,)
+                ).fetchone()
+            finally:
+                conn.close()
+            ok2, msg2 = svc.eliminar_linea_factura(venta.id, det["id"])
+            self.assertTrue(ok2, msg2)
+            conn = env.connect()
+            try:
                 self.assertEqual(stock_of(conn), 10)
             finally:
                 conn.close()
         src = (REPO_ROOT / "ui" / "dashboard_ui.py").read_text(encoding="utf-8")
-        self.assertIn("UPDATE productos SET stock = stock + ? WHERE id = ?", src)
-        self.assertIn("DELETE FROM movimientos", src)
-        self.assertIn("DELETE FROM detalle_ventas WHERE id = ?", src)
+        self.assertNotIn("UPDATE productos SET stock = stock + ? WHERE id = ?", src)
+        self.assertIn("eliminar_linea_factura", src)
+        svc_src = (REPO_ROOT / "services" / "ventas_service.py").read_text(encoding="utf-8")
+        self.assertIn("UPDATE productos SET stock = stock + ? WHERE id = ?", svc_src)

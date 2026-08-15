@@ -728,9 +728,29 @@ class VentasService:
         conn.close()
         return ventas
     
-    def cancelar_venta(self, venta_id: int, motivo: str) -> Tuple[bool, str]:
-        """Cancela una venta y revierte el inventario"""
-        
+    def cancelar_venta(self, venta_id: int, motivo: str,
+                       inventory_mode: Optional[str] = None,
+                       inventory_command_id: Optional[str] = None,
+                       inventory_gateway=None,
+                       inventory_transport=None,
+                       inventory_connection_factory=None) -> Tuple[bool, str]:
+        """Cancela una venta persistida y revierte el inventario.
+
+        No confundir con ui/ventas_ui_modern.cancelar_venta, que solo vacía
+        el carrito y no llama este método. W04 permanece preparado; no se borra.
+        """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._cancelar_venta_authoritative(
+                venta_id,
+                motivo,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+
         # Obtener venta con detalles
         venta = self.obtener_venta(venta_id)
         if not venta:
@@ -836,6 +856,150 @@ class VentasService:
             conn.close()
             return False, f"Error al cancelar venta: {str(e)}"
 
+    def _cancelar_venta_authoritative(
+        self,
+        venta_id: int,
+        motivo: str,
+        *,
+        inventory_command_id,
+        inventory_gateway,
+        inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_VENTA,
+            MissingProductLocalIdError,
+            bind_inventory_gateway,
+            build_positive_operations,
+            command_already_applied,
+            command_motivo_marker,
+            find_rows_marked_for_command,
+            unknown_writer_message,
+        )
+
+        venta = self.obtener_venta(venta_id)
+        if not venta:
+            return False, "Venta no encontrada"
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            already = command_already_applied(conn, command_id)
+            if venta['estado'] == 'CANCELADA':
+                conn.close()
+                if already is not None:
+                    return True, "Venta cancelada exitosamente"
+                return False, "La venta ya está cancelada"
+
+            if already is None:
+                try:
+                    operations = build_positive_operations(
+                        conn, venta['detalles'], command_id=command_id
+                    )
+                except MissingProductLocalIdError as exc:
+                    conn.close()
+                    return False, str(exc)
+                except (QuantityScaleError, UnknownProductError) as exc:
+                    conn.close()
+                    return False, str(exc)
+                gw = bind_inventory_gateway(
+                    conn,
+                    gateway=inventory_gateway,
+                    transport=inventory_transport,
+                    connection_factory=inventory_connection_factory,
+                    cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo="DEVOLUCION",
+                        operations=operations,
+                        command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_VENTA,
+                        documento_local_id=venta.get("local_id"),
+                        device_id=None,
+                        usuario_id=(
+                            self.auth.usuario_actual.id if self.auth.usuario_actual else None
+                        ),
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc))
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador"
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(
+                        result.command_id, result.error or result.outcome
+                    )
+            elif find_rows_marked_for_command(conn, command_id, table="movimientos"):
+                conn.close()
+                return True, "Venta cancelada exitosamente"
+
+            marker = command_motivo_marker(command_id)
+            cursor.execute('''
+                UPDATE ventas
+                SET estado = 'CANCELADA',
+                    observaciones = observaciones || ' | CANCELADA: ' || ?
+                WHERE id = ?
+            ''', (motivo, venta_id))
+            usuario_id = self.auth.usuario_actual.id if self.auth.usuario_actual else None
+            for detalle in venta['detalles']:
+                cursor.execute('''
+                    INSERT INTO movimientos (
+                        tipo, producto_id, usuario_id, cantidad,
+                        precio_unitario, costo_total, motivo, num_factura, fecha
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    'ENTRADA_DEVOLUCION',
+                    detalle['producto_id'],
+                    usuario_id,
+                    detalle['cantidad'],
+                    detalle['precio_unitario'],
+                    detalle['subtotal'],
+                    f'Cancelación de venta {venta["numero_factura"]}: {motivo} {marker}',
+                    venta['numero_factura'],
+                    obtener_fecha_actual()
+                ))
+                ensure_local_id(conn, "movimientos", cursor.lastrowid)
+            if venta['metodo_pago'] == 'CREDITO':
+                cursor.execute('''
+                    UPDATE cuentas_por_cobrar
+                    SET estado = 'CANCELADA'
+                    WHERE venta_id = ?
+                ''', (venta_id,))
+                if venta['cliente_id']:
+                    cursor.execute('''
+                        UPDATE clientes
+                        SET saldo_pendiente = saldo_pendiente - ?
+                        WHERE id = ?
+                    ''', (venta['total'], venta['cliente_id']))
+            venta_row = cursor.execute(
+                "SELECT * FROM ventas WHERE id = ?", (venta_id,)
+            ).fetchone()
+            if venta_row:
+                enqueue_sync(conn, "sale", venta_id, "update", dict(venta_row), "ventas")
+            conn.commit()
+            conn.close()
+            return True, "Venta cancelada exitosamente"
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))
+
     def cantidad_devuelta(self, venta_id: int, producto_id: int) -> float:
         """Unidades ya devueltas de un producto en una venta."""
         conn = self.db.conectar()
@@ -861,7 +1025,12 @@ class VentasService:
             conn.close()
 
     def registrar_devolucion(self, venta_id: int, items: Optional[List[dict]] = None,
-                             motivo: str = "") -> Tuple[bool, str, Optional[int]]:
+                             motivo: str = "",
+                             inventory_mode: Optional[str] = None,
+                             inventory_command_id: Optional[str] = None,
+                             inventory_gateway=None,
+                             inventory_transport=None,
+                             inventory_connection_factory=None) -> Tuple[bool, str, Optional[int]]:
         """Registra una devolución total o parcial de una venta.
 
         items: lista de {producto_id, cantidad}. Si es None/vacío se devuelve
@@ -869,6 +1038,19 @@ class VentasService:
         registra kardex (ENTRADA_DEVOLUCION), auditoría y sincronización.
         Valida: no devolver más de lo vendido ni duplicar devoluciones.
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._registrar_devolucion_authoritative(
+                venta_id,
+                items,
+                motivo,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+
         venta = self.obtener_venta(venta_id)
         if not venta:
             return False, "Venta no encontrada", None
@@ -996,6 +1178,196 @@ class VentasService:
             conn.rollback()
             conn.close()
             return False, f"Error al registrar devolución: {str(e)}", None
+
+    def _registrar_devolucion_authoritative(
+        self,
+        venta_id: int,
+        items: Optional[List[dict]],
+        motivo: str,
+        *,
+        inventory_command_id,
+        inventory_gateway,
+        inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str, Optional[int]]:
+        import uuid as _uuid
+
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_DEVOLUCION,
+            MissingProductLocalIdError,
+            bind_inventory_gateway,
+            build_positive_operations,
+            command_already_applied,
+            command_motivo_marker,
+            find_rows_marked_for_command,
+            operations_from_command_record,
+            unknown_writer_message,
+        )
+        from inventory_ledger import get_inventory_command_or_none
+
+        venta = self.obtener_venta(venta_id)
+        if not venta:
+            return False, "Venta no encontrada", None
+        if venta.get('estado') == 'CANCELADA':
+            return False, "La venta está cancelada; no admite devoluciones", None
+        usuario_id = self.auth.usuario_actual.id if (self.auth and self.auth.usuario_actual) else None
+        if not usuario_id:
+            return False, "Error: Usuario no autenticado", None
+
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        vendido, precio, nombre = {}, {}, {}
+        for d in venta['detalles']:
+            pid = d['producto_id']
+            vendido[pid] = vendido.get(pid, 0) + d['cantidad']
+            precio[pid] = d['precio_unitario']
+            nombre[pid] = d.get('producto_nombre', f'producto {pid}')
+
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            already = command_already_applied(conn, command_id)
+            marked = find_rows_marked_for_command(conn, command_id, table="movimientos")
+            if already is not None and marked:
+                row = cursor.execute(
+                    "SELECT id FROM devoluciones WHERE venta_id = ? ORDER BY id DESC LIMIT 1",
+                    (venta_id,),
+                ).fetchone()
+                conn.close()
+                return True, "Devolución registrada", row["id"] if row else None
+
+            ya = {}
+            for row in cursor.execute(
+                "SELECT producto_id, COALESCE(SUM(cantidad),0) AS c "
+                "FROM devolucion_detalle WHERE venta_id = ? GROUP BY producto_id",
+                (venta_id,),
+            ).fetchall():
+                ya[row['producto_id']] = row['c']
+
+            work_items = list(items) if items else None
+            if not work_items:
+                work_items = []
+                for pid, qty in vendido.items():
+                    restante = qty - ya.get(pid, 0)
+                    if restante > 0:
+                        work_items.append({'producto_id': pid, 'cantidad': restante})
+                if not work_items:
+                    conn.close()
+                    return False, "No hay unidades pendientes por devolver", None
+
+            for it in work_items:
+                pid = it.get('producto_id')
+                cant = it.get('cantidad', 0)
+                if cant is None or cant <= 0:
+                    conn.close()
+                    return False, "La cantidad a devolver debe ser mayor a 0", None
+                if pid not in vendido:
+                    conn.close()
+                    return False, f"El producto {pid} no pertenece a esta venta", None
+                disponible = vendido[pid] - ya.get(pid, 0)
+                if already is None and cant > disponible + 1e-9:
+                    conn.close()
+                    return False, (
+                        f"No se pueden devolver {cant} de '{nombre[pid]}': "
+                        f"vendidas {vendido[pid]}, ya devueltas {ya.get(pid, 0)}, "
+                        f"disponibles {disponible}"
+                    ), None
+
+            total_dev = sum(it['cantidad'] * precio.get(it['producto_id'], 0) for it in work_items)
+            total_vendido_unid = sum(vendido.values())
+            total_dev_unid = sum(ya.values()) + sum(it['cantidad'] for it in work_items)
+            tipo = 'TOTAL' if abs(total_dev_unid - total_vendido_unid) < 1e-9 else 'PARCIAL'
+
+            if already is None:
+                existing = get_inventory_command_or_none(conn, command_id)
+                try:
+                    if existing is not None:
+                        operations = operations_from_command_record(existing)
+                    else:
+                        operations = build_positive_operations(
+                            conn, work_items, command_id=command_id
+                        )
+                except MissingProductLocalIdError as exc:
+                    conn.close()
+                    return False, str(exc), None
+                except (QuantityScaleError, UnknownProductError) as exc:
+                    conn.close()
+                    return False, str(exc), None
+                gw = bind_inventory_gateway(
+                    conn,
+                    gateway=inventory_gateway,
+                    transport=inventory_transport,
+                    connection_factory=inventory_connection_factory,
+                    cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo="DEVOLUCION",
+                        operations=operations,
+                        command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_DEVOLUCION,
+                        device_id=None,
+                        usuario_id=usuario_id,
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc)), None
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador", None
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(
+                        result.command_id, result.error or result.outcome
+                    ), None
+
+            marker = command_motivo_marker(command_id)
+            cursor.execute('''
+                INSERT INTO devoluciones (venta_id, fecha, usuario_id, motivo, tipo, total_devuelto)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (venta_id, obtener_fecha_actual(), usuario_id, f"{motivo} {marker}", tipo, total_dev))
+            dev_id = cursor.lastrowid
+            for it in work_items:
+                pid = it['producto_id']
+                cant = it['cantidad']
+                pu = precio.get(pid, 0)
+                sub = cant * pu
+                cursor.execute('''
+                    INSERT INTO devolucion_detalle
+                        (devolucion_id, venta_id, producto_id, cantidad, precio_unitario, subtotal)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (dev_id, venta_id, pid, cant, pu, sub))
+                cursor.execute('''
+                    INSERT INTO movimientos (tipo, producto_id, usuario_id, cantidad,
+                        precio_unitario, costo_total, motivo, num_factura, fecha)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', ('ENTRADA_DEVOLUCION', pid, usuario_id, cant, pu, sub,
+                      f"Devolución venta {venta['numero_factura']}: {motivo} {marker}",
+                      venta['numero_factura'], obtener_fecha_actual()))
+                ensure_local_id(conn, "movimientos", cursor.lastrowid)
+            if tipo == 'TOTAL':
+                cursor.execute("UPDATE ventas SET estado = 'DEVUELTA' WHERE id = ?", (venta_id,))
+                vrow = cursor.execute("SELECT * FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+                if vrow:
+                    enqueue_sync(conn, "sale", venta_id, "update", dict(vrow), "ventas")
+            conn.commit()
+            conn.close()
+            if hasattr(self.productos_repo, 'invalidar_cache'):
+                self.productos_repo.invalidar_cache()
+            return True, f"Devolución {tipo} registrada por ${total_dev:,.0f}", dev_id
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e)), None
 
     def agregar_productos_a_factura(self, venta_id: int, nuevos_items: List[dict],
                                     inventory_mode: Optional[str] = None,
@@ -1219,6 +1591,8 @@ class VentasService:
             bind_inventory_gateway,
             build_negative_operations,
             command_already_applied,
+            command_motivo_marker,
+            find_rows_marked_for_command,
             unknown_writer_message,
         )
 
@@ -1229,8 +1603,12 @@ class VentasService:
         try:
             already = command_already_applied(conn, command_id)
             if already is not None:
-                conn.close()
-                return True, "Productos agregados exitosamente (comando ya APPLIED)"
+                marked = find_rows_marked_for_command(
+                    conn, command_id, table="movimientos"
+                )
+                if marked:
+                    conn.close()
+                    return True, "Productos agregados exitosamente (comando ya APPLIED)"
 
             cursor.execute('''
                 SELECT id, numero_factura, metodo_pago, total, estado_pago, cliente_id, local_id
@@ -1270,50 +1648,52 @@ class VentasService:
                 })
                 total_nuevo += subtotal
 
-            try:
-                operations = build_negative_operations(
-                    conn, nuevos_items, command_id=command_id
-                )
-            except MissingProductLocalIdError as exc:
-                conn.close()
-                return False, str(exc)
-            except (QuantityScaleError, UnknownProductError) as exc:
-                conn.close()
-                return False, str(exc)
+            if already is None:
+                try:
+                    operations = build_negative_operations(
+                        conn, nuevos_items, command_id=command_id
+                    )
+                except MissingProductLocalIdError as exc:
+                    conn.close()
+                    return False, str(exc)
+                except (QuantityScaleError, UnknownProductError) as exc:
+                    conn.close()
+                    return False, str(exc)
 
-            gw = bind_inventory_gateway(
-                conn,
-                gateway=inventory_gateway,
-                transport=inventory_transport,
-                connection_factory=inventory_connection_factory,
-                cutover_enabled=True,
-            )
-            try:
-                result = gw.submit(
-                    tipo="VENTA",
-                    operations=operations,
-                    command_id=command_id,
-                    documento_tipo=DOCUMENTO_TIPO_VENTA,
-                    documento_local_id=venta["local_id"],
-                    device_id=None,
-                    usuario_id=(
-                        self.auth.usuario_actual.id if self.auth.usuario_actual else None
-                    ),
+                gw = bind_inventory_gateway(
+                    conn,
+                    gateway=inventory_gateway,
+                    transport=inventory_transport,
+                    connection_factory=inventory_connection_factory,
+                    cutover_enabled=True,
                 )
-            except Exception as exc:
-                conn.close()
-                return False, unknown_writer_message(command_id, str(exc))
+                try:
+                    result = gw.submit(
+                        tipo="VENTA",
+                        operations=operations,
+                        command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_VENTA,
+                        documento_local_id=venta["local_id"],
+                        device_id=None,
+                        usuario_id=(
+                            self.auth.usuario_actual.id if self.auth.usuario_actual else None
+                        ),
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc))
 
-            self.last_gateway_result = result
-            if result.outcome == OUTCOME_REJECTED:
-                conn.close()
-                return False, result.error or "Inventario rechazado por el coordinador"
-            if result.outcome != OUTCOME_APPLIED:
-                conn.close()
-                return False, unknown_writer_message(
-                    result.command_id, result.error or result.outcome
-                )
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador"
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(
+                        result.command_id, result.error or result.outcome
+                    )
 
+            marker = command_motivo_marker(command_id)
             _nuevos_detalle_ids = []
             _nuevos_mov_ids = []
             usuario_id = self.auth.usuario_actual.id if self.auth.usuario_actual else None
@@ -1350,7 +1730,7 @@ class VentasService:
                     detalle['cantidad'],
                     detalle['precio_unitario'],
                     detalle['subtotal'],
-                    f'Adición a factura {venta["numero_factura"]}',
+                    f'Adición a factura {venta["numero_factura"]} {marker}',
                     venta['numero_factura'],
                     obtener_fecha_actual()
                 ))
@@ -1391,6 +1771,334 @@ class VentasService:
                 )
             conn.close()
             return True, f"Productos agregados exitosamente. Nuevo total: ${nuevo_total:,.0f}"
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))
+
+    def editar_linea_factura(
+        self,
+        venta_id: int,
+        detalle_id: int,
+        nueva_cantidad,
+        nuevo_precio,
+        inventory_mode: Optional[str] = None,
+        inventory_command_id: Optional[str] = None,
+        inventory_gateway=None,
+        inventory_transport=None,
+        inventory_connection_factory=None,
+    ) -> Tuple[bool, str]:
+        """W17: editar cantidad/precio de una línea de factura. MIXTO."""
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._editar_linea_factura_authoritative(
+                venta_id, detalle_id, nueva_cantidad, nuevo_precio,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            detalle = cursor.execute(
+                "SELECT * FROM detalle_ventas WHERE id = ? AND venta_id = ?",
+                (detalle_id, venta_id),
+            ).fetchone()
+            if not detalle:
+                conn.close()
+                return False, "Detalle no encontrado"
+            cant_anterior = detalle["cantidad"]
+            subtotal_anterior = detalle["subtotal"]
+            nuevo_subtotal = nueva_cantidad * nuevo_precio
+            dif_cant = nueva_cantidad - cant_anterior
+            cursor.execute(
+                "UPDATE detalle_ventas SET cantidad = ?, precio_unitario = ?, subtotal = ? WHERE id = ?",
+                (nueva_cantidad, nuevo_precio, nuevo_subtotal, detalle_id),
+            )
+            if dif_cant != 0:
+                cursor.execute(
+                    "UPDATE productos SET stock = stock - ? WHERE id = ?",
+                    (dif_cant, detalle["producto_id"]),
+                )
+            dif_subtotal = nuevo_subtotal - subtotal_anterior
+            cursor.execute(
+                "UPDATE ventas SET total = total + ?, subtotal = subtotal + ? WHERE id = ?",
+                (dif_subtotal, dif_subtotal, venta_id),
+            )
+            conn.commit()
+            conn.close()
+            return True, "Producto actualizado"
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+            return False, f"Error al editar: {e}"
+
+    def _editar_linea_factura_authoritative(
+        self, venta_id, detalle_id, nueva_cantidad, nuevo_precio, *,
+        inventory_command_id, inventory_gateway, inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_VENTA, NO_INVENTORY_CHANGE, MissingProductLocalIdError,
+            bind_inventory_gateway, build_signed_operations, command_already_applied,
+            unknown_writer_message,
+        )
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            detalle = cursor.execute(
+                "SELECT * FROM detalle_ventas WHERE id = ? AND venta_id = ?",
+                (detalle_id, venta_id),
+            ).fetchone()
+            if not detalle:
+                conn.close()
+                return False, "Detalle no encontrado"
+            venta = cursor.execute("SELECT * FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+            if not venta:
+                conn.close()
+                return False, "Venta no encontrada"
+            cant_anterior = detalle["cantidad"]
+            subtotal_anterior = detalle["subtotal"]
+            nuevo_subtotal = nueva_cantidad * nuevo_precio
+            dif_cant = nueva_cantidad - cant_anterior
+            already = command_already_applied(conn, command_id)
+            if already is None and dif_cant != 0:
+                try:
+                    operations = build_signed_operations(
+                        conn,
+                        [{"producto_id": detalle["producto_id"], "delta": -dif_cant}],
+                        command_id=command_id,
+                    )
+                except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+                    conn.close()
+                    return False, str(exc)
+                if operations:
+                    gw = bind_inventory_gateway(
+                        conn, gateway=inventory_gateway, transport=inventory_transport,
+                        connection_factory=inventory_connection_factory, cutover_enabled=True,
+                    )
+                    try:
+                        result = gw.submit(
+                            tipo="AJUSTE", operations=operations, command_id=command_id,
+                            documento_tipo=DOCUMENTO_TIPO_VENTA,
+                            documento_local_id=venta["local_id"] if "local_id" in venta.keys() else None,
+                            device_id=None,
+                            usuario_id=self.auth.usuario_actual.id if self.auth.usuario_actual else None,
+                        )
+                    except Exception as exc:
+                        conn.close()
+                        return False, unknown_writer_message(command_id, str(exc))
+                    self.last_gateway_result = result
+                    if result.outcome == OUTCOME_REJECTED:
+                        conn.close()
+                        return False, result.error or "Inventario rechazado por el coordinador"
+                    if result.outcome != OUTCOME_APPLIED:
+                        conn.close()
+                        return False, unknown_writer_message(result.command_id, result.error or result.outcome)
+                else:
+                    self.last_gateway_result = NO_INVENTORY_CHANGE
+            elif already is None:
+                self.last_gateway_result = NO_INVENTORY_CHANGE
+            cursor.execute(
+                "UPDATE detalle_ventas SET cantidad = ?, precio_unitario = ?, subtotal = ? WHERE id = ?",
+                (nueva_cantidad, nuevo_precio, nuevo_subtotal, detalle_id),
+            )
+            dif_subtotal = nuevo_subtotal - subtotal_anterior
+            cursor.execute(
+                "UPDATE ventas SET total = total + ?, subtotal = subtotal + ? WHERE id = ?",
+                (dif_subtotal, dif_subtotal, venta_id),
+            )
+            conn.commit()
+            conn.close()
+            return True, "Producto actualizado"
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))
+
+    def eliminar_linea_factura(
+        self, venta_id: int, detalle_id: int,
+        inventory_mode: Optional[str] = None,
+        inventory_command_id: Optional[str] = None,
+        inventory_gateway=None, inventory_transport=None,
+        inventory_connection_factory=None,
+    ) -> Tuple[bool, str]:
+        """W18: quitar una línea de factura y restituir stock. POSITIVO."""
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._eliminar_linea_factura_authoritative(
+                venta_id, detalle_id,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            detalle = cursor.execute(
+                "SELECT * FROM detalle_ventas WHERE id = ? AND venta_id = ?",
+                (detalle_id, venta_id),
+            ).fetchone()
+            if not detalle:
+                conn.close()
+                return False, "Detalle no encontrado"
+            venta = cursor.execute("SELECT * FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+            if not venta:
+                conn.close()
+                return False, "Venta no encontrada"
+            numero_factura = venta["numero_factura"]
+            cursor.execute(
+                "UPDATE productos SET stock = stock + ? WHERE id = ?",
+                (detalle["cantidad"], detalle["producto_id"]),
+            )
+            cursor.execute(
+                """
+                DELETE FROM movimientos WHERE id = (
+                    SELECT id FROM movimientos
+                    WHERE tipo = 'SALIDA_VENTA' AND num_factura = ?
+                    AND producto_id = ? AND cantidad = ?
+                    AND COALESCE(precio_unitario, 0) = COALESCE(?, 0)
+                    AND COALESCE(costo_total, 0) = COALESCE(?, 0)
+                    ORDER BY fecha DESC, id DESC LIMIT 1
+                )
+                """,
+                (
+                    numero_factura, detalle["producto_id"], detalle["cantidad"],
+                    detalle["precio_unitario"] if "precio_unitario" in detalle.keys() else 0,
+                    detalle["subtotal"] if "subtotal" in detalle.keys() else 0,
+                ),
+            )
+            cursor.execute("DELETE FROM detalle_ventas WHERE id = ?", (detalle_id,))
+            sub = detalle["subtotal"] if "subtotal" in detalle.keys() else 0
+            cursor.execute(
+                "UPDATE ventas SET total = total - ?, subtotal = subtotal - ? WHERE id = ?",
+                (sub, sub, venta_id),
+            )
+            conn.commit()
+            conn.close()
+            return True, "Producto eliminado"
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+            return False, f"Error al eliminar: {e}"
+
+    def _eliminar_linea_factura_authoritative(
+        self, venta_id, detalle_id, *, inventory_command_id, inventory_gateway,
+        inventory_transport, inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_VENTA, MissingProductLocalIdError,
+            bind_inventory_gateway, build_positive_operations, command_already_applied,
+            unknown_writer_message,
+        )
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            detalle = cursor.execute(
+                "SELECT * FROM detalle_ventas WHERE id = ? AND venta_id = ?",
+                (detalle_id, venta_id),
+            ).fetchone()
+            already = command_already_applied(conn, command_id)
+            if detalle is None:
+                conn.close()
+                if already is not None:
+                    return True, "Producto eliminado"
+                return False, "Detalle no encontrado"
+            venta = cursor.execute("SELECT * FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+            if not venta:
+                conn.close()
+                return False, "Venta no encontrada"
+            if already is None:
+                try:
+                    operations = build_positive_operations(
+                        conn,
+                        [{"producto_id": detalle["producto_id"], "cantidad": detalle["cantidad"]}],
+                        command_id=command_id,
+                    )
+                except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+                    conn.close()
+                    return False, str(exc)
+                gw = bind_inventory_gateway(
+                    conn, gateway=inventory_gateway, transport=inventory_transport,
+                    connection_factory=inventory_connection_factory, cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo="DEVOLUCION", operations=operations, command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_VENTA,
+                        documento_local_id=venta["local_id"] if "local_id" in venta.keys() else None,
+                        device_id=None,
+                        usuario_id=self.auth.usuario_actual.id if self.auth.usuario_actual else None,
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc))
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador"
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(result.command_id, result.error or result.outcome)
+            numero_factura = venta["numero_factura"]
+            cursor.execute(
+                """
+                DELETE FROM movimientos WHERE id = (
+                    SELECT id FROM movimientos
+                    WHERE tipo = 'SALIDA_VENTA' AND num_factura = ?
+                    AND producto_id = ? AND cantidad = ?
+                    AND COALESCE(precio_unitario, 0) = COALESCE(?, 0)
+                    AND COALESCE(costo_total, 0) = COALESCE(?, 0)
+                    ORDER BY fecha DESC, id DESC LIMIT 1
+                )
+                """,
+                (
+                    numero_factura, detalle["producto_id"], detalle["cantidad"],
+                    detalle["precio_unitario"] if "precio_unitario" in detalle.keys() else 0,
+                    detalle["subtotal"] if "subtotal" in detalle.keys() else 0,
+                ),
+            )
+            cursor.execute("DELETE FROM detalle_ventas WHERE id = ?", (detalle_id,))
+            sub = detalle["subtotal"] if "subtotal" in detalle.keys() else 0
+            cursor.execute(
+                "UPDATE ventas SET total = total - ?, subtotal = subtotal - ? WHERE id = ?",
+                (sub, sub, venta_id),
+            )
+            conn.commit()
+            conn.close()
+            return True, "Producto eliminado"
         except Exception as e:
             try:
                 conn.rollback()

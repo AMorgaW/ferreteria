@@ -157,7 +157,13 @@ def scan_stock_writes_by_function():
                 if wfile != rel:
                     continue
                 token = wfunc.split(".")[-1]
-                if token == name or wfunc == qual or qual.endswith("." + wfunc):
+                auth_name = f"_{token}_authoritative"
+                if (
+                    token == name
+                    or name == auth_name
+                    or wfunc == qual
+                    or qual.endswith("." + wfunc)
+                ):
                     writer_id = wid
                     break
             status = (
@@ -309,14 +315,19 @@ class StockWritersStaticTest(unittest.TestCase):
             self.assertEqual(hit["file"], writer["file"])
 
     def test_negativos_preparados_siguen_legacy_sql_pre_cutover(self):
-        from tests.fase0.stock_writers import GATEWAY_PREPARED_IDS, NEGATIVE_WRITER_IDS
-
-        self.assertEqual(set(NEGATIVE_WRITER_IDS), GATEWAY_PREPARED_IDS)
-        hits = scan_stock_writes_by_function()
-        negative_hits = [h for h in hits if h["writer_id"] in GATEWAY_PREPARED_IDS]
-        self.assertEqual(
-            {h["writer_id"] for h in negative_hits},
-            set(NEGATIVE_WRITER_IDS),
+        from tests.fase0.stock_writers import (
+            DIRECT_WRITER_IDS,
+            GATEWAY_PREPARED_IDS,
+            NEGATIVE_WRITER_IDS,
         )
-        for hit in negative_hits:
+
+        self.assertEqual(set(DIRECT_WRITER_IDS), GATEWAY_PREPARED_IDS)
+        self.assertTrue(set(NEGATIVE_WRITER_IDS).issubset(GATEWAY_PREPARED_IDS))
+        hits = scan_stock_writes_by_function()
+        prepared_hits = [h for h in hits if h["writer_id"] in GATEWAY_PREPARED_IDS]
+        self.assertEqual(
+            {h["writer_id"] for h in prepared_hits},
+            set(DIRECT_WRITER_IDS),
+        )
+        for hit in prepared_hits:
             self.assertEqual(hit["status"], PRE_CUTOVER_SQL_ALLOWED)

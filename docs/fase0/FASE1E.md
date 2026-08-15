@@ -1,7 +1,7 @@
 # Fase 1E — Migración de writers al coordinador
 
-**Estado 1E.1:** implementada (writers negativos preparados). Cutover **OFF**.
-**No autoriza 1E.2+.** No activa autoridad. No seed.
+**Estado 1E.2:** implementada (positivos y mixtos preparados). Cutover **OFF**.
+**No autoriza 1E.3.** No activa autoridad. No seed.
 **No declara INV-01 resuelto en SQLite.** **No declara INV-02 resuelto.**
 `APPLY_AUTHORITATIVE_EXCLUDE` sigue `False`.
 
@@ -10,8 +10,8 @@
 | Subfase | Qué es | Estado |
 |---|---|---|
 | **1E.0** | Inventario definitivo de writers + `InventoryGateway`. Cutover default OFF. Writers productivos **no** llaman al gateway ni al coordinador. | **Cerrada.** |
-| **1E.1** | Migrar writers **negativos** (uno a uno) para que *puedan* usar el gateway, **sin activar autoridad**. Cutover sigue OFF. | **Esta fase. Implementada.** Ver [FASE1E1.md](FASE1E1.md). |
-| **1E.2** | Migrar writers **positivos y mixtos**, mismo régimen: código listo, autoridad apagada. | **No autorizada.** STOP. |
+| **1E.1** | Migrar writers **negativos** (uno a uno) para que *puedan* usar el gateway, **sin activar autoridad**. Cutover sigue OFF. | **Cerrada.** Ver [FASE1E1.md](FASE1E1.md). |
+| **1E.2** | Migrar writers **positivos y mixtos**, mismo régimen: código listo, autoridad apagada. | **Esta fase. Implementada.** Ver [FASE1E2.md](FASE1E2.md). |
 | **1E.3** | **Cutover único.** Activar `INVENTORY_CUTOVER_ENABLED`. Semilla. Retirar writers legacy. Decisión sobre `productos.stock` / LWW. | **No autorizada.** Ver precondiciones abajo. |
 | **1E.4** | Certificación final (PostgreSQL real, no dual authority, scanners, rollback operativo documentado). | **No autorizada.** |
 
@@ -138,15 +138,18 @@ Riesgo de dual authority: si un writer migrado aplicara en PostgreSQL
 **y** otro siguiera haciendo `UPDATE productos.stock`, el pull LWW
 pisaría o divergería. Por eso el cutover es único y 1E.0 no activa nada.
 
-## Deuda de 1E.0 — estado en 1E.1
+## Deuda de 1E.0 — estado en 1E.2
 
 1. Scanner a nivel función/SQL: **cerrada** en 1E.1.
 2. Reconnect test sin `transport=` inyectado: **cerrada** (pasa por
    `apply_inventory_command`).
-3. Caracterización W17/W18 con closures PySide: **aplazada a 1E.2**.
+3. Caracterización W17/W18 con closures PySide: **cerrada** en 1E.2
+   (mutación en `VentasService`).
 4. Timeout/deadlock post-persist → UNKNOWN: **cerrada** en 1E.1.
+5. `intent_class` fail-closed + recovery post-APPLY W06/W02/W15: **cerrada**
+   en 1E.2.
 
 ## STOP
 
-**STOP — no implementar 1E.2.** No cutover. No seed. No migrar positivos/mixtos.
-El detalle de 1E.1 está en [FASE1E1.md](FASE1E1.md).
+**STOP — no implementar 1E.3.** No cutover. No seed.
+El detalle de 1E.2 está en [FASE1E2.md](FASE1E2.md).

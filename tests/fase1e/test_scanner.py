@@ -32,9 +32,9 @@ class Fase1EScannerTest(unittest.TestCase):
         self.assertEqual(CLASSIFICATION_COUNTS["DERIVADO"], 4)
         self.assertEqual(CLASSIFICATION_COUNTS["UNKNOWN"], 0)
         self.assertEqual(len(STOCK_WRITERS), 22)
-        self.assertEqual(len(UPDATE_STOCK_FILES), 8)
+        self.assertEqual(len(UPDATE_STOCK_FILES), 7)
         self.assertEqual(INSERT_STOCK_FILES, frozenset({"repositories/productos_repo.py"}))
-        self.assertEqual(len(DIRECT_STOCK_WRITER_FILES), 8)
+        self.assertEqual(len(DIRECT_STOCK_WRITER_FILES), 7)
 
     def test_scan_no_deja_archivos_fuera(self):
         update_found, insert_found, _ = _scan_direct_stock_files()
@@ -55,7 +55,7 @@ class Fase1EScannerTest(unittest.TestCase):
         untracked = [h for h in hits if h["status"] == UNTRACKED_DIRECT_WRITER]
         self.assertFalse(untracked, msg=repr(untracked))
         found = {h["writer_id"] for h in hits if h["writer_id"] in GATEWAY_PREPARED_IDS}
-        self.assertEqual(found, set(NEGATIVE_WRITER_IDS))
+        self.assertEqual(found, GATEWAY_PREPARED_IDS)
         for hit in hits:
             if hit["writer_id"] in GATEWAY_PREPARED_IDS:
                 self.assertEqual(hit["status"], PRE_CUTOVER_SQL_ALLOWED)

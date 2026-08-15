@@ -201,11 +201,29 @@ class ProductosRepository:
         finally:
             conn.close()
 
-    def crear_producto(self, producto: Producto) -> Tuple[bool, str, Optional[int]]:
+    def crear_producto(self, producto: Producto,
+                       inventory_mode: Optional[str] = None,
+                       inventory_command_id: Optional[str] = None,
+                       inventory_gateway=None,
+                       inventory_transport=None,
+                       inventory_connection_factory=None,
+                       producto_local_id: Optional[str] = None) -> Tuple[bool, str, Optional[int]]:
         """
         Crea un nuevo producto en la base de datos
         Returns: (éxito, mensaje, id_producto)
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._crear_producto_authoritative(
+                producto,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+                producto_local_id=producto_local_id,
+            )
+
         # 1) Validación en la capa de datos (no solo en el formulario)
         valido, msg_val = producto.validar()
         if not valido:
@@ -301,9 +319,202 @@ class ProductosRepository:
         except Exception as e:
             conn.close()
             return False, f"Error al crear producto: {str(e)}", None
-    
-    def actualizar_producto(self, producto: Producto) -> Tuple[bool, str]:
-        """Actualiza un producto existente"""
+
+    def _crear_producto_authoritative(
+        self, producto: Producto, *, inventory_command_id, inventory_gateway,
+        inventory_transport, inventory_connection_factory, producto_local_id,
+    ) -> Tuple[bool, str, Optional[int]]:
+        import uuid as _uuid
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError, get_inventory_command_or_none
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_PRODUCTO, NO_INVENTORY_CHANGE, MissingProductLocalIdError,
+            bind_inventory_gateway, build_positive_operations, command_already_applied,
+            command_motivo_marker, find_rows_marked_for_command,
+            operations_from_command_record, unknown_writer_message,
+        )
+        valido, msg_val = producto.validar()
+        if not valido:
+            return False, msg_val, None
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        local_id = producto_local_id or str(_uuid.uuid4())
+        try:
+            local_id = str(_uuid.UUID(str(local_id)))
+        except (ValueError, AttributeError, TypeError):
+            return False, "producto_local_id inválido", None
+        initial = producto.stock or 0
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            existing_row = cursor.execute(
+                "SELECT id FROM productos WHERE local_id = ?", (local_id,)
+            ).fetchone()
+            if existing_row is None and self.existe_duplicado(
+                producto.nombre, producto.marca,
+                producto.presentacion, producto.unidad_medida,
+            ):
+                conn.close()
+                return False, ("Ya existe un producto con el mismo nombre, marca, "
+                               "presentación y unidad de medida. Si es una variante "
+                               "distinta, especifique el tamaño/medida en 'Presentación'."), None
+            already = command_already_applied(conn, command_id)
+            if existing_row and already is not None:
+                producto_id = existing_row["id"]
+                if initial > 0 and not find_rows_marked_for_command(
+                    conn, command_id, table="movimientos"
+                ):
+                    uid = (self.auth.usuario_actual.id
+                           if (self.auth and getattr(self.auth, 'usuario_actual', None))
+                           else None)
+                    marker = command_motivo_marker(command_id)
+                    cursor.execute('''
+                        INSERT INTO movimientos (tipo, producto_id, usuario_id, cantidad,
+                            precio_unitario, costo_total, motivo, fecha)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', ('ENTRADA_AJUSTE', producto_id, uid, initial,
+                          producto.precio_compra or 0,
+                          (producto.precio_compra or 0) * initial,
+                          f'Stock inicial al crear producto {marker}', _ahora()))
+                    self._encolar_sync(conn, "inventory_movement", cursor.lastrowid, "create", "movimientos")
+                    conn.commit()
+                else:
+                    conn.close()
+                    return True, "Producto creado exitosamente", producto_id
+                conn.close()
+                self.invalidar_cache()
+                return True, "Producto creado exitosamente", producto_id
+            if existing_row and initial <= 0:
+                conn.close()
+                return True, "Producto creado exitosamente", existing_row["id"]
+
+            if existing_row:
+                producto_id = existing_row["id"]
+            else:
+                cursor.execute('''
+                    INSERT INTO productos (
+                        codigo_barras, nombre, categoria, marca, presentacion, proveedor_id,
+                        precio_compra, precio_venta, stock, stock_minimo,
+                        ubicacion, descripcion, unidad_medida, viene_en_caja,
+                        unidades_por_caja, unidades_por_media_caja, vende_por_empaque,
+                        permite_decimales, iva, activo, local_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    producto.codigo_barras, producto.nombre, producto.categoria,
+                    producto.marca, producto.presentacion, producto.proveedor_id,
+                    producto.precio_compra, producto.precio_venta,
+                    0,
+                    producto.stock_minimo, producto.ubicacion, producto.descripcion,
+                    producto.unidad_medida, 1 if producto.viene_en_caja else 0,
+                    producto.unidades_por_caja, producto.unidades_por_media_caja,
+                    producto.vende_por_empaque, 1 if producto.permite_decimales else 0,
+                    producto.iva, 1 if producto.activo else 0, local_id,
+                ))
+                producto_id = cursor.lastrowid
+                if not (producto.codigo_barras or '').strip():
+                    sku = self._generar_sku_unico(cursor, producto, producto_id)
+                    cursor.execute('UPDATE productos SET codigo_barras = ? WHERE id = ?',
+                                   (sku, producto_id))
+                self._encolar_sync(conn, "product", producto_id, "create", "productos")
+
+            if initial <= 0:
+                conn.commit()
+                conn.close()
+                self.invalidar_cache()
+                self.last_gateway_result = NO_INVENTORY_CHANGE
+                return True, "Producto creado exitosamente", producto_id
+
+            if already is None:
+                try:
+                    existing_cmd = get_inventory_command_or_none(conn, command_id)
+                    if existing_cmd is not None:
+                        operations = operations_from_command_record(existing_cmd)
+                    else:
+                        operations = build_positive_operations(
+                            conn, [{"producto_id": producto_id, "cantidad": initial}],
+                            command_id=command_id,
+                        )
+                except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+                    conn.rollback()
+                    conn.close()
+                    return False, str(exc), None
+                gw = bind_inventory_gateway(
+                    conn, gateway=inventory_gateway, transport=inventory_transport,
+                    connection_factory=inventory_connection_factory, cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo="AJUSTE", operations=operations, command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_PRODUCTO, documento_local_id=local_id,
+                        device_id=None,
+                        usuario_id=(self.auth.usuario_actual.id
+                                    if (self.auth and getattr(self.auth, 'usuario_actual', None))
+                                    else None),
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc)), None
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador", None
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(result.command_id, result.error or result.outcome), None
+
+            uid = (self.auth.usuario_actual.id
+                   if (self.auth and getattr(self.auth, 'usuario_actual', None))
+                   else None)
+            marker = command_motivo_marker(command_id)
+            cursor.execute('''
+                INSERT INTO movimientos (tipo, producto_id, usuario_id, cantidad,
+                    precio_unitario, costo_total, motivo, fecha)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', ('ENTRADA_AJUSTE', producto_id, uid, initial,
+                  producto.precio_compra or 0,
+                  (producto.precio_compra or 0) * initial,
+                  f'Stock inicial al crear producto {marker}', _ahora()))
+            self._encolar_sync(conn, "inventory_movement", cursor.lastrowid, "create", "movimientos")
+            conn.commit()
+            conn.close()
+            self.invalidar_cache()
+            return True, "Producto creado exitosamente", producto_id
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e)), None
+
+    def actualizar_producto(self, producto: Producto,
+                            inventory_mode: Optional[str] = None,
+                            inventory_command_id: Optional[str] = None,
+                            inventory_gateway=None,
+                            inventory_transport=None,
+                            inventory_connection_factory=None,
+                            inventory_stock_base_scaled: Optional[int] = None) -> Tuple[bool, str]:
+        """Actualiza un producto existente.
+
+        Legacy: metadata y stock viajan juntos (SET stock = ?).
+        Autoritativo: UPDATE de metadata no puede mutar stock; un cambio de
+        stock requiere InventoryCommand AJUSTE.
+        """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._actualizar_producto_authoritative(
+                producto,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+                inventory_stock_base_scaled=inventory_stock_base_scaled,
+            )
+
         valido, msg_val = producto.validar()
         if not valido:
             return False, msg_val
@@ -392,6 +603,133 @@ class ProductosRepository:
         except Exception as e:
             conn.close()
             return False, f"Error al actualizar producto: {str(e)}"
+
+    def _actualizar_producto_authoritative(
+        self, producto: Producto, *, inventory_command_id, inventory_gateway,
+        inventory_transport, inventory_connection_factory, inventory_stock_base_scaled,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED, InventoryGatewayError
+        from inventory_ledger import QuantityScaleError, UnknownProductError, get_inventory_command_or_none
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_PRODUCTO, NO_INVENTORY_CHANGE, MissingProductLocalIdError,
+            bind_inventory_gateway, build_absolute_operations, command_already_applied,
+            operations_from_command_record, require_producto_local_id,
+            resolve_authoritative_base_scaled, unknown_writer_message,
+        )
+        valido, msg_val = producto.validar()
+        if not valido:
+            return False, msg_val
+        if self.existe_duplicado(producto.nombre, producto.marca,
+                                 producto.presentacion, producto.unidad_medida,
+                                 exclude_id=producto.id):
+            return False, ("Ya existe otro producto con el mismo nombre, marca, "
+                           "presentación y unidad de medida.")
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            current = cursor.execute(
+                "SELECT stock, local_id, precio_venta, precio_compra FROM productos WHERE id = ?",
+                (producto.id,),
+            ).fetchone()
+            if not current:
+                conn.close()
+                return False, "Producto no encontrado"
+            target_stock = producto.stock
+            stock_changed = int(current["stock"]) != int(target_stock)
+            already = command_already_applied(conn, command_id)
+            if stock_changed and already is None:
+                try:
+                    existing_cmd = get_inventory_command_or_none(conn, command_id)
+                    if existing_cmd is not None:
+                        operations = operations_from_command_record(existing_cmd)
+                    else:
+                        local_id = require_producto_local_id(conn, producto.id)
+                        base = resolve_authoritative_base_scaled(
+                            local_id,
+                            explicit_base_scaled=inventory_stock_base_scaled,
+                            connection_factory=inventory_connection_factory,
+                        )
+                        operations = build_absolute_operations(
+                            conn, command_id=command_id, producto_id=producto.id,
+                            target_qty=target_stock, base_scaled=base,
+                        )
+                except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+                    conn.close()
+                    return False, str(exc)
+                except InventoryGatewayError as exc:
+                    conn.close()
+                    return False, str(exc)
+                if operations:
+                    gw = bind_inventory_gateway(
+                        conn, gateway=inventory_gateway, transport=inventory_transport,
+                        connection_factory=inventory_connection_factory, cutover_enabled=True,
+                    )
+                    try:
+                        result = gw.submit(
+                            tipo="AJUSTE", operations=operations, command_id=command_id,
+                            documento_tipo=DOCUMENTO_TIPO_PRODUCTO,
+                            documento_local_id=current["local_id"],
+                            device_id=None,
+                            usuario_id=(self.auth.usuario_actual.id
+                                        if (self.auth and getattr(self.auth, 'usuario_actual', None))
+                                        else None),
+                        )
+                    except Exception as exc:
+                        conn.close()
+                        return False, unknown_writer_message(command_id, str(exc))
+                    self.last_gateway_result = result
+                    if result.outcome == OUTCOME_REJECTED:
+                        conn.close()
+                        return False, result.error or "Inventario rechazado por el coordinador"
+                    if result.outcome != OUTCOME_APPLIED:
+                        conn.close()
+                        return False, unknown_writer_message(result.command_id, result.error or result.outcome)
+                else:
+                    self.last_gateway_result = NO_INVENTORY_CHANGE
+            elif not stock_changed:
+                self.last_gateway_result = NO_INVENTORY_CHANGE
+
+            cursor.execute('''
+                UPDATE productos SET
+                    codigo_barras = ?, nombre = ?, categoria = ?, marca = ?,
+                    presentacion = ?, proveedor_id = ?, precio_compra = ?,
+                    precio_venta = ?, stock_minimo = ?, ubicacion = ?,
+                    descripcion = ?, unidad_medida = ?, viene_en_caja = ?,
+                    unidades_por_caja = ?, unidades_por_media_caja = ?,
+                    vende_por_empaque = ?, permite_decimales = ?, iva = ?, activo = ?
+                WHERE id = ?
+            ''', (
+                producto.codigo_barras, producto.nombre, producto.categoria,
+                producto.marca, producto.presentacion, producto.proveedor_id,
+                producto.precio_compra, producto.precio_venta,
+                producto.stock_minimo, producto.ubicacion, producto.descripcion,
+                producto.unidad_medida, 1 if producto.viene_en_caja else 0,
+                producto.unidades_por_caja, producto.unidades_por_media_caja,
+                producto.vende_por_empaque, 1 if producto.permite_decimales else 0,
+                producto.iva, 1 if producto.activo else 0, producto.id
+            ))
+            self._registrar_cambio_precio(cursor, producto.id, 'venta',
+                                          current["precio_venta"], producto.precio_venta)
+            self._registrar_cambio_precio(cursor, producto.id, 'compra',
+                                          current["precio_compra"], producto.precio_compra)
+            self._encolar_sync(conn, "product", producto.id, "update", "productos")
+            conn.commit()
+            conn.close()
+            self.invalidar_cache()
+            return True, "Producto actualizado exitosamente"
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))
     
     def obtener_por_id(self, producto_id: int) -> Optional[dict]:
         """Obtiene un producto por su ID"""
@@ -496,11 +834,27 @@ class ProductosRepository:
         
         return [dict(row) for row in rows]
     
-    def actualizar_stock(self, producto_id: int, cantidad: int, operacion: str = 'sumar') -> Tuple[bool, str]:
+    def actualizar_stock(self, producto_id: int, cantidad: int, operacion: str = 'sumar',
+                         inventory_mode: Optional[str] = None,
+                         inventory_command_id: Optional[str] = None,
+                         inventory_gateway=None,
+                         inventory_transport=None,
+                         inventory_connection_factory=None) -> Tuple[bool, str]:
         """
         Actualiza el stock de un producto
-        operacion: 'sumar' o 'restar'
+        operacion: 'sumar' o 'restar' (DELTA, no valor absoluto)
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._actualizar_stock_authoritative(
+                producto_id, cantidad, operacion,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+
         conn = self.db.conectar()
         cursor = conn.cursor()
         
@@ -541,6 +895,70 @@ class ProductosRepository:
         except Exception as e:
             conn.close()
             return False, f"Error actualizando stock: {str(e)}"
+
+    def _actualizar_stock_authoritative(
+        self, producto_id: int, cantidad: int, operacion: str, *,
+        inventory_command_id, inventory_gateway, inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_AJUSTE, MissingProductLocalIdError,
+            bind_inventory_gateway, build_signed_operations, command_already_applied,
+            unknown_writer_message,
+        )
+        if operacion not in ('sumar', 'restar'):
+            return False, "Operación inválida"
+        if cantidad is None or cantidad <= 0:
+            return False, "La cantidad debe ser mayor a 0"
+        signed = cantidad if operacion == 'sumar' else -cantidad
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        try:
+            already = command_already_applied(conn, command_id)
+            if already is None:
+                try:
+                    operations = build_signed_operations(
+                        conn, [{"producto_id": producto_id, "delta": signed}],
+                        command_id=command_id,
+                    )
+                except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+                    conn.close()
+                    return False, str(exc)
+                if not operations:
+                    conn.close()
+                    return True, "Stock actualizado. Sin cambio de inventario"
+                gw = bind_inventory_gateway(
+                    conn, gateway=inventory_gateway, transport=inventory_transport,
+                    connection_factory=inventory_connection_factory, cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo="AJUSTE", operations=operations, command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_AJUSTE, device_id=None, usuario_id=None,
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc))
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador"
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(result.command_id, result.error or result.outcome)
+            conn.close()
+            self.invalidar_cache()
+            return True, "Stock actualizado"
+        except Exception as e:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))
     
     def obtener_productos_stock_bajo(self) -> List[dict]:
         """Obtiene productos con stock bajo o crítico"""

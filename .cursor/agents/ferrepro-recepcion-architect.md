@@ -52,11 +52,16 @@ con el mismo `command_id`. No reabrir el ledger 1C.
 **Fase 1E.0 (cerrada):** inventario de writers + `inventory_gateway.py`.
 Cutover DEFAULT OFF. No migró writers.
 
-**Fase 1E.1 (autorizada):** preparar writers **negativos** (W03, W16, W06,
-W02, W15) para el gateway **sin activar cutover**. Barrera
-`LEGACY_OBSERVED`. Timeout/deadlock → UNKNOWN. Scanner a función.
+**Fase 1E.1 (cerrada):** writers **negativos** preparados, cutover OFF,
+barrera `LEGACY_OBSERVED`.
 
-**Prohibido (1E.2+ no autorizada):** migrar positivos/mixtos, cutover ON,
+**Fase 1E.2 (autorizada):** preparar writers **positivos y mixtos**
+(W01, W04, W05, W07–W14, W17, W18) **sin activar cutover**. Deudas 1E.1:
+`intent_class` fail-closed; recovery post-APPLY W06/W02/W15. Extraer
+W17/W18 de closures. Stock absoluto con CAS `expected_base_scaled`.
+No dual-write. No seed. No backlog replay.
+
+**Prohibido (1E.3+ no autorizada):** cutover ON, seed,
 `APPLY_AUTHORITATIVE_EXCLUDE = True`, barcodes múltiples, recepción, OCR,
 fencing/leases/`OFFLINE_INVENTORY_AUTHORITY`, UI nueva.
 

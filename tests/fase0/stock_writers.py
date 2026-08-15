@@ -5,7 +5,8 @@ El scanner de `test_stock_writers.py` (y `tests/fase1e`) falla si aparece un
 UPDATE/INSERT directo de `productos.stock` que no esté listado.
 
 Ninguna de estas rutas es la autoridad futura. Todas mutan la proyección
-local y (casi todas) encolan un snapshot LWW. Cutover 1E.0 = OFF.
+local y (casi todas) encolan un snapshot LWW. Cutover 1E.2 = OFF.
+W01–W18 preparados (código listo, no activados).
 """
 from __future__ import annotations
 
@@ -295,8 +296,8 @@ STOCK_WRITERS: Tuple[dict, ...] = (
     },
     {
         "id": "W17",
-        "file": "ui/dashboard_ui.py",
-        "function": "editar_producto_factura (closure)",
+        "file": "services/ventas_service.py",
+        "function": "VentasService.editar_linea_factura",
         "business": "editar cantidad de línea de factura",
         "sign": "+/- (dif_cant = nueva - anterior)",
         "classification": "MIXTO",
@@ -307,13 +308,13 @@ STOCK_WRITERS: Tuple[dict, ...] = (
         "outbox": False,
         "offline_possible": True,
         "callers": ("ui/dashboard_ui.py",),
-        "risk": "Writer en UI. Sin kardex. Sin outbox. Sin piso stock>=.",
+        "risk": "1E.2: extraído de dashboard. Sin kardex. Sin outbox. Sin piso stock>=. Default legacy.",
         "kind": "direct",
     },
     {
         "id": "W18",
-        "file": "ui/dashboard_ui.py",
-        "function": "eliminar_producto_factura (closure)",
+        "file": "services/ventas_service.py",
+        "function": "VentasService.eliminar_linea_factura",
         "business": "quitar línea de factura",
         "sign": "+",
         "classification": "POSITIVO",
@@ -324,7 +325,7 @@ STOCK_WRITERS: Tuple[dict, ...] = (
         "outbox": False,
         "offline_possible": True,
         "callers": ("ui/dashboard_ui.py",),
-        "risk": "Writer en UI. DELETE de kardex. Sin outbox.",
+        "risk": "1E.2: extraído de dashboard. DELETE de kardex. Sin outbox. Default legacy.",
         "kind": "direct",
     },
     {
@@ -461,14 +462,35 @@ CLASSIFICATION_COUNTS = {
 # mientras el cutover esté OFF. Cualquier UPDATE/INSERT de stock en una
 # función no inventariada es UNTRACKED_DIRECT_WRITER.
 NEGATIVE_WRITER_IDS = ("W03", "W16", "W06", "W02", "W15")
-GATEWAY_PREPARED_IDS = frozenset(NEGATIVE_WRITER_IDS)
+POSITIVE_WRITER_IDS = ("W01", "W04", "W05", "W09", "W18")
+MIXED_WRITER_IDS = ("W07", "W08", "W10", "W11", "W12", "W13", "W14", "W17")
+DIRECT_WRITER_IDS = tuple(
+    w["id"] for w in STOCK_WRITERS if w["kind"] in ("direct", "insert")
+)
+GATEWAY_PREPARED_IDS = frozenset(DIRECT_WRITER_IDS)
+DEPRECATED_WRITER_IDS = frozenset({"W15"})
+# W04 no tiene caller de UI (el botón POS vacía el carrito). Permanece preparado.
+W04_NO_UI_CALLER = True
 PRE_CUTOVER_SQL_ALLOWED = "LEGACY_ALLOWED_PRE_CUTOVER"
 UNTRACKED_DIRECT_WRITER = "UNTRACKED_DIRECT_WRITER"
 
 AUTHORITATIVE_TIPO_BY_WRITER = {
-    "W03": "VENTA",
-    "W16": "VENTA",
-    "W06": "VENTA",
+    "W01": "COMPRA",
     "W02": "AJUSTE",
+    "W03": "VENTA",
+    "W04": "DEVOLUCION",
+    "W05": "DEVOLUCION",
+    "W06": "VENTA",
+    "W07": "AJUSTE",
+    "W08": "AJUSTE",
+    "W09": "AJUSTE",
+    "W10": "mapped",
+    "W11": "AJUSTE",
+    "W12": "mapped",
+    "W13": "AJUSTE",
+    "W14": "AJUSTE",
     "W15": "VENTA",
+    "W16": "VENTA",
+    "W17": "AJUSTE",
+    "W18": "DEVOLUCION",
 }

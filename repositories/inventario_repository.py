@@ -13,11 +13,27 @@ class InventarioRepository:
     def __init__(self, db_manager):
         self.db = db_manager
     
-    def registrar_movimiento(self, movimiento: MovimientoInventario) -> Tuple[bool, str]:
+    def registrar_movimiento(self, movimiento: MovimientoInventario,
+                             inventory_mode: Optional[str] = None,
+                             inventory_command_id: Optional[str] = None,
+                             inventory_gateway=None,
+                             inventory_transport=None,
+                             inventory_connection_factory=None) -> Tuple[bool, str]:
         """
         Registra un movimiento de inventario (entrada o salida)
         Actualiza automáticamente el stock del producto
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._registrar_movimiento_authoritative(
+                movimiento,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+
         conn = self.db.conectar()
         cursor = conn.cursor()
         
@@ -99,6 +115,104 @@ class InventarioRepository:
             conn.rollback()
             conn.close()
             return False, f"Error al registrar movimiento: {str(e)}"
+
+    def _registrar_movimiento_authoritative(
+        self, movimiento: MovimientoInventario, *,
+        inventory_command_id, inventory_gateway, inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_MOVIMIENTO, MissingProductLocalIdError,
+            bind_inventory_gateway, build_signed_operations, command_already_applied,
+            command_motivo_marker, find_rows_marked_for_command, movement_tipo_to_ledger,
+            unknown_writer_message,
+        )
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        try:
+            ledger_tipo, sign = movement_tipo_to_ledger(movimiento.tipo_movimiento)
+        except QuantityScaleError as exc:
+            return False, str(exc)
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            already = command_already_applied(conn, command_id)
+            if already is not None and find_rows_marked_for_command(
+                conn, command_id, table="movimientos_inventario", column="observaciones"
+            ):
+                conn.close()
+                return True, "Movimiento registrado"
+            if already is None:
+                operations = build_signed_operations(
+                    conn,
+                    [{"producto_id": movimiento.producto_id, "delta": sign * movimiento.cantidad}],
+                    command_id=command_id,
+                )
+                gw = bind_inventory_gateway(
+                    conn, gateway=inventory_gateway, transport=inventory_transport,
+                    connection_factory=inventory_connection_factory, cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo=ledger_tipo, operations=operations, command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_MOVIMIENTO, device_id=None,
+                        usuario_id=movimiento.usuario_id,
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc))
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador"
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(result.command_id, result.error or result.outcome)
+            marker = command_motivo_marker(command_id)
+            obs = movimiento.observaciones or ""
+            obs = f"{obs} {marker}".strip()
+            cursor.execute('''
+                INSERT INTO movimientos_inventario (
+                    tipo_movimiento, producto_id, proveedor_id, cliente_id,
+                    cantidad, precio_unitario, numero_factura, observaciones,
+                    usuario_id, fecha
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                movimiento.tipo_movimiento, movimiento.producto_id,
+                movimiento.proveedor_id, movimiento.cliente_id,
+                movimiento.cantidad, movimiento.precio_unitario,
+                movimiento.numero_factura, obs, movimiento.usuario_id,
+                movimiento.fecha.strftime('%Y-%m-%d %H:%M:%S') if isinstance(movimiento.fecha, datetime) else movimiento.fecha
+            ))
+            from repositories._outbox import encolar
+            encolar(conn, "inventory_movement2", cursor.lastrowid, "create", "movimientos_inventario")
+            if movimiento.tipo_movimiento == 'ENTRADA_COMPRA' and movimiento.precio_unitario > 0:
+                cursor.execute(
+                    "UPDATE productos SET precio_compra = ? WHERE id = ?",
+                    (movimiento.precio_unitario, movimiento.producto_id),
+                )
+            conn.commit()
+            conn.close()
+            return True, "Movimiento registrado"
+        except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, str(exc)
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))
     
     def obtener_movimientos(self, producto_id: Optional[int] = None, 
                            limite: int = 100) -> List[dict]:
@@ -413,11 +527,29 @@ class InventarioRepository:
         return kardex
     
     def ajustar_stock_directo(self, producto_id: int, nuevo_stock: int, 
-                             motivo: str, usuario_id: int) -> Tuple[bool, str]:
+                             motivo: str, usuario_id: int,
+                             inventory_mode: Optional[str] = None,
+                             inventory_command_id: Optional[str] = None,
+                             inventory_gateway=None,
+                             inventory_transport=None,
+                             inventory_connection_factory=None,
+                             inventory_stock_base_scaled: Optional[int] = None) -> Tuple[bool, str]:
         """
         Ajusta el stock de un producto directamente
         Útil para correcciones o inventarios físicos
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._ajustar_stock_directo_authoritative(
+                producto_id, nuevo_stock, motivo, usuario_id,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+                inventory_stock_base_scaled=inventory_stock_base_scaled,
+            )
+
         conn = self.db.conectar()
         cursor = conn.cursor()
         
@@ -474,13 +606,141 @@ class InventarioRepository:
             conn.rollback()
             conn.close()
             return False, f"Error al ajustar stock: {str(e)}"
+
+    def _ajustar_stock_directo_authoritative(
+        self, producto_id: int, nuevo_stock: int, motivo: str, usuario_id: int, *,
+        inventory_command_id, inventory_gateway, inventory_transport,
+        inventory_connection_factory, inventory_stock_base_scaled,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED, InventoryGatewayError
+        from inventory_ledger import QuantityScaleError, UnknownProductError, get_inventory_command_or_none
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_AJUSTE, NO_INVENTORY_CHANGE, MissingProductLocalIdError,
+            bind_inventory_gateway, build_absolute_operations, command_already_applied,
+            command_motivo_marker, find_rows_marked_for_command,
+            operations_from_command_record, require_producto_local_id,
+            resolve_authoritative_base_scaled, unknown_writer_message,
+        )
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            already = command_already_applied(conn, command_id)
+            if already is not None and find_rows_marked_for_command(
+                conn, command_id, table="movimientos_inventario", column="observaciones"
+            ):
+                conn.close()
+                return True, "Stock ajustado"
+            row = cursor.execute(
+                "SELECT id, local_id FROM productos WHERE id = ?", (producto_id,)
+            ).fetchone()
+            if not row:
+                conn.close()
+                return False, "Producto no encontrado"
+            if already is None:
+                try:
+                    existing_cmd = get_inventory_command_or_none(conn, command_id)
+                    if existing_cmd is not None:
+                        operations = operations_from_command_record(existing_cmd)
+                    else:
+                        local_id = require_producto_local_id(conn, producto_id)
+                        base = resolve_authoritative_base_scaled(
+                            local_id,
+                            explicit_base_scaled=inventory_stock_base_scaled,
+                            connection_factory=inventory_connection_factory,
+                        )
+                        operations = build_absolute_operations(
+                            conn, command_id=command_id, producto_id=producto_id,
+                            target_qty=nuevo_stock, base_scaled=base,
+                        )
+                except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError, InventoryGatewayError) as exc:
+                    conn.close()
+                    return False, str(exc)
+                if not operations:
+                    conn.close()
+                    self.last_gateway_result = NO_INVENTORY_CHANGE
+                    return True, "No hay diferencia en el stock"
+                gw = bind_inventory_gateway(
+                    conn, gateway=inventory_gateway, transport=inventory_transport,
+                    connection_factory=inventory_connection_factory, cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo="AJUSTE", operations=operations, command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_AJUSTE, device_id=None,
+                        usuario_id=usuario_id,
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc))
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador"
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(result.command_id, result.error or result.outcome)
+            else:
+                operations = operations_from_command_record(already)
+            marker = command_motivo_marker(command_id)
+            tipo_movimiento = 'ENTRADA_AJUSTE'
+            cantidad = 0
+            if operations:
+                dlt = int(operations[0]["delta_scaled"])
+                tipo_movimiento = 'ENTRADA_AJUSTE' if dlt > 0 else 'SALIDA_AJUSTE'
+                cantidad = abs(dlt) / 1000
+            cursor.execute('''
+                INSERT INTO movimientos_inventario (
+                    tipo_movimiento, producto_id, cantidad, precio_unitario,
+                    observaciones, usuario_id, fecha
+                ) VALUES (?, ?, ?, 0, ?, ?, CURRENT_TIMESTAMP)
+            ''', (tipo_movimiento, producto_id, cantidad, f"{motivo} {marker}", usuario_id))
+            from repositories._outbox import encolar
+            encolar(conn, "inventory_movement2", cursor.lastrowid, "create", "movimientos_inventario")
+            conn.commit()
+            conn.close()
+            return True, f"Stock ajustado a {nuevo_stock}"
+        except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, str(exc)
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))
     
     def eliminar_movimiento(self, movimiento_id: int, 
-                           revertir_stock: bool = True) -> Tuple[bool, str]:
+                           revertir_stock: bool = True,
+                           inventory_mode: Optional[str] = None,
+                           inventory_command_id: Optional[str] = None,
+                           inventory_gateway=None,
+                           inventory_transport=None,
+                           inventory_connection_factory=None) -> Tuple[bool, str]:
         """
         Elimina un movimiento de inventario
         Si revertir_stock=True, ajusta el stock del producto
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._eliminar_movimiento_authoritative(
+                movimiento_id, revertir_stock,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+
         conn = self.db.conectar()
         cursor = conn.cursor()
         
@@ -537,3 +797,81 @@ class InventarioRepository:
             conn.rollback()
             conn.close()
             return False, f"Error al eliminar movimiento: {str(e)}"
+
+    def _eliminar_movimiento_authoritative(
+        self, movimiento_id: int, revertir_stock: bool, *,
+        inventory_command_id, inventory_gateway, inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str]:
+        import uuid as _uuid
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import QuantityScaleError, UnknownProductError
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_MOVIMIENTO, MissingProductLocalIdError,
+            bind_inventory_gateway, build_signed_operations, command_already_applied,
+            movement_tipo_to_ledger, unknown_writer_message,
+        )
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            already = command_already_applied(conn, command_id)
+            cursor.execute(
+                "SELECT producto_id, tipo_movimiento, cantidad FROM movimientos_inventario WHERE id = ?",
+                (movimiento_id,),
+            )
+            movimiento = cursor.fetchone()
+            if not movimiento:
+                conn.close()
+                if already is not None:
+                    return True, "Movimiento eliminado exitosamente"
+                return False, "Movimiento no encontrado"
+            if revertir_stock and already is None:
+                try:
+                    _tipo, sign = movement_tipo_to_ledger(movimiento["tipo_movimiento"])
+                    operations = build_signed_operations(
+                        conn,
+                        [{"producto_id": movimiento["producto_id"], "delta": -sign * movimiento["cantidad"]}],
+                        command_id=command_id,
+                    )
+                except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError) as exc:
+                    conn.close()
+                    return False, str(exc)
+                if operations:
+                    gw = bind_inventory_gateway(
+                        conn, gateway=inventory_gateway, transport=inventory_transport,
+                        connection_factory=inventory_connection_factory, cutover_enabled=True,
+                    )
+                    try:
+                        result = gw.submit(
+                            tipo="AJUSTE", operations=operations, command_id=command_id,
+                            documento_tipo=DOCUMENTO_TIPO_MOVIMIENTO, device_id=None,
+                            usuario_id=None,
+                        )
+                    except Exception as exc:
+                        conn.close()
+                        return False, unknown_writer_message(command_id, str(exc))
+                    self.last_gateway_result = result
+                    if result.outcome == OUTCOME_REJECTED:
+                        conn.close()
+                        return False, result.error or "Inventario rechazado por el coordinador"
+                    if result.outcome != OUTCOME_APPLIED:
+                        conn.close()
+                        return False, unknown_writer_message(result.command_id, result.error or result.outcome)
+            from repositories._outbox import encolar_borrado
+            encolar_borrado(conn, "inventory_movement2", movimiento_id, "movimientos_inventario")
+            cursor.execute("DELETE FROM movimientos_inventario WHERE id = ?", (movimiento_id,))
+            conn.commit()
+            conn.close()
+            return True, "Movimiento eliminado exitosamente"
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e))

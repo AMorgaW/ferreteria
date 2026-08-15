@@ -24,7 +24,12 @@ class ComprasRepository:
         usuario_id: int = None,
         monto_pagado_inicial: float = 0.0,
         tipo_pago_inicial: str = None,
-        numero_comprobante_inicial: str = None
+        numero_comprobante_inicial: str = None,
+        inventory_mode: Optional[str] = None,
+        inventory_command_id: Optional[str] = None,
+        inventory_gateway=None,
+        inventory_transport=None,
+        inventory_connection_factory=None,
     ) -> Tuple[bool, str, Optional[int]]:
         """
         Crea una nueva compra con múltiples productos
@@ -40,6 +45,25 @@ class ComprasRepository:
         Returns:
             (éxito, mensaje, id_compra)
         """
+        from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode
+
+        if resolve_writer_mode(inventory_mode) == WRITER_MODE_AUTHORITATIVE:
+            return self._crear_compra_authoritative(
+                proveedor_id,
+                productos,
+                numero_factura=numero_factura,
+                tipo_compra=tipo_compra,
+                observaciones=observaciones,
+                usuario_id=usuario_id,
+                monto_pagado_inicial=monto_pagado_inicial,
+                tipo_pago_inicial=tipo_pago_inicial,
+                numero_comprobante_inicial=numero_comprobante_inicial,
+                inventory_command_id=inventory_command_id,
+                inventory_gateway=inventory_gateway,
+                inventory_transport=inventory_transport,
+                inventory_connection_factory=inventory_connection_factory,
+            )
+
         conn = self.db.conectar()
         cursor = conn.cursor()
 
@@ -170,6 +194,242 @@ class ComprasRepository:
             conn.rollback()
             conn.close()
             return False, f"Error al crear compra: {str(e)}", None
+
+    def _crear_compra_authoritative(
+        self,
+        proveedor_id: int,
+        productos: List[Dict],
+        *,
+        numero_factura,
+        tipo_compra,
+        observaciones,
+        usuario_id,
+        monto_pagado_inicial,
+        tipo_pago_inicial,
+        numero_comprobante_inicial,
+        inventory_command_id,
+        inventory_gateway,
+        inventory_transport,
+        inventory_connection_factory,
+    ) -> Tuple[bool, str, Optional[int]]:
+        import uuid as _uuid
+
+        from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
+        from inventory_ledger import (
+            QuantityScaleError,
+            UnknownProductError,
+            bind_inventory_command_documento,
+            get_inventory_command_or_none,
+        )
+        from inventory_writer_support import (
+            DOCUMENTO_TIPO_COMPRA,
+            MissingProductLocalIdError,
+            bind_inventory_gateway,
+            build_positive_operations,
+            command_already_applied,
+            operations_from_command_record,
+            unknown_writer_message,
+        )
+        from local_first_db import ensure_local_id
+        from repositories._outbox import encolar
+
+        if not productos:
+            return False, "Debe agregar al menos un producto a la compra", None
+
+        command_id = inventory_command_id or str(_uuid.uuid4())
+        self.last_inventory_command_id = command_id
+        conn = self.db.conectar()
+        cursor = conn.cursor()
+        try:
+            existing = get_inventory_command_or_none(conn, command_id)
+            already = command_already_applied(conn, command_id)
+            skip_header = False
+            compra_id = None
+            compra_local = None
+            if already is not None and already.documento_local_id:
+                row = cursor.execute(
+                    "SELECT id FROM compras WHERE local_id = ?",
+                    (already.documento_local_id,),
+                ).fetchone()
+                if row:
+                    n_det = cursor.execute(
+                        "SELECT COUNT(*) FROM detalle_compras WHERE compra_id = ?",
+                        (row["id"],),
+                    ).fetchone()[0]
+                    if n_det:
+                        conn.close()
+                        return True, "Compra registrada exitosamente", row["id"]
+                    compra_id = row["id"]
+                    compra_local = already.documento_local_id
+                    skip_header = True
+
+            total = 0
+            for item in productos:
+                total += item['cantidad'] * item['precio_unitario']
+            monto_pagado = float(monto_pagado_inicial or 0)
+            if monto_pagado < 0:
+                monto_pagado = 0.0
+
+            if already is None:
+                try:
+                    if existing is not None:
+                        operations = operations_from_command_record(existing)
+                    else:
+                        operations = build_positive_operations(
+                            conn, productos, command_id=command_id
+                        )
+                except MissingProductLocalIdError as exc:
+                    conn.close()
+                    return False, str(exc), None
+                except (QuantityScaleError, UnknownProductError) as exc:
+                    conn.close()
+                    return False, str(exc), None
+
+                gw = bind_inventory_gateway(
+                    conn,
+                    gateway=inventory_gateway,
+                    transport=inventory_transport,
+                    connection_factory=inventory_connection_factory,
+                    cutover_enabled=True,
+                )
+                try:
+                    result = gw.submit(
+                        tipo="COMPRA",
+                        operations=operations,
+                        command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_COMPRA,
+                        device_id=None,
+                        usuario_id=usuario_id,
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc)), None
+
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, (
+                        result.error or "Inventario rechazado por el coordinador"
+                    ), None
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(
+                        result.command_id, result.error or result.outcome
+                    ), None
+
+                bound_id = result.record.documento_local_id if result.record else None
+                if bound_id:
+                    row = cursor.execute(
+                        "SELECT id FROM compras WHERE local_id = ?",
+                        (bound_id,),
+                    ).fetchone()
+                    if row:
+                        conn.close()
+                        return True, "Compra registrada exitosamente", row["id"]
+
+            if not skip_header:
+                cursor.execute('''
+                    INSERT INTO compras (
+                        proveedor_id, numero_factura, fecha, tipo_compra,
+                        total, observaciones, usuario_id, estado,
+                        estado_pago, monto_pagado, saldo_pendiente
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    proveedor_id,
+                    numero_factura,
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    tipo_compra,
+                    total,
+                    observaciones,
+                    usuario_id,
+                    'COMPLETADA',
+                    'PENDIENTE',
+                    0,
+                    total
+                ))
+                compra_id = cursor.lastrowid
+                if already is not None and already.documento_local_id:
+                    cursor.execute(
+                        "UPDATE compras SET local_id = ? WHERE id = ?",
+                        (already.documento_local_id, compra_id),
+                    )
+                    compra_local = already.documento_local_id
+                else:
+                    compra_local = ensure_local_id(conn, "compras", compra_id)
+                    bind_inventory_command_documento(conn, command_id, compra_local)
+                encolar(conn, "purchase", compra_id, "create", "compras")
+
+            for item in productos:
+                producto_id = item['producto_id']
+                cantidad = item['cantidad']
+                precio_unitario = item['precio_unitario']
+                subtotal = cantidad * precio_unitario
+                cursor.execute('''
+                    INSERT INTO detalle_compras (
+                        compra_id, producto_id, cantidad, precio_unitario, subtotal
+                    ) VALUES (?, ?, ?, ?, ?)
+                ''', (compra_id, producto_id, cantidad, precio_unitario, subtotal))
+                encolar(conn, "purchase_detail", cursor.lastrowid, "create", "detalle_compras")
+                cursor.execute('''
+                    INSERT INTO movimientos (
+                        tipo, producto_id, proveedor_id, usuario_id,
+                        cantidad, precio_unitario, costo_total,
+                        num_factura, observaciones, fecha
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    'ENTRADA_COMPRA',
+                    producto_id,
+                    proveedor_id,
+                    usuario_id,
+                    cantidad,
+                    precio_unitario,
+                    subtotal,
+                    numero_factura,
+                    f"Compra #{compra_id}",
+                    obtener_fecha_actual()
+                ))
+                encolar(conn, "inventory_movement", cursor.lastrowid, "create", "movimientos")
+
+            if monto_pagado > 0:
+                usuario_pago = "Sistema"
+                if usuario_id:
+                    cursor.execute("SELECT username FROM usuarios WHERE id = ?", (usuario_id,))
+                    usuario_row = cursor.fetchone()
+                    if usuario_row:
+                        usuario_pago = usuario_row['username'] if hasattr(usuario_row, 'keys') else usuario_row[0]
+                from models import Abono
+                from repositories.abonos_compras_repo import registrar_abono_compra_en_transaccion
+                abono_inicial = Abono(
+                    id_compra=compra_id,
+                    monto_abono=monto_pagado,
+                    fecha_abono=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    tipo_pago=tipo_pago_inicial or 'Efectivo',
+                    numero_comprobante=numero_comprobante_inicial,
+                    usuario=usuario_pago,
+                    observaciones='Pago inicial de compra'
+                )
+                registrar_abono_compra_en_transaccion(conn, cursor, abono_inicial)
+
+            cursor.execute('''
+                INSERT INTO auditoria (usuario_id, accion, modulo, descripcion, ip_address)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (usuario_id, "REGISTRAR_COMPRA", "Compras",
+                  f"Compra #{compra_id} a proveedor {proveedor_id} por ${total:,.0f}", None))
+            encolar(conn, "audit_log", cursor.lastrowid, "create", "auditoria")
+
+            conn.commit()
+            conn.close()
+            return True, f"Compra registrada exitosamente (Total: ${total:,.0f})", compra_id
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False, unknown_writer_message(command_id, str(e)), None
 
     def obtener_compra_por_id(self, compra_id: int) -> Optional[Dict]:
         """
@@ -507,6 +767,7 @@ class ComprasRepository:
             bind_inventory_gateway,
             build_negative_operations,
             command_already_applied,
+            command_motivo_marker,
             unknown_writer_message,
         )
         from local_first_db import ensure_local_id
@@ -518,10 +779,6 @@ class ComprasRepository:
         cursor = conn.cursor()
         try:
             already = command_already_applied(conn, command_id)
-            if already is not None:
-                conn.close()
-                return True, "Compra cancelada y stock revertido exitosamente"
-
             cursor.execute('SELECT estado, local_id FROM compras WHERE id = ?', (compra_id,))
             fila = cursor.fetchone()
             if not fila:
@@ -529,6 +786,8 @@ class ComprasRepository:
                 return False, "Compra no encontrada"
             if str(fila['estado']).upper() == 'CANCELADA':
                 conn.close()
+                if already is not None:
+                    return True, "Compra cancelada y stock revertido exitosamente"
                 return False, "La compra ya estaba cancelada"
 
             cursor.execute('''
@@ -541,48 +800,50 @@ class ComprasRepository:
                 conn.close()
                 return False, "La compra no tiene detalles de inventario"
 
-            try:
-                operations = build_negative_operations(
-                    conn, detalles, command_id=command_id
-                )
-            except MissingProductLocalIdError as exc:
-                conn.close()
-                return False, str(exc)
-            except (QuantityScaleError, UnknownProductError) as exc:
-                conn.close()
-                return False, str(exc)
+            if already is None:
+                try:
+                    operations = build_negative_operations(
+                        conn, detalles, command_id=command_id
+                    )
+                except MissingProductLocalIdError as exc:
+                    conn.close()
+                    return False, str(exc)
+                except (QuantityScaleError, UnknownProductError) as exc:
+                    conn.close()
+                    return False, str(exc)
 
-            gw = bind_inventory_gateway(
-                conn,
-                gateway=inventory_gateway,
-                transport=inventory_transport,
-                connection_factory=inventory_connection_factory,
-                cutover_enabled=True,
-            )
-            try:
-                result = gw.submit(
-                    tipo="AJUSTE",
-                    operations=operations,
-                    command_id=command_id,
-                    documento_tipo=DOCUMENTO_TIPO_COMPRA,
-                    documento_local_id=fila["local_id"],
-                    device_id=None,
-                    usuario_id=None,
+                gw = bind_inventory_gateway(
+                    conn,
+                    gateway=inventory_gateway,
+                    transport=inventory_transport,
+                    connection_factory=inventory_connection_factory,
+                    cutover_enabled=True,
                 )
-            except Exception as exc:
-                conn.close()
-                return False, unknown_writer_message(command_id, str(exc))
+                try:
+                    result = gw.submit(
+                        tipo="AJUSTE",
+                        operations=operations,
+                        command_id=command_id,
+                        documento_tipo=DOCUMENTO_TIPO_COMPRA,
+                        documento_local_id=fila["local_id"],
+                        device_id=None,
+                        usuario_id=None,
+                    )
+                except Exception as exc:
+                    conn.close()
+                    return False, unknown_writer_message(command_id, str(exc))
 
-            self.last_gateway_result = result
-            if result.outcome == OUTCOME_REJECTED:
-                conn.close()
-                return False, result.error or "Inventario rechazado por el coordinador"
-            if result.outcome != OUTCOME_APPLIED:
-                conn.close()
-                return False, unknown_writer_message(
-                    result.command_id, result.error or result.outcome
-                )
+                self.last_gateway_result = result
+                if result.outcome == OUTCOME_REJECTED:
+                    conn.close()
+                    return False, result.error or "Inventario rechazado por el coordinador"
+                if result.outcome != OUTCOME_APPLIED:
+                    conn.close()
+                    return False, unknown_writer_message(
+                        result.command_id, result.error or result.outcome
+                    )
 
+            marker = command_motivo_marker(command_id)
             for detalle in detalles:
                 cursor.execute('''
                     INSERT INTO movimientos (
@@ -590,7 +851,7 @@ class ComprasRepository:
                         motivo, fecha
                     ) VALUES ('SALIDA_AJUSTE', ?, ?, 0, 0, ?, ?)
                 ''', (detalle['producto_id'], detalle['cantidad'],
-                      f'Cancelación de compra #{compra_id}', obtener_fecha_actual()))
+                      f'Cancelación de compra #{compra_id} {marker}', obtener_fecha_actual()))
                 ensure_local_id(conn, "movimientos", cursor.lastrowid)
                 encolar(conn, "inventory_movement", cursor.lastrowid, "create", "movimientos")
 

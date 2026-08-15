@@ -1,7 +1,7 @@
 # Fase 1E.1 — Writers negativos preparados, cutover OFF
 
 **Estado:** implementada. Cutover **OFF**. No activa autoridad.
-**No autoriza 1E.2, 1E.3 ni cutover.**
+**Cerrada.** 1E.2 está en [FASE1E2.md](FASE1E2.md).
 **No declara INV-01 resuelto en SQLite.** **No declara INV-02 resuelto.**
 `APPLY_AUTHORITATIVE_EXCLUDE` sigue `False`.
 
@@ -19,7 +19,7 @@ legacy: `productos.stock` es la ruta efectiva.
 | W02 | `ComprasRepository.eliminar_compra` | sí | legacy |
 | W15 | `MezclasService.descontar_stock_mezcla` | sí (DEPRECATED/DEAD) | legacy |
 
-No se migraron positivos ni mixtos (W01, W04, W05, W07–W14, W17, W18).
+No se migraron positivos ni mixtos en 1E.1 (eso es 1E.2).
 
 ## Pre-cutover / backlog
 
@@ -135,23 +135,19 @@ el SQL legacy de los negativos **sigue permitido**.
 | Scanner a nivel función | cerrada |
 | Timeout/deadlock → UNKNOWN | cerrada |
 | Reconnect sin `transport=` inyectado | test adicional pasa por `apply_inventory_command` |
-| W17/W18 closures PySide | **aplazada a 1E.2** (positivos/mixtos) |
+| W17/W18 closures PySide | **cerrada en 1E.2** |
 
 ## Qué ocurrirá en cutover (1E.3, no ahora)
 
-1. Migrar el resto de writers (1E.2).
-2. Seed one-shot de `inventory_balances` desde el stock actual.
-3. Encender `INVENTORY_CUTOVER_ENABLED`.
-4. Solo commands `AUTHORITATIVE` + `PERSISTED` son transmissible.
-5. `LEGACY_OBSERVED` permanece inaplicable.
-6. Decisión sobre `productos.stock` / LWW.
+1. Seed one-shot de `inventory_balances` desde el stock actual.
+2. Encender `INVENTORY_CUTOVER_ENABLED`.
+3. Solo commands `AUTHORITATIVE` + `PERSISTED` son transmissible.
+4. `LEGACY_OBSERVED` permanece inaplicable.
+5. Decisión sobre `productos.stock` / LWW.
 
-## Writers que faltan (1E.2)
-
-Positivos: W01, W04, W05, W09, W18.
-Mixtos: W07, W08, W10, W11, W12, W13, W14, W17.
-Derivados D01–D04 no se migran como writers; LWW se decide en 1E.3.
+Positivos y mixtos se prepararon en 1E.2. Ver [FASE1E2.md](FASE1E2.md).
 
 ## STOP
 
-**STOP — no implementar 1E.2.** No cutover. No seed. No barcodes. No recepción.
+**STOP — no implementar 1E.3 desde 1E.1.** El trabajo de positivos/mixtos
+está en [FASE1E2.md](FASE1E2.md). No cutover. No seed. No barcodes.

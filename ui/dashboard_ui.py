@@ -2297,39 +2297,27 @@ class DashboardUI(QWidget):
                     if dlg_edit.exec() == QDlg.Accepted:
                         nueva_cant = spin_cant.value()
                         nuevo_precio = spin_precio.value()
-                        nuevo_subtotal = nueva_cant * nuevo_precio
-                        cant_anterior = detalle.get('cantidad', 0)
-                        subtotal_anterior = detalle.get('subtotal', 0)
-
                         try:
+                            from database import DatabaseManager
+                            from repositories.productos_repo import ProductosRepository
+                            from repositories.clientes_repo import ClientesRepository
+                            from services.ventas_service import VentasService
+
                             db_edit = DatabaseManager()
+                            ventas_service = VentasService(
+                                db_edit,
+                                ProductosRepository(db_edit),
+                                ClientesRepository(db_edit),
+                                self.auth,
+                            )
+                            ok, msg = ventas_service.editar_linea_factura(
+                                id_venta, detalle_id, nueva_cant, nuevo_precio,
+                            )
+                            if not ok:
+                                QMessageBox.critical(ventana, "Error", msg)
+                                return
                             conn_e = db_edit.conectar()
                             cur_e = conn_e.cursor()
-
-                            cur_e.execute('''
-                                UPDATE detalle_ventas
-                                SET cantidad = ?, precio_unitario = ?, subtotal = ?
-                                WHERE id = ?
-                            ''', (nueva_cant, nuevo_precio, nuevo_subtotal, detalle_id))
-
-                            # Ajustar stock
-                            dif_cant = nueva_cant - cant_anterior
-                            if dif_cant != 0:
-                                cur_e.execute('''
-                                    UPDATE productos SET stock = stock - ? WHERE id = ?
-                                ''', (dif_cant, detalle['producto_id']))
-
-                            # Actualizar total de la venta
-                            dif_subtotal = nuevo_subtotal - subtotal_anterior
-                            cur_e.execute('''
-                                UPDATE ventas
-                                SET total = total + ?, subtotal = subtotal + ?
-                                WHERE id = ?
-                            ''', (dif_subtotal, dif_subtotal, id_venta))
-
-                            conn_e.commit()
-
-                            # Refrescar detalles
                             self._refrescar_productos_factura(
                                 cur_e, id_venta, tree_productos, venta_completa,
                                 saldo_actual, saldo_label_ref, tbl, totales_widget,
@@ -2372,57 +2360,26 @@ class DashboardUI(QWidget):
                         return
 
                     try:
+                        from database import DatabaseManager
+                        from repositories.productos_repo import ProductosRepository
+                        from repositories.clientes_repo import ClientesRepository
+                        from services.ventas_service import VentasService
+
                         db_del = DatabaseManager()
+                        ventas_service = VentasService(
+                            db_del,
+                            ProductosRepository(db_del),
+                            ClientesRepository(db_del),
+                            self.auth,
+                        )
+                        ok, msg = ventas_service.eliminar_linea_factura(
+                            id_venta, detalle_id,
+                        )
+                        if not ok:
+                            QMessageBox.critical(ventana, "Error", msg)
+                            return
                         conn_d = db_del.conectar()
                         cur_d = conn_d.cursor()
-
-                        numero_factura_actual = (
-                            venta_completa.get('numero_factura') or numero_factura
-                        )
-
-                        # Devolver stock
-                        cur_d.execute('''
-                            UPDATE productos SET stock = stock + ? WHERE id = ?
-                        ''', (detalle['cantidad'], detalle['producto_id']))
-
-                        # Eliminar el movimiento de inventario asociado a esta línea.
-                        cur_d.execute('''
-                            DELETE FROM movimientos
-                            WHERE id = (
-                                SELECT id
-                                FROM movimientos
-                                WHERE tipo = 'SALIDA_VENTA'
-                                AND num_factura = ?
-                                AND producto_id = ?
-                                AND cantidad = ?
-                                AND COALESCE(precio_unitario, 0) = COALESCE(?, 0)
-                                AND COALESCE(costo_total, 0) = COALESCE(?, 0)
-                                ORDER BY fecha DESC, id DESC
-                                LIMIT 1
-                            )
-                        ''', (
-                            numero_factura_actual,
-                            detalle['producto_id'],
-                            detalle['cantidad'],
-                            detalle.get('precio_unitario', 0),
-                            detalle.get('subtotal', 0),
-                        ))
-
-                        # Eliminar detalle
-                        cur_d.execute('DELETE FROM detalle_ventas WHERE id = ?',
-                                      (detalle_id,))
-
-                        # Actualizar total de la venta
-                        sub = detalle.get('subtotal', 0)
-                        cur_d.execute('''
-                            UPDATE ventas
-                            SET total = total - ?, subtotal = subtotal - ?
-                            WHERE id = ?
-                        ''', (sub, sub, id_venta))
-
-                        conn_d.commit()
-
-                        # Refrescar detalles
                         self._refrescar_productos_factura(
                             cur_d, id_venta, tree_productos, venta_completa,
                             saldo_actual, saldo_label_ref, tbl, totales_widget,

@@ -99,6 +99,7 @@ class InventoryOperationRecord:
     producto_local_id: str
     delta_scaled: int
     line_no: int
+    expected_base_scaled: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -117,7 +118,7 @@ class InventoryCommandRecord:
     updated_at: str
     operations: Tuple[InventoryOperationRecord, ...]
     replayed: bool
-    intent_class: str = INTENT_CLASS_AUTHORITATIVE
+    intent_class: str = INTENT_CLASS_LEGACY_OBSERVED
 
 
 def quantity_to_scaled(value: QuantityInput) -> int:
@@ -280,6 +281,18 @@ def _normalize_operations(
                 "delta 0 no tiene razón de dominio en el ledger; "
                 "una línea de inventario vacía no se persiste"
             )
+        expected_base = raw.get("expected_base_scaled")
+        if expected_base is not None:
+            if isinstance(expected_base, bool) or isinstance(expected_base, float):
+                raise QuantityScaleError(
+                    "expected_base_scaled debe ser entero; no float"
+                )
+            try:
+                expected_base = int(expected_base)
+            except (TypeError, ValueError) as exc:
+                raise QuantityScaleError(
+                    "expected_base_scaled debe ser entero"
+                ) from exc
         normalized.append(
             {
                 "operation_id": operation_id,
@@ -287,6 +300,7 @@ def _normalize_operations(
                 "producto_local_id": producto_local_id,
                 "delta_scaled": delta_scaled,
                 "line_no": line_no,
+                "expected_base_scaled": expected_base,
             }
         )
     normalized.sort(key=lambda item: item["line_no"])
@@ -319,7 +333,7 @@ def sqlite_ledger_statements() -> Tuple[str, ...]:
             motivo TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            intent_class TEXT NOT NULL DEFAULT 'AUTHORITATIVE' CHECK (
+            intent_class TEXT NOT NULL DEFAULT 'LEGACY_OBSERVED' CHECK (
                 intent_class IN ('AUTHORITATIVE', 'LEGACY_OBSERVED')
             )
         )
@@ -331,6 +345,7 @@ def sqlite_ledger_statements() -> Tuple[str, ...]:
             producto_local_id TEXT NOT NULL,
             delta_scaled INTEGER NOT NULL,
             line_no INTEGER NOT NULL,
+            expected_base_scaled INTEGER,
             FOREIGN KEY (command_id) REFERENCES inventory_commands(command_id),
             UNIQUE (command_id, line_no)
         )
@@ -472,6 +487,7 @@ def ensure_inventory_ledger_schema(conn) -> None:
             continue
         conn.execute(statement)
     _ensure_intent_class_column(conn)
+    _ensure_expected_base_column(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_inventory_commands_intent "
         "ON inventory_commands(intent_class)"
@@ -493,8 +509,31 @@ def _ensure_intent_class_column(conn) -> None:
     )
 
 
+def _ensure_expected_base_column(conn) -> None:
+    """1E.2: CAS absoluto. No forma parte del request_hash."""
+    rows = conn.execute("PRAGMA table_info(inventory_operations)").fetchall()
+    cols = {
+        (row["name"] if hasattr(row, "keys") else row[1])
+        for row in rows
+    }
+    if "expected_base_scaled" in cols:
+        return
+    conn.execute(
+        "ALTER TABLE inventory_operations "
+        "ADD COLUMN expected_base_scaled INTEGER"
+    )
+
+
 def _normalize_intent_class(value: Any) -> str:
-    text = str(value or INTENT_CLASS_AUTHORITATIVE).strip().upper()
+    """Fail-closed: ausencia/vacío = LEGACY_OBSERVED (no transmissible).
+
+    AUTHORITATIVE solo cuando el caller lo pide de forma explícita.
+    """
+    if value is None:
+        return INTENT_CLASS_LEGACY_OBSERVED
+    text = str(value).strip().upper()
+    if text == "":
+        return INTENT_CLASS_LEGACY_OBSERVED
     if text not in INTENT_CLASSES:
         raise InventoryLedgerError(
             f"intent_class desconocido: {value!r}. "
@@ -521,23 +560,30 @@ def _load_command(conn, command_id: str, *, replayed: bool) -> InventoryCommandR
     command = dict(command_row)
     op_rows = conn.execute(
         """
-        SELECT operation_id, command_id, producto_local_id, delta_scaled, line_no
+        SELECT *
         FROM inventory_operations
         WHERE command_id = ?
         ORDER BY line_no
         """,
         (command_id,),
     ).fetchall()
-    operations = tuple(
-        InventoryOperationRecord(
-            operation_id=row["operation_id"],
-            command_id=row["command_id"],
-            producto_local_id=row["producto_local_id"],
-            delta_scaled=int(row["delta_scaled"]),
-            line_no=int(row["line_no"]),
+    operations = []
+    for row in op_rows:
+        mapping = dict(row)
+        expected = mapping.get("expected_base_scaled")
+        operations.append(
+            InventoryOperationRecord(
+                operation_id=mapping["operation_id"],
+                command_id=mapping["command_id"],
+                producto_local_id=mapping["producto_local_id"],
+                delta_scaled=int(mapping["delta_scaled"]),
+                line_no=int(mapping["line_no"]),
+                expected_base_scaled=(
+                    None if expected is None else int(expected)
+                ),
+            )
         )
-        for row in op_rows
-    )
+    operations = tuple(operations)
     return InventoryCommandRecord(
         command_id=command["command_id"],
         tipo=command["tipo"],
@@ -553,9 +599,7 @@ def _load_command(conn, command_id: str, *, replayed: bool) -> InventoryCommandR
         updated_at=command["updated_at"],
         operations=operations,
         replayed=replayed,
-        intent_class=_normalize_intent_class(
-            command.get("intent_class") or INTENT_CLASS_AUTHORITATIVE
-        ),
+        intent_class=_normalize_intent_class(command.get("intent_class")),
     )
 
 
@@ -643,14 +687,14 @@ def create_inventory_command(
     documento_local_id: Optional[str] = None,
     device_id: Optional[str] = None,
     usuario_id: Optional[int] = None,
-    intent_class: str = INTENT_CLASS_AUTHORITATIVE,
+    intent_class: Optional[str] = None,
 ) -> InventoryCommandRecord:
     """Persiste command + operaciones en una sola transacción SQLite.
 
     No modifica productos.stock. estado/resultado en 1C: PERSISTED.
     Retry con el mismo payload recupera el registro original.
-    ``intent_class=LEGACY_OBSERVED`` es observación pre-cutover: el gateway
-    se niega a transmitirla para siempre.
+    Default local = LEGACY_OBSERVED (fail-closed, no transmissible).
+    AUTHORITATIVE solo si el caller lo solicita explícitamente.
     """
     if not schema_bootstrap.is_sqlite_connection(conn):
         raise InventoryLedgerError(
@@ -739,8 +783,8 @@ def create_inventory_command(
                     """
                     INSERT INTO inventory_operations (
                         operation_id, command_id, producto_local_id,
-                        delta_scaled, line_no
-                    ) VALUES (?, ?, ?, ?, ?)
+                        delta_scaled, line_no, expected_base_scaled
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         op["operation_id"],
@@ -748,6 +792,7 @@ def create_inventory_command(
                         op["producto_local_id"],
                         op["delta_scaled"],
                         op["line_no"],
+                        op.get("expected_base_scaled"),
                     ),
                 )
         except sqlite3.IntegrityError as exc:

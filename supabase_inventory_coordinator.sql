@@ -145,6 +145,11 @@ DECLARE
     v_qty bigint;
     v_next numeric;
     v_failures text := '';
+    v_exp_min bigint;
+    v_exp_max bigint;
+    v_has_expected boolean;
+    v_current_base bigint;
+    v_balance_found boolean;
     v_plan jsonb := '[]'::jsonb;
     v_item jsonb;
     v_motivo text;
@@ -271,14 +276,36 @@ BEGIN
                 MESSAGE = 'DUPLICATE_OPERATION: operation_id ' || v_opid
                     || ' ya pertenece a otro comando (' || v_owner || ')';
         END IF;
-        v_parsed := v_parsed || jsonb_build_array(
-            jsonb_build_object(
-                'operation_id', v_opid,
-                'producto_local_id', v_pid,
-                'delta_scaled', v_delta::bigint,
-                'line_no', v_line
-            )
-        );
+        IF v_op ? 'expected_base_scaled' THEN
+            BEGIN
+                IF (v_op->>'expected_base_scaled') IS NULL
+                   OR (v_op->>'expected_base_scaled')::numeric <> trunc((v_op->>'expected_base_scaled')::numeric) THEN
+                    RAISE EXCEPTION 'INVALID_DELTA: expected_base_scaled debe ser entero'
+                        USING ERRCODE = '22023';
+                END IF;
+            EXCEPTION WHEN invalid_text_representation THEN
+                RAISE EXCEPTION 'INVALID_DELTA: expected_base_scaled debe ser entero'
+                    USING ERRCODE = '22023';
+            END;
+            v_parsed := v_parsed || jsonb_build_array(
+                jsonb_build_object(
+                    'operation_id', v_opid,
+                    'producto_local_id', v_pid,
+                    'delta_scaled', v_delta::bigint,
+                    'line_no', v_line,
+                    'expected_base_scaled', (v_op->>'expected_base_scaled')::bigint
+                )
+            );
+        ELSE
+            v_parsed := v_parsed || jsonb_build_array(
+                jsonb_build_object(
+                    'operation_id', v_opid,
+                    'producto_local_id', v_pid,
+                    'delta_scaled', v_delta::bigint,
+                    'line_no', v_line
+                )
+            );
+        END IF;
     END LOOP;
 
     v_parsed := COALESCE(
@@ -424,7 +451,32 @@ BEGIN
           FROM public.inventory_balances b
          WHERE b.producto_local_id = v_pid
          FOR UPDATE;
-        IF NOT FOUND THEN
+        v_balance_found := FOUND;
+        SELECT MIN((e->>'expected_base_scaled')::bigint),
+               MAX((e->>'expected_base_scaled')::bigint),
+               bool_or(e ? 'expected_base_scaled')
+          INTO v_exp_min, v_exp_max, v_has_expected
+          FROM jsonb_array_elements(v_parsed) e
+         WHERE e->>'producto_local_id' = v_pid;
+        IF COALESCE(v_has_expected, false) THEN
+            IF v_exp_min IS DISTINCT FROM v_exp_max THEN
+                v_failures := v_failures || 'STALE_BALANCE: expected_base conflict producto='
+                    || v_pid || '; ';
+                CONTINUE;
+            END IF;
+            IF v_balance_found THEN
+                v_current_base := v_qty;
+            ELSE
+                v_current_base := 0;
+            END IF;
+            IF v_current_base IS DISTINCT FROM v_exp_min THEN
+                v_failures := v_failures || 'STALE_BALANCE: producto='
+                    || v_pid || ' expected=' || v_exp_min::text
+                    || ' actual=' || v_current_base::text || '; ';
+                CONTINUE;
+            END IF;
+        END IF;
+        IF NOT v_balance_found THEN
             IF v_net < 0 THEN
                 v_failures := v_failures || 'BALANCE_NOT_FOUND: producto='
                     || v_pid || '; ';

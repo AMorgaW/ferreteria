@@ -31,19 +31,21 @@ Eres QA adversarial de FERREPRO. Tu trabajo es **demostrar que el entregable est
 - Fase 1D (coordinador PostgreSQL): cerrada con GO.
 - Fase 1D.3 (gate + reconexión): cerrada con GO.
 - Fase 1E.0 (gateway + inventario de writers): cerrada con GO.
-- Fase 1E.1 (writers negativos, cutover OFF): **autorizada**. Auditar:
-  5 negativos preparados; default cutover OFF; 0 APPLY remoto accidental;
-  backlog `LEGACY_OBSERVED` no atraviesa cutover; timeout/deadlock/UNKNOWN
-  no generan nueva identidad; scanner por función;
-  `APPLY_AUTHORITATIVE_EXCLUDE` False; PostgreSQL real verde; 0 dual-write
-  en camino autoritativo. No rechazarla por no haber migrado positivos/mixtos
-  (eso es 1E.2, no autorizada).
-- Fase 1E.2+ (positivos/mixtos, cutover, barcodes, recepción, fencing):
-  **no autorizar**. Decisión humana.
+- Fase 1E.1 (writers negativos, cutover OFF): cerrada con GO.
+- Fase 1E.2 (positivos/mixtos, cutover OFF): **autorizada**. Auditar:
+  5 positivos + 8 mixtos preparados; W17/W18 fuera de closures;
+  `intent_class` fail-closed; recovery post-APPLY W06/W02/W15;
+  default cutover OFF; 0 APPLY remoto accidental; backlog
+  `LEGACY_OBSERVED` no transmite; no dual-write; no bypass W08/W13;
+  absolute stock sin race stale; scanner 0 UNTRACKED;
+  `APPLY_AUTHORITATIVE_EXCLUDE` False; PostgreSQL real verde.
+  No rechazarla por no haber hecho seed/cutover (eso es 1E.3).
+- Fase 1E.3+ (cutover, barcodes, recepción, fencing): **no autorizar**.
 
-Al auditar 1E.1: cutover DEFAULT OFF; writers negativos preparados pero no
-activados; `LEGACY_OBSERVED` no es transmissible; UNKNOWN conserva command_id;
-INV-01 xfail de dos SQLite sigue; INV-02 sigue xfail. No se adelantó 1E.2 ni cutover.
+Al auditar 1E.2: cutover DEFAULT OFF; W01–W18 preparados pero no
+activados; `LEGACY_OBSERVED` no es transmissible; UNKNOWN conserva
+command_id; INV-01 xfail de dos SQLite sigue; INV-02 sigue xfail.
+No se adelantó 1E.3 ni cutover.
 
 ## Veredicto
 

@@ -179,9 +179,15 @@ def _prepare_operations(
 
 
 def command_is_transmittable(record: InventoryCommandRecord) -> bool:
-    """Solo AUTHORITATIVE + PERSISTED/APPLIED puede ir al coordinador."""
-    intent = getattr(record, "intent_class", INTENT_CLASS_AUTHORITATIVE)
-    return intent == INTENT_CLASS_AUTHORITATIVE
+    """Solo AUTHORITATIVE explícito puede ir al coordinador.
+
+    Ausencia, NULL, vacío o LEGACY_OBSERVED = no transmitir (fail-closed).
+    """
+    intent = getattr(record, "intent_class", None)
+    if intent is None:
+        return False
+    text = str(intent).strip().upper()
+    return text == INTENT_CLASS_AUTHORITATIVE
 
 
 def assert_command_transmittable(record: InventoryCommandRecord) -> None:
@@ -204,10 +210,10 @@ def list_transmittable_command_ids(conn) -> Tuple[str, ...]:
         SELECT command_id
           FROM inventory_commands
          WHERE estado = ?
-           AND COALESCE(intent_class, ?) = ?
+           AND intent_class = ?
          ORDER BY created_at, command_id
         """,
-        (LEDGER_STATE_PERSISTED, INTENT_CLASS_LEGACY_OBSERVED, INTENT_CLASS_AUTHORITATIVE),
+        (LEDGER_STATE_PERSISTED, INTENT_CLASS_AUTHORITATIVE),
     ).fetchall()
     ids = []
     for row in rows:
@@ -330,10 +336,22 @@ class InventoryGateway:
         usuario_id: Optional[int],
     ) -> InventoryCommandRecord:
         assert_command_transmittable(record)
+        merged_ops = []
+        stored_expected = {
+            op.operation_id: op.expected_base_scaled
+            for op in record.operations
+            if getattr(op, "expected_base_scaled", None) is not None
+        }
+        for raw in operations:
+            item = dict(raw)
+            stored = stored_expected.get(str(item.get("operation_id") or ""))
+            if stored is not None and item.get("expected_base_scaled") is None:
+                item["expected_base_scaled"] = int(stored)
+            merged_ops.append(item)
         payload = dict(
             command_id=record.command_id,
             tipo=record.tipo,
-            operations=list(operations),
+            operations=merged_ops,
             documento_tipo=documento_tipo,
             documento_local_id=documento_local_id,
             device_id=device_id,
