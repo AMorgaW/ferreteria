@@ -66,9 +66,10 @@ El contrato productivo compara nombre + marca + presentación + unidad. El
 validador reproduce esa llave y añade barcode duplicado. Nunca fusiona filas;
 marca `REVISAR_POSIBLE_DUPLICADO`.
 
-## Barcode
+## Barcode desde Fase 2C
 
-El repository actual puede generar un SKU cuando `codigo_barras` está vacío.
-Fase 2B no invoca ese writer ni trata esos SKU como barcodes físicos. El staging
-mantiene `codigo_barras` vacío hasta scan y conserva el código previo en
-`codigo_sistema_actual`.
+Los códigos físicos viven en `product_barcodes`; `productos.codigo_barras`
+queda como referencia legacy y no almacena el nuevo conjunto multi-barcode.
+El formulario normal crea con política `FINAL` y exige doble scan o FRP
+explícito. El staging usa `BARCODE_PENDING`; los existentes sin código siguen
+accesibles como `BARCODE_MISSING_LEGACY`. Véase [BARCODES.md](BARCODES.md).

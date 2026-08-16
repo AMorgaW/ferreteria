@@ -43,6 +43,45 @@ REGISTRATION_STATUS_VALUES = (
     "REVISAR",
 )
 
+# Contrato operacional de captura física (Fase 2D). A diferencia del workbook
+# maestro de Fase 2B, este input humano no contiene IDs técnicos ni fórmulas.
+# Parser, tests, documentación y UI importan esta única definición.
+OPERATIONAL_INVENTORY_FIELDS: Tuple[Tuple[str, str], ...] = (
+    ("nombre", "PRODUCTO / NOMBRE"),
+    ("categoria", "CATEGORÍA"),
+    ("marca", "MARCA"),
+    ("precio_compra", "PRECIO DE COMPRA"),
+    ("precio_venta", "PRECIO DE VENTA"),
+    ("stock_minimo", "STOCK MÍNIMO"),
+    ("unidad_base", "UNIDAD DE MEDIDA BASE"),
+    ("presentacion_empaque", "PRESENTACIÓN / EMPAQUE"),
+    ("cantidad_base_por_empaque", "CANTIDAD DE UNIDAD BASE POR EMPAQUE"),
+    ("vende_unidad_base", "¿SE VENDE POR UNIDAD BASE? (SI/NO)"),
+    ("vende_medio_empaque", "¿SE VENDE POR MEDIO EMPAQUE? (SI/NO)"),
+    ("vende_empaque_completo", "¿SE VENDE POR EMPAQUE COMPLETO? (SI/NO)"),
+    ("permite_decimales", "¿PERMITE DECIMALES? (SI/NO)"),
+    ("empaques_completos_contados", "EMPAQUES COMPLETOS CONTADOS"),
+    ("unidades_sueltas_contadas", "UNIDADES BASE SUELTAS CONTADAS"),
+    ("cantidad_total_excel", "CANTIDAD TOTAL CONTADA"),
+    ("barcode_primero", "CÓDIGO DE BARRAS - 1er ESCANEO (PENDIENTE)"),
+    ("barcode_segundo", "VERIFICACIÓN CÓDIGO DE BARRAS - 2do ESCANEO (PENDIENTE)"),
+)
+OPERATIONAL_INVENTORY_HEADERS = tuple(label for _, label in OPERATIONAL_INVENTORY_FIELDS)
+OPERATIONAL_HEADER_TO_KEY = {label: key for key, label in OPERATIONAL_INVENTORY_FIELDS}
+OPERATIONAL_REQUIRED_KEYS = (
+    "nombre", "categoria", "precio_compra", "precio_venta", "stock_minimo",
+    "unidad_base", "presentacion_empaque", "vende_unidad_base",
+    "vende_medio_empaque", "vende_empaque_completo", "permite_decimales",
+    "empaques_completos_contados", "unidades_sueltas_contadas",
+    "cantidad_total_excel",
+)
+
+NO_PACKAGE_VALUE = "SIN EMPAQUE"
+PACKAGE_PRESENTATION_VALUES = (
+    NO_PACKAGE_VALUE, "UNIDAD", "CAJA", "BULTO", "SACO", "ROLLO",
+    "PAQUETE", "BOLSA", "BOTELLA", "TUBO", "GALÓN",
+)
+
 
 @dataclass(frozen=True)
 class ProductField:

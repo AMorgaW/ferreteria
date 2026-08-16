@@ -8,6 +8,19 @@ import uuid
 from datetime import datetime
 from typing import List, Optional, Tuple
 from models import Producto
+from barcode_scanner import normalize_barcode
+from repositories.product_barcodes_repo import (
+    BARCODE_TYPE_MANUFACTURER,
+    SOURCE_HID_DOUBLE_SCAN,
+    BarcodeConflictError,
+    BarcodeRepositoryError,
+    ProductBarcodesRepository,
+)
+
+
+PRODUCT_CREATION_FINAL = "FINAL"
+PRODUCT_CREATION_STAGING = "STAGING"
+PRODUCT_CREATION_LEGACY_COMPAT = "LEGACY_COMPAT"
 
 
 def _ahora():
@@ -207,12 +220,40 @@ class ProductosRepository:
                        inventory_gateway=None,
                        inventory_transport=None,
                        inventory_connection_factory=None,
-                       producto_local_id: Optional[str] = None) -> Tuple[bool, str, Optional[int]]:
+                       producto_local_id: Optional[str] = None,
+                       creation_policy: str = PRODUCT_CREATION_LEGACY_COMPAT,
+                       verified_barcode: Optional[str] = None,
+                       verified_barcode_type: str = BARCODE_TYPE_MANUFACTURER,
+                       verified_barcode_source: str = SOURCE_HID_DOUBLE_SCAN) -> Tuple[bool, str, Optional[int]]:
         """
         Crea un nuevo producto en la base de datos
         Returns: (éxito, mensaje, id_producto)
         """
         from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
+
+        policy = (creation_policy or "").strip().upper()
+        if policy not in {
+            PRODUCT_CREATION_FINAL,
+            PRODUCT_CREATION_STAGING,
+            PRODUCT_CREATION_LEGACY_COMPAT,
+        }:
+            return False, f"Política de alta de producto inválida: {creation_policy}", None
+        barcode = None
+        if verified_barcode is not None:
+            try:
+                barcode = normalize_barcode(verified_barcode)
+            except Exception as exc:
+                return False, str(exc), None
+        if policy == PRODUCT_CREATION_FINAL and not barcode:
+            return False, (
+                "Un producto nuevo finalizado requiere al menos un barcode "
+                "verificado por doble escaneo o un FRP generado explícitamente"
+            ), None
+        barcode_status = (
+            "BARCODE_VERIFIED" if barcode
+            else "BARCODE_PENDING" if policy == PRODUCT_CREATION_STAGING
+            else "BARCODE_MISSING_LEGACY"
+        )
 
         mode, frozen = resolve_writer_mode_or_frozen(
             inventory_mode, db=self.db,
@@ -221,14 +262,20 @@ class ProductosRepository:
         if frozen:
             return False, frozen, None
         if mode == WRITER_MODE_AUTHORITATIVE:
-            return self._crear_producto_authoritative(
+            result = self._crear_producto_authoritative(
                 producto,
                 inventory_command_id=inventory_command_id,
                 inventory_gateway=inventory_gateway,
                 inventory_transport=inventory_transport,
                 inventory_connection_factory=inventory_connection_factory,
                 producto_local_id=producto_local_id,
+                creation_policy=policy,
+                verified_barcode=barcode,
+                verified_barcode_type=verified_barcode_type,
+                verified_barcode_source=verified_barcode_source,
+                barcode_status=barcode_status,
             )
+            return self._verify_creation_barcode(result, barcode)
 
         # 1) Validación en la capa de datos (no solo en el formulario)
         valido, msg_val = producto.validar()
@@ -246,16 +293,29 @@ class ProductosRepository:
         cursor = conn.cursor()
 
         try:
+            local_id = producto_local_id or str(uuid.uuid4())
+            try:
+                local_id = str(uuid.UUID(str(local_id)))
+            except (ValueError, AttributeError, TypeError):
+                conn.close()
+                return False, "producto_local_id inválido", None
+            legacy_code = (
+                producto.codigo_barras
+                if policy == PRODUCT_CREATION_LEGACY_COMPAT
+                else None
+            )
             cursor.execute('''
                 INSERT INTO productos (
                     codigo_barras, nombre, categoria, marca, presentacion, proveedor_id,
                     precio_compra, precio_venta, stock, stock_minimo,
                     ubicacion, descripcion, unidad_medida, viene_en_caja,
                     unidades_por_caja, unidades_por_media_caja, vende_por_empaque,
-                    permite_decimales, iva, activo, local_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    usar_unidades_categoria, unidades_venta_custom,
+                    unidad_base_producto, permite_decimales, iva, activo,
+                    local_id, barcode_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                producto.codigo_barras,
+                legacy_code,
                 producto.nombre,
                 producto.categoria,
                 producto.marca,
@@ -272,10 +332,14 @@ class ProductosRepository:
                 producto.unidades_por_caja,
                 producto.unidades_por_media_caja,
                 producto.vende_por_empaque,
+                1 if producto.usar_unidades_categoria else 0,
+                producto.unidades_venta_custom,
+                producto.unidad_base_producto,
                 1 if producto.permite_decimales else 0,
                 producto.iva,
                 1 if producto.activo else 0,
-                str(uuid.uuid4()),
+                local_id,
+                barcode_status,
             ))
 
             producto_id = cursor.lastrowid
@@ -284,7 +348,8 @@ class ProductosRepository:
             #    Globalmente único (sufijo aleatorio) para permitir creación
             #    simultánea de productos desde varios equipos sin chocar con la
             #    restricción UNIQUE de codigo_barras.
-            if not (producto.codigo_barras or '').strip():
+            if (policy == PRODUCT_CREATION_LEGACY_COMPAT
+                    and not (producto.codigo_barras or '').strip()):
                 sku = self._generar_sku_unico(cursor, producto, producto_id)
                 cursor.execute('UPDATE productos SET codigo_barras = ? WHERE id = ?',
                                (sku, producto_id))
@@ -316,6 +381,15 @@ class ProductosRepository:
 
             # 5) Local-first: encolar para sincronizar a Supabase (patrón outbox).
             self._encolar_sync(conn, "product", producto_id, "create", "productos")
+            if barcode:
+                ProductBarcodesRepository(self.db).assign_in_connection(
+                    conn,
+                    producto_local_id=local_id,
+                    barcode=barcode,
+                    barcode_type=verified_barcode_type,
+                    source=verified_barcode_source,
+                    is_primary=True,
+                )
             if mov_id:
                 self._encolar_sync(conn, "inventory_movement", mov_id,
                                    "create", "movimientos")
@@ -333,15 +407,43 @@ class ProductosRepository:
 
             self._auditar("CREAR_PRODUCTO",
                           f"Creó producto '{producto.nombre}' (id {producto_id})")
-            return True, "Producto creado exitosamente", producto_id
+            return self._verify_creation_barcode(
+                (True, "Producto creado exitosamente", producto_id), barcode
+            )
 
+        except (BarcodeConflictError, BarcodeRepositoryError) as e:
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
+            return False, str(e), None
         except Exception as e:
-            conn.close()
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
             return False, f"Error al crear producto: {str(e)}", None
+
+    def _verify_creation_barcode(self, result, barcode):
+        """Solo declara éxito final tras una relectura exacta desde DB."""
+        ok, message, producto_id = result
+        if not ok or not barcode:
+            return result
+        try:
+            product = ProductBarcodesRepository(self.db).lookup_product(barcode)
+        except Exception as exc:
+            return False, f"ERROR de verificación de persistencia: {exc}", producto_id
+        if not product or product.get("matched_barcode") != barcode:
+            return False, (
+                "ERROR: el barcode guardado no coincidió en la relectura de DB"
+            ), producto_id
+        return True, "Producto creado; CÓDIGO GUARDADO Y VERIFICADO", producto_id
 
     def _crear_producto_authoritative(
         self, producto: Producto, *, inventory_command_id, inventory_gateway,
         inventory_transport, inventory_connection_factory, producto_local_id,
+        creation_policy, verified_barcode, verified_barcode_type,
+        verified_barcode_source, barcode_status,
     ) -> Tuple[bool, str, Optional[int]]:
         import uuid as _uuid
         from inventory_gateway import OUTCOME_APPLIED, OUTCOME_REJECTED
@@ -422,31 +524,53 @@ class ProductosRepository:
                     conn.close()
                     return True, "Producto creado exitosamente", producto_id
             else:
+                legacy_code = (
+                    producto.codigo_barras
+                    if creation_policy == PRODUCT_CREATION_LEGACY_COMPAT
+                    else None
+                )
                 cursor.execute('''
                     INSERT INTO productos (
                         codigo_barras, nombre, categoria, marca, presentacion, proveedor_id,
                         precio_compra, precio_venta, stock, stock_minimo,
                         ubicacion, descripcion, unidad_medida, viene_en_caja,
                         unidades_por_caja, unidades_por_media_caja, vende_por_empaque,
-                        permite_decimales, iva, activo, local_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        usar_unidades_categoria, unidades_venta_custom,
+                        unidad_base_producto, permite_decimales, iva, activo,
+                        local_id, barcode_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    producto.codigo_barras, producto.nombre, producto.categoria,
+                    legacy_code, producto.nombre, producto.categoria,
                     producto.marca, producto.presentacion, producto.proveedor_id,
                     producto.precio_compra, producto.precio_venta,
                     0,
                     producto.stock_minimo, producto.ubicacion, producto.descripcion,
                     producto.unidad_medida, 1 if producto.viene_en_caja else 0,
                     producto.unidades_por_caja, producto.unidades_por_media_caja,
-                    producto.vende_por_empaque, 1 if producto.permite_decimales else 0,
+                    producto.vende_por_empaque,
+                    1 if producto.usar_unidades_categoria else 0,
+                    producto.unidades_venta_custom,
+                    producto.unidad_base_producto,
+                    1 if producto.permite_decimales else 0,
                     producto.iva, 1 if producto.activo else 0, local_id,
+                    barcode_status,
                 ))
                 producto_id = cursor.lastrowid
-                if not (producto.codigo_barras or '').strip():
+                if (creation_policy == PRODUCT_CREATION_LEGACY_COMPAT
+                        and not (producto.codigo_barras or '').strip()):
                     sku = self._generar_sku_unico(cursor, producto, producto_id)
                     cursor.execute('UPDATE productos SET codigo_barras = ? WHERE id = ?',
                                    (sku, producto_id))
                 self._encolar_sync(conn, "product", producto_id, "create", "productos")
+                if verified_barcode:
+                    ProductBarcodesRepository(self.db).assign_in_connection(
+                        conn,
+                        producto_local_id=local_id,
+                        barcode=verified_barcode,
+                        barcode_type=verified_barcode_type,
+                        source=verified_barcode_source,
+                        is_primary=True,
+                    )
 
             if initial <= 0:
                 conn.commit()
@@ -603,6 +727,9 @@ class ProductosRepository:
                     unidades_por_caja = ?,
                     unidades_por_media_caja = ?,
                     vende_por_empaque = ?,
+                    usar_unidades_categoria = ?,
+                    unidades_venta_custom = ?,
+                    unidad_base_producto = ?,
                     permite_decimales = ?,
                     iva = ?,
                     activo = ?
@@ -624,6 +751,9 @@ class ProductosRepository:
                 producto.unidades_por_caja,
                 producto.unidades_por_media_caja,
                 producto.vende_por_empaque,
+                1 if producto.usar_unidades_categoria else 0,
+                producto.unidades_venta_custom,
+                producto.unidad_base_producto,
                 1 if producto.permite_decimales else 0,
                 producto.iva,
                 1 if producto.activo else 0,
@@ -796,7 +926,9 @@ class ProductosRepository:
                     precio_venta = ?, stock_minimo = ?, ubicacion = ?,
                     descripcion = ?, unidad_medida = ?, viene_en_caja = ?,
                     unidades_por_caja = ?, unidades_por_media_caja = ?,
-                    vende_por_empaque = ?, permite_decimales = ?, iva = ?, activo = ?
+                    vende_por_empaque = ?, usar_unidades_categoria = ?,
+                    unidades_venta_custom = ?, unidad_base_producto = ?,
+                    permite_decimales = ?, iva = ?, activo = ?
                 WHERE id = ?
             ''', (
                 producto.codigo_barras, producto.nombre, producto.categoria,
@@ -805,7 +937,11 @@ class ProductosRepository:
                 producto.stock_minimo, producto.ubicacion, producto.descripcion,
                 producto.unidad_medida, 1 if producto.viene_en_caja else 0,
                 producto.unidades_por_caja, producto.unidades_por_media_caja,
-                producto.vende_por_empaque, 1 if producto.permite_decimales else 0,
+                producto.vende_por_empaque,
+                1 if producto.usar_unidades_categoria else 0,
+                producto.unidades_venta_custom,
+                producto.unidad_base_producto,
+                1 if producto.permite_decimales else 0,
                 producto.iva, 1 if producto.activo else 0, producto.id
             ))
             self._registrar_cambio_precio(cursor, producto.id, 'venta',
@@ -842,7 +978,14 @@ class ProductosRepository:
         return None
     
     def obtener_por_codigo(self, codigo_barras: str) -> Optional[dict]:
-        """Obtiene un producto por código de barras"""
+        """Resuelve cualquiera de los barcodes físicos; conserva fallback legacy."""
+        try:
+            matched = ProductBarcodesRepository(self.db).lookup_product(codigo_barras)
+            if matched:
+                return matched
+        except BarcodeRepositoryError:
+            # Bases aún no migradas conservan el lookup de la columna histórica.
+            pass
         conn = self.db.conectar()
         cursor = conn.cursor()
         

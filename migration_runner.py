@@ -12,6 +12,12 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Tuple
 
 import schema_bootstrap
+from barcode_schema import (
+    ensure_sqlite_barcode_package_role,
+    ensure_sqlite_barcode_schema,
+)
+from inventory_import_schema import ensure_inventory_import_schema
+from inventory_apply_schema import ensure_inventory_apply_schema
 
 
 class MigrationError(RuntimeError):
@@ -214,6 +220,52 @@ DEFAULT_MIGRATIONS = (
             "numero_factura_normalizada)"
         ),
         apply=_add_purchase_detection_index,
+    ),
+    Migration(
+        version="20260815_003",
+        name="product_barcodes_model",
+        signature=(
+            "productos.barcode_status;product_barcodes(local_id PK,"
+            "producto_local_id->productos.local_id,barcode UNIQUE binary,"
+            "barcode_type,source,is_primary,active,timestamps,sync metadata);"
+            "one active primary per product;no backfill;no FRP generation"
+        ),
+        apply=ensure_sqlite_barcode_schema,
+    ),
+    Migration(
+        version="20260815_004",
+        name="inventory_import_staging",
+        signature=(
+            "inventory_import_batches(source_sha256 UNIQUE,status,counters);"
+            "inventory_import_rows(batch_id FK,excel_row_number,payload snapshots,"
+            "cantidad_contada_scaled,match,barcode,validation,row_hash);"
+            "local durable staging only;no product/stock/barcode mutation"
+        ),
+        apply=ensure_inventory_import_schema,
+    ),
+    Migration(
+        version="20260815_005",
+        name="controlled_inventory_apply",
+        signature=(
+            "inventory_import_apply_batches(workflow,revision,immutable approval,"
+            "apply identity,lease);inventory_import_apply_rows(resolutions,warning and "
+            "metadata decisions,durable command ids,row saga,before-after,verification);"
+            "inventory_import_apply_audit;staging mutation invalidates approval;"
+            "staging locked while applying/completed;"
+            "local coordinator only;no stock/product/barcode mutation"
+        ),
+        apply=ensure_inventory_apply_schema,
+    ),
+    Migration(
+        version="20260815_006",
+        name="barcode_package_role",
+        signature=(
+            "product_barcodes.package_role TEXT NOT NULL DEFAULT 'BASE_UNIT' "
+            "CHECK (BASE_UNIT,FULL_PACKAGE,CUSTOM_PRESENTATION);"
+            "existing 2C barcodes preserved;no backfill beyond column default;"
+            "no stock derivation;no half-package barcode;no FRP generation"
+        ),
+        apply=ensure_sqlite_barcode_package_role,
     ),
 )
 

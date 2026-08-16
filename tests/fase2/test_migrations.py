@@ -13,7 +13,13 @@ class MigrationRunnerTest(unittest.TestCase):
             conn = env.connect()
             try:
                 first = default_runner().run(conn, dry_run=False)
-                self.assertEqual([item.status for item in first], ["APPLIED", "APPLIED"])
+                self.assertEqual(
+                    [item.status for item in first],
+                    [
+                        "APPLIED", "APPLIED", "APPLIED",
+                        "APPLIED", "APPLIED", "APPLIED",
+                    ],
+                )
                 cols = {row["name"] for row in conn.execute("PRAGMA table_info(compras)")}
                 self.assertIn("documento_tipo_normalizado", cols)
                 self.assertIn("numero_factura_normalizada", cols)
@@ -25,7 +31,11 @@ class MigrationRunnerTest(unittest.TestCase):
                 second = default_runner().run(conn, dry_run=False)
                 self.assertEqual(
                     [item.status for item in second],
-                    ["SKIPPED_APPLIED", "SKIPPED_APPLIED"],
+                    [
+                        "SKIPPED_APPLIED", "SKIPPED_APPLIED",
+                        "SKIPPED_APPLIED", "SKIPPED_APPLIED",
+                        "SKIPPED_APPLIED", "SKIPPED_APPLIED",
+                    ],
                 )
             finally:
                 conn.close()
@@ -54,6 +64,9 @@ class MigrationRunnerTest(unittest.TestCase):
         try:
             conn.execute(
                 "CREATE TABLE compras (id INTEGER PRIMARY KEY, proveedor_id INTEGER, numero_factura TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE productos (id INTEGER PRIMARY KEY, local_id TEXT UNIQUE)"
             )
             conn.execute(
                 "INSERT INTO compras (proveedor_id, numero_factura) VALUES (1, ' A-1 ')"

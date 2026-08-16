@@ -244,6 +244,13 @@ def ensure_local_first_schema(db_path=DEFAULT_DB_PATH):
         from inventory_ledger import ensure_inventory_ledger_schema
         ensure_inventory_ledger_schema(conn)
 
+        # Fase 2C: una instalación fresca debe materializar todas las tablas
+        # declaradas por el registry. La misma función es el cuerpo de la
+        # migración versionada 20260815_003 para instalaciones existentes.
+        # No hace backfill, no genera FRP y no toca stock.
+        from barcode_schema import ensure_sqlite_barcode_schema
+        ensure_sqlite_barcode_schema(conn)
+
         # Registrar la versión de esquema aplicada (etiqueta; no selecciona
         # migraciones — ver version.py).
         from version import SCHEMA_VERSION

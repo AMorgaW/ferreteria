@@ -481,6 +481,8 @@ class SistemaFerreteriaApp(QMainWindow):
         menus = [
             ("dashboard", "Dashboard", self.mostrar_dashboard, 'ver_dashboard'),
             ("productos", "Productos", self.mostrar_productos, 'gestionar_productos'),
+            ("productos", "Regularizar barcodes", self.mostrar_regularizar_barcodes, 'gestionar_productos'),
+            ("movimientos", "Importar inventario", self.mostrar_importar_inventario, 'gestionar_productos'),
             ("clientes", "Clientes", self.mostrar_clientes, 'gestionar_clientes'),
             ("proveedores", "Proveedores", self.mostrar_proveedores, 'gestionar_proveedores'),
             ("compras", "Compras", self.mostrar_compras, 'gestionar_proveedores'),
@@ -967,6 +969,18 @@ class SistemaFerreteriaApp(QMainWindow):
         from ui.productos_ui import ProductosUI
         w = ProductosUI(self.content_stack, self.productos_repo, self.auth,
                         self.proveedores_repo)
+        self._set_content(w)
+
+    def mostrar_importar_inventario(self):
+        from ui.inventory_import_ui import InventoryImportUI
+        w = InventoryImportUI(
+            self.content_stack, self.db, self.productos_repo, self.auth
+        )
+        self._set_content(w)
+
+    def mostrar_regularizar_barcodes(self):
+        from ui.barcode_regularization_ui import BarcodeRegularizationUI
+        w = BarcodeRegularizationUI(self.content_stack, self.db, self.auth)
         self._set_content(w)
 
     def mostrar_clientes(self):

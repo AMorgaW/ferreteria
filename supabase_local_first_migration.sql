@@ -21,7 +21,7 @@ DECLARE
     t text;
 BEGIN
     FOREACH table_name IN ARRAY ARRAY[
-        'usuarios', 'productos', 'clientes', 'proveedores', 'ventas',
+        'usuarios', 'productos', 'product_barcodes', 'clientes', 'proveedores', 'ventas',
         'detalle_ventas', 'movimientos', 'movimientos_inventario',
         'cuentas_por_cobrar', 'pagos_cuentas', 'cierres_caja',
         'abonos_ventas', 'abonos_compras', 'egresos_caja', 'configuracion',

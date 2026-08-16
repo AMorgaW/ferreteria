@@ -15,6 +15,7 @@ BEGIN
         'clientes',
         'configuracion',
         'productos',
+        'product_barcodes',
         'ventas',
         'compras',
         'cierres_caja',

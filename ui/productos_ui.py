@@ -16,6 +16,9 @@ from models import Producto
 from ui_config import COLORS, FONTS, make_font
 from formato import formatear_stock
 from ui.async_worker import FunctionWorker
+from ui.barcode_widget import BarcodeCaptureWidget
+from repositories.product_barcodes_repo import ProductBarcodesRepository
+from repositories.productos_repo import PRODUCT_CREATION_FINAL
 
 
 class ProductosUI(QWidget):
@@ -25,6 +28,7 @@ class ProductosUI(QWidget):
         super().__init__(parent)
         self.parent_widget = parent
         self.productos_repo = productos_repo
+        self.barcode_repo = ProductBarcodesRepository(productos_repo.db)
         self.auth = auth
         self.proveedores_repo = proveedores_repo
 
@@ -478,8 +482,9 @@ class ProductosUI(QWidget):
         info_grid.addWidget(marca_combo, 3, 1)
 
         # Tamaño / Medida (presentación) — distingue variantes del mismo artículo
-        info_grid.addWidget(self._label("Tamaño / Medida (variante)"), 4, 0, Qt.AlignLeft)
-        info_grid.addWidget(self._label("SKU / Código (auto si vacío)"), 4, 1, Qt.AlignLeft)
+        info_grid.addWidget(
+            self._label("Tamaño / Medida (variante)"), 4, 0, 1, 2, Qt.AlignLeft
+        )
 
         presentacion_size_edit = QLineEdit(
             (producto_dict.get('presentacion') or '') if producto_dict else '')
@@ -489,13 +494,7 @@ class ProductosUI(QWidget):
             "Sirve para diferenciar variantes del MISMO artículo.\n"
             "Ej: «Tornillo» en 1/2\", 3/4\" y 1\", o «Pintura» en 1 galón y 1/4.\n"
             "Escribe la medida, tamaño, color o presentación que distingue esta versión.")
-        info_grid.addWidget(presentacion_size_edit, 5, 0)
-
-        sku_edit = QLineEdit(
-            (producto_dict.get('codigo_barras') or '') if producto_dict else '')
-        sku_edit.setFont(make_font(FONTS['body']))
-        sku_edit.setPlaceholderText("Se genera automáticamente")
-        info_grid.addWidget(sku_edit, 5, 1)
+        info_grid.addWidget(presentacion_size_edit, 5, 0, 1, 2)
 
         info_grid.addWidget(self._label("Proveedor"), 6, 0, 1, 2, Qt.AlignLeft)
 
@@ -719,6 +718,22 @@ class ProductosUI(QWidget):
         right_column = QVBoxLayout()
         right_column.setSpacing(10)
 
+        existing_barcodes = []
+        if producto_dict and producto_dict.get('local_id'):
+            try:
+                existing_barcodes = self.barcode_repo.list_for_product(
+                    producto_dict['local_id']
+                )
+            except Exception:
+                # La propia acción mostrará un error de migración si se intenta
+                # escanear/guardar sobre una base aún no migrada.
+                existing_barcodes = []
+        barcode_widget = BarcodeCaptureWidget(
+            self.barcode_repo,
+            existing_barcodes=existing_barcodes,
+        )
+        right_column.addWidget(barcode_widget)
+
         # ===== Configuración de Empaque =====
         cajas_group = QGroupBox("\U0001f4e6 Configuración de Empaque")
         cajas_group.setFont(make_font(FONTS['body_bold']))
@@ -939,7 +954,7 @@ class ProductosUI(QWidget):
             num_cajas_edit, unidades_por_caja_edit,
             permitir_venta_empaque_check,
             permite_decimales_check,
-            presentacion_size_edit, sku_edit
+            presentacion_size_edit, barcode_widget
         ))
         footer_lay.addWidget(btn_guardar)
 
@@ -970,7 +985,7 @@ class ProductosUI(QWidget):
                          num_cajas_edit, unidades_por_caja_edit,
                          permitir_venta_empaque_check,
                          permite_decimales_check,
-                         presentacion_size_edit=None, sku_edit=None):
+                         presentacion_size_edit=None, barcode_widget=None):
         """Guarda el producto con la nueva lógica de unidad base y presentación"""
         try:
             nombre = nombre_edit.text().strip()
@@ -1015,11 +1030,13 @@ class ProductosUI(QWidget):
             if proveedor_id == 0:
                 proveedor_id = None
 
-            # Tamaño/medida (presentación) y SKU ingresados por el usuario
+            # Tamaño/medida y código histórico. Los barcodes físicos viven
+            # exclusivamente en product_barcodes.
             presentacion_size = (presentacion_size_edit.text().strip()
                                  if presentacion_size_edit else '') or None
-            sku_val = (sku_edit.text().strip() if sku_edit else '')
-            codigo_barras = sku_val or (producto_dict.get('codigo_barras') if producto_dict else None)
+            codigo_barras = (
+                producto_dict.get('codigo_barras') if producto_dict else None
+            )
 
             producto = Producto(
                 id=producto_dict['id'] if producto_dict else None,
@@ -1042,11 +1059,41 @@ class ProductosUI(QWidget):
             )
 
             if modo == 'crear':
-                exito, mensaje, _ = self.productos_repo.crear_producto(producto)
+                exito, mensaje, _ = self.productos_repo.crear_producto(
+                    producto,
+                    creation_policy=PRODUCT_CREATION_FINAL,
+                    verified_barcode=(
+                        barcode_widget.verified_barcode if barcode_widget else None
+                    ),
+                    verified_barcode_type=(
+                        barcode_widget.barcode_type if barcode_widget else 'MANUFACTURER'
+                    ),
+                    verified_barcode_source=(
+                        barcode_widget.source if barcode_widget else 'HID_DOUBLE_SCAN'
+                    ),
+                )
             else:
                 exito, mensaje = self.productos_repo.actualizar_producto(producto)
+                if exito and barcode_widget and barcode_widget.verified_barcode:
+                    try:
+                        record = self.barcode_repo.assign_barcode(
+                            producto_local_id=producto_dict['local_id'],
+                            barcode=barcode_widget.verified_barcode,
+                            barcode_type=barcode_widget.barcode_type,
+                            source=barcode_widget.source,
+                        )
+                        if record.barcode != barcode_widget.verified_barcode:
+                            raise RuntimeError(
+                                "la relectura de DB no coincide con el barcode"
+                            )
+                        mensaje = "Producto actualizado; CÓDIGO GUARDADO Y VERIFICADO"
+                    except Exception as exc:
+                        exito = False
+                        mensaje = str(exc)
 
             if exito:
+                if barcode_widget and barcode_widget.verified_barcode:
+                    barcode_widget.mark_persistence_verified()
                 QMessageBox.information(ventana, "Éxito", mensaje)
                 ventana.close()
                 self.cargar_datos_autocompletado()

@@ -32,6 +32,7 @@ def _entry(
     entity_type: str,
     *,
     parents: Sequence[Tuple[str, str]] = (),
+    sync_dependencies: Sequence[str] = (),
     pk: str = "id",
     push: bool = True,
     pull: bool = True,
@@ -47,6 +48,7 @@ def _entry(
         "entity_type": entity_type,
         "pk": pk,
         "parents": tuple(parents),
+        "sync_dependencies": tuple(sync_dependencies),
         "authoritative_exclude": tuple(authoritative_exclude),
         "projection_fields": tuple(projection_fields),
         "required_for_startup": bool(required_for_startup),
@@ -82,6 +84,15 @@ SYNC_REGISTRY: Dict[str, dict] = {
             "local_id es la identidad global del SKU. stock es proyección; "
             "authoritative_exclude NO se aplica mientras "
             "APPLY_AUTHORITATIVE_EXCLUDE sea False."
+        ),
+    ),
+    "product_barcodes": _entry(
+        "product_barcode",
+        pk="local_id",
+        sync_dependencies=("productos",),
+        notes=(
+            "producto_local_id ya es la identidad global del SKU y por eso no "
+            "se traduce como FK entera. barcode es UNIQUE central y case-sensitive."
         ),
     ),
     "ventas": _entry(
@@ -280,6 +291,13 @@ def topo_order(registry: Optional[Mapping[str, dict]] = None) -> List[str]:
                 )
             children[parent].append(table)
             indeg[table] += 1
+        for dependency in reg[table].get("sync_dependencies") or ():
+            if dependency not in table_set:
+                raise SyncRegistryError(
+                    f"{table} depende de tabla no sincronizada {dependency!r}"
+                )
+            children[dependency].append(table)
+            indeg[table] += 1
     queue = [name for name in tables if indeg[name] == 0]
     order: List[str] = []
     while queue:
@@ -427,6 +445,7 @@ def product_field_class(column: str) -> str:
         "local_id": "identity_global",
         "remote_id": "remote_pointer",
         "codigo_barras": "business_key",
+        "barcode_status": "metadata",
         "stock": "projection",
         "updated_at": "sync_plumbing",
         "deleted_at": "sync_plumbing",

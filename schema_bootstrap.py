@@ -90,6 +90,7 @@ REQUIRED_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
     ("productos", "unidad_base_producto", "TEXT"),
     ("productos", "unidades_por_media_caja", "INTEGER DEFAULT 1"),
     ("productos", "vende_por_empaque", "INTEGER DEFAULT 0"),
+    ("productos", "barcode_status", "TEXT NOT NULL DEFAULT 'BARCODE_MISSING_LEGACY'"),
     ("movimientos_inventario", "numero_factura", "TEXT"),
 )
 

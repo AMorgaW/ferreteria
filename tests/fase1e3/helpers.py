@@ -70,6 +70,11 @@ def reset_lab_balances(admin_conn):
         cur.execute("DELETE FROM inventory_balance_init_state WHERE init_key = 'legacy_cutover'")
         cur.execute("DELETE FROM inventory_balance_init")
         cur.execute("DELETE FROM inventory_balances")
+        # Fase 2C usa FK RESTRICT para impedir que un barcode quede huérfano.
+        # Este reset es exclusivamente del laboratorio: limpia primero hijos.
+        cur.execute("SELECT to_regclass('public.product_barcodes')")
+        if cur.fetchone()[0] is not None:
+            cur.execute("DELETE FROM product_barcodes")
         cur.execute("DELETE FROM productos")
     admin_conn.commit()
 
