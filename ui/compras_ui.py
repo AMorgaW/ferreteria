@@ -11,13 +11,23 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                                 QListWidget, QListWidgetItem, QCompleter,
                                 QSizePolicy, QAbstractItemView, QButtonGroup,
                                 QGroupBox)
-from PySide6.QtCore import Qt, QSize, QStringListModel, Signal, QTimer
+from PySide6.QtCore import Qt, QSize, QStringListModel, Signal, QTimer, QThreadPool
 from PySide6.QtGui import QFont, QColor
 from ui_config import COLORS, FONTS, make_font
 from ui.widgets import ShadowCard, KpiCard, ActionButton
 from models import Abono
 from datetime import datetime
-from repositories.compras_repo import registrar_compra_desde_ui
+from packaging_conversion import (
+    PACKAGING_BLOCKED,
+    PackagingConversionBlocked,
+    PackagingError,
+    as_decimal,
+    get_base_units_per_package,
+)
+from repositories.product_barcodes_repo import PACKAGE_ROLE_BASE_UNIT, PACKAGE_ROLE_FULL_PACKAGE
+from services.compras_service import ComprasService
+from services.purchase_cart import PurchaseCart, receipt_finalize_allowed
+from ui.async_worker import FunctionWorker
 
 
 class AutocompleteEntry(QWidget):
@@ -795,7 +805,7 @@ class ComprasUI(QWidget):
         """Abre el formulario de nueva compra"""
         FormularioCompra(self, self.compras_repo, self.proveedores_repo,
                          self.productos_repo, self.auth, callback=self.cargar_compras_recientes,
-                         abonos_repo=self.abonos_repo)
+                         abonos_repo=self.abonos_repo, db_manager=self.db)
 
     def crear_panel_deudas(self):
         """Crea panel de resumen de deudas — estilo ámbar/dorado degradado"""
@@ -908,7 +918,7 @@ class ComprasUI(QWidget):
 class FormularioCompra(QDialog):
     """Formulario para registrar una compra con m\u00faltiples productos"""
 
-    def __init__(self, parent, compras_repo, proveedores_repo, productos_repo, auth_manager, callback=None, abonos_repo=None):
+    def __init__(self, parent, compras_repo, proveedores_repo, productos_repo, auth_manager, callback=None, abonos_repo=None, db_manager=None, compras_service=None, auto_exec=True):
         super().__init__(parent)
         self.compras_repo = compras_repo
         self.proveedores_repo = proveedores_repo
@@ -916,17 +926,29 @@ class FormularioCompra(QDialog):
         self.auth = auth_manager
         self.callback = callback
         self.abonos_repo = abonos_repo
+        self.db_manager = db_manager
+        self.compras_service = compras_service or ComprasService(
+            db_manager or getattr(compras_repo, "db", None),
+            compras_repo=compras_repo,
+            productos_repo=productos_repo,
+            proveedores_repo=proveedores_repo,
+            auth=auth_manager,
+        )
+        self.purchase_cart = PurchaseCart()
+        self._thread_pool = QThreadPool.globalInstance()
+        self._draft_id = None
 
         self.carrito = []
         self.ultimo_precio_proveedor = None
 
-        self.setWindowTitle("Registrar Nueva Compra")
+        self.setWindowTitle("Registrar Nueva Compra / Recepción")
         self.resize(1000, 700)
         self.setStyleSheet(f"background: {COLORS['bg_primary']};")
         self.setModal(True)
 
         self.crear_formulario()
-        self.exec()
+        if auto_exec:
+            self.exec()
 
     def crear_formulario(self):
         """Crea el formulario completo"""
@@ -1194,6 +1216,16 @@ class FormularioCompra(QDialog):
         self.producto_combo = AutocompleteEntry(self)
         self.producto_combo.bind_select(self.on_producto_change)
         grid.addWidget(self.producto_combo, 0, 1)
+
+        lbl_scan = QLabel("Escanear / código:")
+        lbl_scan.setFont(make_font(FONTS['body']))
+        lbl_scan.setStyleSheet(f"color: {COLORS['text_secondary']}; border: none;")
+        grid.addWidget(lbl_scan, 4, 0)
+        self.scan_entry = QLineEdit()
+        self.scan_entry.setPlaceholderText("Barcode físico o alias de proveedor")
+        self.scan_entry.setFont(make_font(FONTS['body']))
+        self.scan_entry.returnPressed.connect(self.agregar_por_codigo)
+        grid.addWidget(self.scan_entry, 4, 1, 1, 2)
 
         # M\u00e9todo de compra (cajas/unidades)
         metodo_frame = QWidget()
@@ -1481,34 +1513,49 @@ class FormularioCompra(QDialog):
         btn_layout = QHBoxLayout(btn_frame)
         btn_layout.setContentsMargins(30, 10, 30, 20)
 
-        btn_cancelar = QPushButton("Cancelar")
-        btn_cancelar.setFont(make_font(FONTS['body']))
-        btn_cancelar.setCursor(Qt.PointingHandCursor)
-        btn_cancelar.setStyleSheet(f"""
+        self.btn_cancelar = QPushButton("Cancelar")
+        self.btn_cancelar.setFont(make_font(FONTS['body']))
+        self.btn_cancelar.setCursor(Qt.PointingHandCursor)
+        self.btn_cancelar.setStyleSheet(f"""
             QPushButton {{
                 background: {COLORS['danger']}; color: white;
                 border: none; border-radius: 6px; padding: 12px 30px;
             }}
             QPushButton:hover {{ background: {COLORS['danger_dark']}; }}
+            QPushButton:disabled {{ background: {COLORS['border_input']}; color: {COLORS['text_secondary']}; }}
         """)
-        btn_cancelar.clicked.connect(self.reject)
-        btn_layout.addWidget(btn_cancelar)
+        self.btn_cancelar.clicked.connect(self.reject)
+        btn_layout.addWidget(self.btn_cancelar)
 
         btn_layout.addStretch()
 
-        btn_confirmar = QPushButton("Confirmar Compra")
-        btn_confirmar.setFont(make_font(FONTS['body_bold']))
-        btn_confirmar.setCursor(Qt.PointingHandCursor)
-        btn_confirmar.setStyleSheet(f"""
+        self.btn_guardar_borrador = QPushButton("Guardar borrador")
+        self.btn_guardar_borrador.setFont(make_font(FONTS['body']))
+        self.btn_guardar_borrador.setCursor(Qt.PointingHandCursor)
+        self.btn_guardar_borrador.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['bg_secondary']}; color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border_input']}; border-radius: 6px; padding: 12px 22px;
+            }}
+            QPushButton:hover {{ background: {COLORS['bg_hover']}; }}
+        """)
+        self.btn_guardar_borrador.clicked.connect(self.guardar_borrador)
+        btn_layout.addWidget(self.btn_guardar_borrador)
+
+        self.btn_confirmar = QPushButton("CONFIRMAR RECEPCIÓN")
+        self.btn_confirmar.setFont(make_font(FONTS['body_bold']))
+        self.btn_confirmar.setCursor(Qt.PointingHandCursor)
+        self.btn_confirmar.setStyleSheet(f"""
             QPushButton {{
                 background: {COLORS['primary']}; color: white;
                 border: none; border-radius: 6px; padding: 12px 30px;
                 font-weight: 500;
             }}
             QPushButton:hover {{ background: {COLORS['primary_dark']}; }}
+            QPushButton:disabled {{ background: {COLORS['border_input']}; color: {COLORS['text_secondary']}; }}
         """)
-        btn_confirmar.clicked.connect(self.guardar_compra)
-        btn_layout.addWidget(btn_confirmar)
+        self.btn_confirmar.clicked.connect(self.guardar_compra)
+        btn_layout.addWidget(self.btn_confirmar)
 
         parent_layout.addWidget(btn_frame)
 
@@ -1590,20 +1637,26 @@ class FormularioCompra(QDialog):
             unidad = producto.unidad_medida or "UNIDAD"
             self.unidad_medida_label.setText(unidad)
 
-            tiene_empaque = hasattr(producto, 'viene_en_caja') and producto.viene_en_caja
+            factor = get_base_units_per_package(self._producto_mapping(producto))
+            tiene_empaque = factor is not None
+            presentacion_nombre = (
+                getattr(producto, "presentacion", None)
+                or getattr(producto, "presentacion_empaque", None)
+                or "empaque"
+            )
             if tiene_empaque:
-                presentacion = "Caja/Paquete"
-                unidades_por = producto.unidades_por_caja if hasattr(producto, 'unidades_por_caja') else 1
-                if unidades_por > 1:
-                    contenido_texto = f"Referencia: {unidades_por} {unidad}s por caja"
-                else:
-                    contenido_texto = "Referencia: 1 unidad por caja"
-                self.unidades_por_caja_entry.setText(str(unidades_por))
+                presentacion = str(presentacion_nombre)
+                contenido_texto = f"Canónico: {factor} {unidad} por {presentacion}"
+                self.unidades_por_caja_entry.setText(str(factor))
+                self.unidades_por_caja_entry.setReadOnly(True)
             else:
-                presentacion = "Sin empaque"
+                presentacion = "Sin empaque canónico"
                 contenido_texto = f"Se vende por {unidad}"
                 self.unidades_por_caja_entry.setText("1")
-            self.radio_caja.setEnabled(True)
+                self.unidades_por_caja_entry.setReadOnly(True)
+            self.radio_caja.setEnabled(bool(tiene_empaque))
+            if not tiene_empaque and self.radio_caja.isChecked():
+                self.radio_unidad.setChecked(True)
             self._actualizar_labels_modo_compra(unidad)
 
             self.presentacion_label.setText(presentacion)
@@ -1612,11 +1665,9 @@ class FormularioCompra(QDialog):
             from formato import formatear_stock
             _stock_fmt = formatear_stock(producto.stock, getattr(producto, 'permite_decimales', None))
             stock_texto = f"{_stock_fmt} {unidad}"
-            if tiene_empaque and hasattr(producto, 'unidades_por_caja'):
-                unidades_por = producto.unidades_por_caja
-                if unidades_por > 1 and producto.stock > 0:
-                    cajas_equiv = producto.stock / unidades_por
-                    stock_texto = f"{_stock_fmt} {unidad}s ({cajas_equiv:.1f} cajas)"
+            if tiene_empaque and factor and producto.stock > 0:
+                empaques_equiv = as_decimal(producto.stock) / factor
+                stock_texto = f"{_stock_fmt} {unidad} ({empaques_equiv} {presentacion})"
 
             self.stock_label.setText(stock_texto)
 
@@ -1698,8 +1749,99 @@ class FormularioCompra(QDialog):
         """Calcula el total de unidades basado en cajas y unidades por caja"""
         pass
 
+    def _producto_mapping(self, producto):
+        if isinstance(producto, dict):
+            return producto
+        return {
+            "id": getattr(producto, "id", None),
+            "nombre": getattr(producto, "nombre", ""),
+            "precio_compra": getattr(producto, "precio_compra", 0),
+            "precio_venta": getattr(producto, "precio_venta", 0),
+            "permite_decimales": getattr(producto, "permite_decimales", 0),
+            "unidad_medida": getattr(producto, "unidad_medida", "UNIDAD"),
+            "unidad_base": getattr(producto, "unidad_base", None)
+            or getattr(producto, "unidad_base_producto", None)
+            or getattr(producto, "unidad_medida", "UNIDAD"),
+            "presentacion": getattr(producto, "presentacion", None),
+            "presentacion_empaque": getattr(producto, "presentacion_empaque", None)
+            or getattr(producto, "presentacion", None),
+            "cantidad_base_por_empaque": getattr(
+                producto, "cantidad_base_por_empaque", None
+            ),
+            "unidades_por_caja": getattr(producto, "unidades_por_caja", None),
+            "viene_en_caja": getattr(producto, "viene_en_caja", 0),
+            "vende_por_empaque": getattr(producto, "vende_por_empaque", 0),
+            "vende_empaque_completo": getattr(producto, "vende_empaque_completo", 0),
+            "vende_medio_empaque": getattr(producto, "vende_medio_empaque", 0),
+            "unidades_por_media_caja": getattr(producto, "unidades_por_media_caja", None),
+            "unidades_venta_custom": getattr(producto, "unidades_venta_custom", None),
+            "local_id": getattr(producto, "local_id", None),
+            "stock": getattr(producto, "stock", 0),
+        }
+
+    def _set_confirm_busy(self, busy: bool):
+        self.btn_confirmar.setEnabled(not busy)
+        self.btn_guardar_borrador.setEnabled(not busy)
+        self.btn_cancelar.setEnabled(not busy)
+        self.btn_confirmar.setText("PROCESANDO..." if busy else "CONFIRMAR RECEPCIÓN")
+
+    def reject(self):
+        if self.purchase_cart.confirm_in_flight:
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self.purchase_cart.confirm_in_flight:
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def agregar_por_codigo(self):
+        raw = self.scan_entry.text().strip()
+        if not raw:
+            return
+        proveedor_id = self.proveedores_dict.get(self.proveedor_combo.currentText())
+        costo = None
+        try:
+            if self.precio_entry.text().strip():
+                costo = self.precio_entry.text().replace(",", "")
+        except Exception:
+            costo = None
+        result = self.purchase_cart.add_scan(
+            self.productos_repo,
+            raw,
+            aliases_repo=getattr(self.compras_service, "aliases_repo", None),
+            proveedor_id=proveedor_id,
+            costo_unitario=costo,
+        )
+        self.scan_entry.clear()
+        if not result.ok:
+            QMessageBox.warning(self, "Código no aplicado", result.error or "No se pudo agregar")
+            return
+        self._sync_carrito_from_cart()
+        self.actualizar_tabla_carrito()
+
+    def _sync_carrito_from_cart(self):
+        self.carrito = []
+        for line in self.purchase_cart.lines:
+            product = line.get("producto") or {}
+            self.carrito.append({
+                "producto_id": product.get("id"),
+                "nombre": product.get("nombre"),
+                "cantidad": line.get("cantidad_presentacion"),
+                "cantidad_base": line.get("cantidad"),
+                "precio": line.get("precio_unitario"),
+                "package_role": line.get("package_role"),
+                "unidad_medida": product.get("unidad_medida", "UNIDAD"),
+                "texto_cantidad": (
+                    f"{line.get('cantidad_presentacion')} "
+                    f"{line.get('package_role')} → {line.get('cantidad')} base"
+                ),
+                "supplier_alias": line.get("supplier_alias"),
+            })
+
     def agregar_producto_al_carrito(self):
-        """Agrega un producto al carrito"""
+        """Agrega el producto al carrito de recepción. No mueve stock."""
         try:
             producto_nombre = self.producto_combo.get()
             if not producto_nombre:
@@ -1710,141 +1852,68 @@ class FormularioCompra(QDialog):
             if not producto:
                 QMessageBox.critical(self, "Error", "Producto no encontrado")
                 return
-
+            mapping = self._producto_mapping(producto)
+            role = PACKAGE_ROLE_BASE_UNIT
             if self.radio_caja.isChecked():
-                try:
-                    num_piezas = float(self.num_cajas_entry.text() or 0)
-                    medida_por_pieza = float(self.unidades_por_caja_entry.text() or 1)
-                except Exception:
-                    num_piezas, medida_por_pieza = 0, 1
-
-                permite_dec = getattr(producto, 'permite_decimales', False)
-                unidad_str = (producto.unidad_medida or 'UNIDAD').upper()
-                cantidad_raw = num_piezas * medida_por_pieza
-                cantidad_real = cantidad_raw if permite_dec else int(cantidad_raw)
-
-                if cantidad_real <= 0:
-                    QMessageBox.warning(self, "Advertencia", "Debe especificar la cantidad")
+                role = PACKAGE_ROLE_FULL_PACKAGE
+                if get_base_units_per_package(mapping) is None:
+                    QMessageBox.warning(
+                        self,
+                        "Empaque",
+                        f"{PACKAGING_BLOCKED}: FULL_PACKAGE sin factor canónico",
+                    )
                     return
-
-                if unidad_str == 'UNIDAD':
-                    texto_cantidad = f"{int(num_piezas)} empaque(s) \u00d7 {int(medida_por_pieza)} = {int(cantidad_real)} unidades"
-                else:
-                    total_str = f"{cantidad_real:.2f}".rstrip('0').rstrip('.')
-                    texto_cantidad = (f"{int(num_piezas)} pieza(s) \u00d7 {medida_por_pieza} "
-                                      f"{unidad_str.lower()} = {total_str} {unidad_str.lower()}")
+                try:
+                    cantidad_real = self.num_cajas_entry.text() or "0"
+                except Exception:
+                    cantidad_real = "0"
             else:
-                permite_dec = getattr(producto, 'permite_decimales', False)
-                try:
-                    raw = self.cantidad_entry.text()
-                    cantidad_real = float(raw) if permite_dec else int(raw)
-                except Exception:
-                    cantidad_real = 0
+                cantidad_real = self.cantidad_entry.text() or "0"
 
-                if cantidad_real <= 0:
-                    QMessageBox.warning(self, "Advertencia", "Debe especificar al menos una unidad")
-                    return
-
-                unidad_str = (producto.unidad_medida or 'unidad').lower()
-                if permite_dec:
-                    total_str = f"{cantidad_real:.2f}".rstrip('0').rstrip('.')
-                    texto_cantidad = f"{total_str} {unidad_str}"
-                else:
-                    texto_cantidad = f"{int(cantidad_real)} {unidad_str}"
-
-            precio_compra = float(self.precio_entry.text())
-            precio_venta = float(self.precio_venta_entry.text())
-
-            if precio_compra <= 0 or precio_venta <= 0:
-                QMessageBox.warning(self, "Advertencia", "Precio de compra y precio de venta deben ser mayores a cero")
+            precio_compra = self.precio_entry.text().replace(",", "") or "0"
+            try:
+                self.purchase_cart.add_line(
+                    mapping,
+                    cantidad_real,
+                    package_role=role,
+                    costo_unitario=precio_compra,
+                )
+            except (PackagingConversionBlocked, PackagingError, ValueError) as exc:
+                QMessageBox.warning(self, "Línea inválida", str(exc))
                 return
 
-            if precio_venta <= precio_compra:
-                ret = QMessageBox.question(self, "Advertencia",
-                    f"El precio de venta (${precio_venta:,.0f}) es menor o igual al precio de compra (${precio_compra:,.0f}).\n\n"
-                    "Esto generar\u00eda p\u00e9rdidas. \u00bfDesea continuar de todas formas?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-                if ret != QMessageBox.Yes:
-                    return
-
-            if not producto:
-                QMessageBox.critical(self, "Error", "Producto no encontrado")
-                return
-
-            if hasattr(self, 'ultimo_precio_proveedor') and self.ultimo_precio_proveedor:
-                diferencia_porcentual = abs((precio_compra - self.ultimo_precio_proveedor) / self.ultimo_precio_proveedor * 100)
-
-                if diferencia_porcentual > 10:
-                    cambio = "aument\u00f3" if precio_compra > self.ultimo_precio_proveedor else "disminuy\u00f3"
-                    mensaje = f"[AVISO] ALERTA DE PRECIO DE COMPRA\n\n"
-                    mensaje += f"El precio {cambio} {diferencia_porcentual:.1f}%\n\n"
-                    mensaje += f"Precio anterior: ${self.ultimo_precio_proveedor:,.0f}\n"
-                    mensaje += f"Precio actual: ${precio_compra:,.0f}\n\n"
-                    mensaje += f"\u00bfDesea continuar?"
-
-                    ret = QMessageBox.question(self, "Cambio de Precio Detectado", mensaje,
-                                               QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-                    if ret != QMessageBox.Yes:
-                        return
-
-            for item in self.carrito:
-                if item['producto_id'] == producto.id:
-                    item['cantidad'] += cantidad_real
-                    item['precio'] = precio_compra
-                    item['precio_venta'] = precio_venta
-                    item['texto_cantidad'] = texto_cantidad
-                    self.actualizar_tabla_carrito()
-                    QMessageBox.information(self, "Info", f"Cantidad actualizada:\n{texto_cantidad}")
-                    return
-
-            self.carrito.append({
-                'producto_id': producto.id,
-                'nombre': producto.nombre,
-                'cantidad': cantidad_real,
-                'precio': precio_compra,
-                'precio_venta': precio_venta,
-                'unidad_medida': producto.unidad_medida,
-                'texto_cantidad': texto_cantidad
-            })
-
+            self._sync_carrito_from_cart()
             self.actualizar_tabla_carrito()
-            QMessageBox.information(self, "\u00c9xito", f"'{producto.nombre}' agregado:\n{texto_cantidad}")
-
             if self.radio_caja.isChecked():
                 self.num_cajas_entry.setText("0")
-                self.unidades_por_caja_entry.setText("1")
             else:
                 self.cantidad_entry.setText("1")
-
         except ValueError as e:
-            QMessageBox.critical(self, "Error", f"Cantidad y precio deben ser n\u00fameros v\u00e1lidos\n{str(e)}")
+            QMessageBox.critical(self, "Error", f"Cantidad y costo deben ser números válidos\n{str(e)}")
 
     def actualizar_tabla_carrito(self):
         """Actualiza la tabla del carrito y el total"""
         self.tree_carrito.setRowCount(0)
-
-        total = 0
+        from decimal import Decimal
+        total = Decimal("0")
+        if not self.carrito and self.purchase_cart.lines:
+            self._sync_carrito_from_cart()
         for row_idx, item in enumerate(self.carrito):
-            subtotal = item['cantidad'] * item['precio']
+            subtotal = Decimal(str(item['cantidad'])) * Decimal(str(item['precio']))
             total += subtotal
-
-            cantidad_mostrar = item.get('texto_cantidad', f"{item['cantidad']} {item['unidad_medida']}")
-
+            cantidad_mostrar = item.get('texto_cantidad', f"{item['cantidad']} {item.get('unidad_medida', '')}")
             valores = (
                 item['nombre'],
                 cantidad_mostrar,
-                f"${item['precio']:,.0f}",
+                f"${Decimal(str(item['precio'])):,.0f}",
                 f"${subtotal:,.0f}"
             )
-
             self.tree_carrito.insertRow(row_idx)
             for col_idx, val in enumerate(valores):
                 tw_item = QTableWidgetItem(str(val))
                 tw_item.setTextAlignment(Qt.AlignCenter)
                 self.tree_carrito.setItem(row_idx, col_idx, tw_item)
-
         self.total_label.setText(f"TOTAL: ${total:,.0f}")
-        # Guardar el total para el botón "Pagar todo" del pago inicial.
         self._total_compra_actual = total
 
     def eliminar_del_carrito(self):
@@ -1853,158 +1922,172 @@ class FormularioCompra(QDialog):
         if row < 0:
             QMessageBox.warning(self, "Advertencia", "Seleccione un producto del carrito")
             return
-
-        producto_nombre = self.tree_carrito.item(row, 0).text()
-        self.carrito = [item for item in self.carrito if item['nombre'] != producto_nombre]
-
+        try:
+            self.purchase_cart.remove_line(row)
+        except Exception:
+            pass
+        self._sync_carrito_from_cart()
         self.actualizar_tabla_carrito()
-        QMessageBox.information(self, "Info", "Producto eliminado del carrito")
 
     def vaciar_carrito(self):
-        """Vac\u00eda todo el carrito"""
-        if not self.carrito:
-            QMessageBox.information(self, "Info", "El carrito ya est\u00e1 vac\u00edo")
+        """Vacía todo el carrito"""
+        if not self.purchase_cart.lines:
+            QMessageBox.information(self, "Info", "El carrito ya está vacío")
             return
-
-        ret = QMessageBox.question(self, "Confirmar", "\u00bfEst\u00e1 seguro de vaciar el carrito?",
+        ret = QMessageBox.question(self, "Confirmar", "¿Está seguro de vaciar el carrito?",
                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if ret == QMessageBox.Yes:
-            self.carrito = []
+            self.purchase_cart.clear()
+            self._sync_carrito_from_cart()
             self.actualizar_tabla_carrito()
-            QMessageBox.information(self, "Info", "Carrito vaciado")
+
+    def _header_payload(self):
+        proveedor_nombre = self.proveedor_combo.currentText()
+        if not proveedor_nombre:
+            return None, "Seleccione un proveedor"
+        if not self.purchase_cart.lines:
+            return None, "Agregue al menos un producto al carrito"
+        proveedor_id = self.proveedores_dict[proveedor_nombre]
+        numero_factura = self.factura_entry.text().strip() or None
+        if not numero_factura:
+            return None, "El número de factura es obligatorio. Ingrese el # Factura del proveedor."
+        tipo_compra = 'CONTADO' if self.radio_contado.isChecked() else 'CREDITO'
+        observaciones = self._observaciones_text or None
+        usuario_id = self.auth.usuario_actual.id if self.auth and self.auth.usuario_actual else None
+        items = self.purchase_cart.to_purchase_items()
+        return {
+            "proveedor_id": proveedor_id,
+            "proveedor_nombre": proveedor_nombre,
+            "productos": items,
+            "numero_factura": numero_factura,
+            "tipo_compra": tipo_compra,
+            "observaciones": observaciones,
+            "usuario_id": usuario_id,
+        }, None
+
+    def guardar_borrador(self):
+        payload, error = self._header_payload()
+        if error:
+            QMessageBox.critical(self, "Error", error)
+            return
+        ok, msg, compra_id = self.compras_service.guardar_borrador(
+            proveedor_id=payload["proveedor_id"],
+            productos=payload["productos"],
+            numero_factura=payload["numero_factura"],
+            tipo_compra=payload["tipo_compra"],
+            observaciones=payload["observaciones"],
+            usuario_id=payload["usuario_id"],
+            compra_id=self._draft_id,
+        )
+        if ok:
+            self._draft_id = compra_id
+            QMessageBox.information(self, "Borrador", f"{msg} (ID {compra_id}). El inventario no cambió.")
+            if self.callback:
+                self.callback()
+        else:
+            QMessageBox.critical(self, "Error", msg)
 
     def guardar_compra(self):
-        """Guarda la compra completa"""
+        """CONFIRMAR RECEPCIÓN. Única vía que aplica inventario."""
         try:
-            proveedor_nombre = self.proveedor_combo.currentText()
-            if not proveedor_nombre:
-                QMessageBox.critical(self, "Error", "Seleccione un proveedor")
+            if self.purchase_cart.confirm_in_flight:
                 return
-
-            if not self.carrito or len(self.carrito) == 0:
-                QMessageBox.critical(self, "Error", "Agregue al menos un producto al carrito")
+            payload, error = self._header_payload()
+            if error:
+                QMessageBox.critical(self, "Error", error)
                 return
-
-            proveedor_id = self.proveedores_dict[proveedor_nombre]
-            numero_factura = self.factura_entry.text().strip() or None
-
-            if not numero_factura:
-                QMessageBox.critical(self, "Error", "El n\u00famero de factura es obligatorio. Ingrese el # Factura del proveedor.")
-                return
-
-            tipo_compra = 'CONTADO' if self.radio_contado.isChecked() else 'CREDITO'
-            observaciones = self._observaciones_text or None
-            usuario_id = self.auth.usuario_actual.id if self.auth.usuario_actual else None
-
-            total_carrito = sum(item['cantidad'] * item['precio'] for item in self.carrito)
-
-            try:
-                monto_pagado_inicial = float(
-                    self.monto_pagado_inicial_entry.text().replace(',', '') or "0")
-                if monto_pagado_inicial < 0:
-                    QMessageBox.critical(self, "Error", "El monto pagado inicial no puede ser negativo")
-                    return
-            except ValueError:
-                QMessageBox.critical(self, "Error", "Monto pagado inicial inv\u00e1lido. Ingrese un n\u00famero v\u00e1lido.")
-                return
-
-            if monto_pagado_inicial > total_carrito:
-                QMessageBox.critical(self, "Error",
-                    f"El pago inicial (${monto_pagado_inicial:,.0f}) no puede ser mayor al total de la compra (${total_carrito:,.0f})")
-                return
-
-            tipo_pago_inicial = self.tipo_pago_inicial_combo.currentText() if monto_pagado_inicial > 0 else None
-            comprobante = self.comprobante_entry.text().strip() if monto_pagado_inicial > 0 else None
-
-            productos = []
-            for item in self.carrito:
-                productos.append({
-                    'producto_id': item['producto_id'],
-                    'cantidad': item['cantidad'],
-                    'precio_unitario': item['precio']
-                })
-
-            info_pago = ""
-            if monto_pagado_inicial > 0:
-                info_pago = f"\n\nPago Inicial: ${monto_pagado_inicial:,.0f}"
-                saldo_pendiente = total_carrito - monto_pagado_inicial
-                info_pago += f"\nSaldo Pendiente: ${saldo_pendiente:,.0f}"
-
-            mensaje_confirmacion = (
-                f"\u00bfConfirmar compra?\n\n"
-                f"Proveedor: {proveedor_nombre}\n"
-                f"Productos: {len(productos)}\n"
-                f"Total de Compra: ${total_carrito:,.0f}"
-                f"{info_pago}\n"
-                f"Tipo: {tipo_compra}"
+            allowed, reason = receipt_finalize_allowed(
+                self.db_manager or getattr(self.compras_repo, "db", None)
             )
-
-            ret = QMessageBox.question(self, "Confirmar Compra", mensaje_confirmacion,
+            if not allowed:
+                QMessageBox.warning(
+                    self,
+                    "CONFIRMAR bloqueado",
+                    reason or "No se puede confirmar la recepción sin autoridad central.",
+                )
+                return
+            total_carrito = self.purchase_cart.totals()[1]
+            mensaje_confirmacion = (
+                f"¿Confirmar recepción?\n\n"
+                f"Proveedor: {payload['proveedor_nombre']}\n"
+                f"Productos: {len(payload['productos'])}\n"
+                f"Total: ${total_carrito:,.0f}\n"
+                f"Tipo: {payload['tipo_compra']}\n\n"
+                "El inventario se incrementará exactamente una vez."
+            )
+            ret = QMessageBox.question(self, "Confirmar recepción", mensaje_confirmacion,
                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if ret != QMessageBox.Yes:
                 return
-
-            exito, mensaje, compra_id = registrar_compra_desde_ui(
-                self.compras_repo,
-                proveedor_id=proveedor_id,
-                productos=productos,
-                numero_factura=numero_factura,
-                tipo_compra=tipo_compra,
-                observaciones=observaciones,
-                usuario_id=usuario_id,
-                monto_pagado_inicial=monto_pagado_inicial,
-                tipo_pago_inicial=tipo_pago_inicial,
-                numero_comprobante_inicial=comprobante
-            )
-
-            if exito:
-                for item in self.carrito:
-                    try:
-                        self.productos_repo.actualizar_precio_venta(
-                            item['producto_id'],
-                            item['precio_venta']
-                        )
-                    except Exception as e:
-                        print(f"Error actualizando precio de venta: {e}")
-
-                if self.auth.usuario_actual:
-                    try:
-                        audit_msg = f"Compra #{compra_id} a '{proveedor_nombre}' - {len(productos)} productos - ${total_carrito:,.0f}"
-                        if monto_pagado_inicial > 0:
-                            audit_msg += f" [Pago Inicial: ${monto_pagado_inicial:,.0f}]"
-
-                        self.auth.registrar_auditoria(
-                            self.auth.usuario_actual.id,
-                            "REGISTRAR_COMPRA",
-                            "Compras",
-                            audit_msg
-                        )
-                    except Exception as e:
-                        print(f"Error en auditor\u00eda: {e}")
-
-                success_msg = (
-                    f"{mensaje}\n\n"
-                    f"Compra ID: {compra_id}\n"
-                    f"Productos: {len(productos)}\n"
-                    f"Total de Compra: ${total_carrito:,.0f}"
+            if not self.purchase_cart.begin_confirm():
+                return
+            self._set_confirm_busy(True)
+            if self._draft_id is None:
+                ok, msg, cid = self.compras_service.guardar_borrador(
+                    proveedor_id=payload["proveedor_id"],
+                    productos=payload["productos"],
+                    numero_factura=payload["numero_factura"],
+                    tipo_compra=payload["tipo_compra"],
+                    observaciones=payload["observaciones"],
+                    usuario_id=payload["usuario_id"],
                 )
-                if monto_pagado_inicial > 0:
-                    success_msg += f"\nPago Inicial Registrado: ${monto_pagado_inicial:,.0f}"
+                if not ok:
+                    self.purchase_cart.end_confirm()
+                    self._set_confirm_busy(False)
+                    QMessageBox.critical(self, "Error", msg)
+                    return
+                self._draft_id = cid
+            draft_id = self._draft_id
 
-                success_msg += "\n\nEl inventario y precios de venta se han actualizado autom\u00e1ticamente."
+            def _confirmar():
+                return self.compras_service.confirmar_recepcion(
+                    compra_id=draft_id,
+                )
 
-                QMessageBox.information(self, "\u00c9xito", success_msg)
-
-                self.accept()
-                if self.callback:
-                    self.callback()
-            else:
-                QMessageBox.critical(self, "Error", mensaje)
-
+            worker = FunctionWorker(_confirmar)
+            worker.signals.result.connect(self._on_recepcion_resultado)
+            worker.signals.error.connect(self._on_recepcion_error)
+            self._thread_pool.start(worker)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Error al guardar compra:\n{str(e)}")
-            import traceback
-            traceback.print_exc()
+            self.purchase_cart.end_confirm()
+            self._set_confirm_busy(False)
+            QMessageBox.critical(self, "Error", f"Error al confirmar recepción:\n{str(e)}")
+
+    def _on_recepcion_error(self, mensaje):
+        self.purchase_cart.end_confirm()
+        self._set_confirm_busy(False)
+        QMessageBox.critical(self, "Error", mensaje or "Error al confirmar recepción")
+
+    def _on_recepcion_resultado(self, outcome):
+        try:
+            exito, mensaje, compra_id = outcome
+        except Exception:
+            self._on_recepcion_error("Resultado de recepción ilegible")
+            return
+        if not exito:
+            self.purchase_cart.end_confirm()
+            self._set_confirm_busy(False)
+            if mensaje and str(mensaje).startswith("INVENTORY_UNKNOWN"):
+                QMessageBox.warning(
+                    self,
+                    "Inventario pendiente",
+                    "La recepción no se confirmó en el coordinador. "
+                    "Reintente la misma operación; no cree otra recepción.",
+                )
+                return
+            QMessageBox.critical(self, "Error", mensaje)
+            return
+        self.purchase_cart.end_confirm()
+        self._set_confirm_busy(False)
+        QMessageBox.information(
+            self,
+            "Recepción confirmada",
+            f"{mensaje}\n\nCompra ID: {compra_id}\n"
+            "El precio de venta maestro no se modificó.",
+        )
+        self.accept()
+        if self.callback:
+            self.callback()
 
 
 class VentanaDetallesCompra(QDialog):

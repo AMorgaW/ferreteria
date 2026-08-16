@@ -290,6 +290,7 @@ class DatabaseManager:
                 monto_pagado REAL DEFAULT 0,
                 saldo_pendiente REAL DEFAULT 0,
                 fecha_vencimiento DATE,
+                inventory_command_id TEXT,
                 FOREIGN KEY (proveedor_id) REFERENCES proveedores(id),
                 FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
             )
@@ -304,8 +305,22 @@ class DatabaseManager:
                 cantidad INTEGER NOT NULL,
                 precio_unitario REAL NOT NULL,
                 subtotal REAL NOT NULL,
+                package_role TEXT DEFAULT 'BASE_UNIT',
+                cantidad_presentacion TEXT,
+                supplier_alias TEXT,
                 FOREIGN KEY (compra_id) REFERENCES compras(id),
                 FOREIGN KEY (producto_id) REFERENCES productos(id)
+            )
+        ''')
+
+        _create('''
+            CREATE TABLE IF NOT EXISTS supplier_product_aliases (
+                local_id TEXT PRIMARY KEY NOT NULL,
+                proveedor_id INTEGER NOT NULL,
+                producto_local_id TEXT NOT NULL,
+                alias_codigo TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (proveedor_id, alias_codigo)
             )
         ''')
         

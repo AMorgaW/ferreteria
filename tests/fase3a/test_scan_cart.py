@@ -173,6 +173,35 @@ class PosScanCartTest(unittest.TestCase):
             self.assertTrue(converted.ok, converted.error)
             self.assertEqual(cart2.lines[0]["cantidad"], Decimal("12"))
 
+    def test_16c_saco_full_package_uses_canonical_factor(self):
+        from packaging_conversion import get_base_units_per_package
+
+        with phase3a_env() as env:
+            pid, _lid, _p = seed_pos_product(
+                env,
+                name="Cemento",
+                barcode="SACO-50",
+                package_role=PACKAGE_ROLE_FULL_PACKAGE,
+                unidades_por_caja=50,
+                vende_por_empaque=1,
+            )
+            conn = env.connect()
+            try:
+                conn.execute(
+                    "UPDATE productos SET presentacion=?, unidad_medida=? WHERE id=?",
+                    ("SACO", "KG", pid),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            product = ProductosRepository(env.db).obtener_por_id(pid)
+            self.assertEqual(get_base_units_per_package(product), Decimal("50"))
+            cart = PosCart()
+            result = cart.add_scan(ProductosRepository(env.db), "SACO-50")
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(cart.lines[0]["cantidad"], Decimal("50"))
+            self.assertEqual(cart.lines[0]["producto"]["id"], pid)
+
     def test_16b_custom_presentation_without_contract_is_blocked(self):
         with phase3a_env() as env:
             seed_pos_product(

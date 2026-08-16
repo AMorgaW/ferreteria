@@ -18,6 +18,7 @@ from barcode_schema import (
 )
 from inventory_import_schema import ensure_inventory_import_schema
 from inventory_apply_schema import ensure_inventory_apply_schema
+from purchase_schema import ensure_sqlite_purchase_receiving_schema
 
 
 class MigrationError(RuntimeError):
@@ -266,6 +267,17 @@ DEFAULT_MIGRATIONS = (
             "no stock derivation;no half-package barcode;no FRP generation"
         ),
         apply=ensure_sqlite_barcode_package_role,
+    ),
+    Migration(
+        version="20260816_007",
+        name="purchase_receiving_draft_and_supplier_aliases",
+        signature=(
+            "compras.inventory_command_id;detalle_compras.package_role,"
+            "cantidad_presentacion,supplier_alias;"
+            "supplier_product_aliases(local_id PK,proveedor_id,producto_local_id,"
+            "alias_codigo UNIQUE per supplier);not product_barcodes"
+        ),
+        apply=ensure_sqlite_purchase_receiving_schema,
     ),
 )
 

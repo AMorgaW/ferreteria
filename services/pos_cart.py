@@ -2,12 +2,20 @@
 """Carrito POS local-first. El scan no vende; el commit usa el writer existente."""
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 from barcode_scanner import BarcodeScanError, normalize_barcode
+from packaging_conversion import (
+    PACKAGING_BLOCKED,
+    PackagingConversionBlocked,
+    PackagingError,
+    as_decimal,
+    quantity_in_base_units as _quantity_in_base_units,
+    sqlite_number,
+    validate_quantity as _validate_quantity,
+)
 from repositories.product_barcodes_repo import (
     PACKAGE_ROLE_BASE_UNIT,
     PACKAGE_ROLE_CUSTOM_PRESENTATION,
@@ -15,130 +23,28 @@ from repositories.product_barcodes_repo import (
     PACKAGE_ROLES,
 )
 
-PACKAGING_BLOCKED = "BLOCKED_BY_PACKAGING_CONVERSION_CONTRACT"
 OFFLINE_FINALIZE_BLOCKED = (
     "FINALIZAR bloqueado: se requiere autoridad central de inventario. "
     "El carrito puede prepararse en local; no hay stock autoritativo offline."
 )
 
 
-class PackagingConversionBlocked(ValueError):
-    def __init__(self, package_role: str, detail: str = "") -> None:
-        self.package_role = package_role
-        message = PACKAGING_BLOCKED if not detail else f"{PACKAGING_BLOCKED}: {detail}"
-        super().__init__(message)
-
-
 class PosCartError(ValueError):
     pass
 
 
-def as_decimal(value: Any) -> Decimal:
-    if isinstance(value, Decimal):
-        return value
-    if value is None:
-        return Decimal("0")
-    return Decimal(str(value))
-
-
-def sqlite_number(value: Any):
-    """Decimal exacto en memoria; SQLite recibe int o str, nunca float crítico."""
-    number = as_decimal(value)
-    if number == number.to_integral_value():
-        return int(number)
-    return format(number, "f")
-
-
-def _truthy(value: Any) -> bool:
-    if value in (None, "", 0, "0", False):
-        return False
-    if isinstance(value, str) and value.strip().upper() in ("NO", "FALSE", "N"):
-        return False
-    return bool(value)
-
-
-def canonical_full_package_factor(product: Mapping[str, Any]) -> Optional[Decimal]:
-    """Usa solo metadata canónica del producto. Sin heurística de categoría."""
-    raw = product.get("unidades_por_caja")
-    if raw in (None, "", 0, "0"):
-        return None
+def quantity_in_base_units(product, package_role, quantity):
     try:
-        factor = as_decimal(raw)
-    except (InvalidOperation, ValueError):
-        return None
-    if factor <= 1:
-        return None
-    if not (
-        _truthy(product.get("viene_en_caja"))
-        or _truthy(product.get("vende_por_empaque"))
-        or _truthy(product.get("vende_empaque_completo"))
-    ):
-        return None
-    return factor
+        return _quantity_in_base_units(product, package_role, quantity)
+    except PackagingError as exc:
+        raise PosCartError(str(exc)) from exc
 
 
-def canonical_custom_factor(product: Mapping[str, Any]) -> Optional[Decimal]:
-    """Una sola presentación custom inequívoca. Si hay 0 o >1, no inventa."""
-    raw = product.get("unidades_venta_custom")
-    if not raw:
-        return None
+def validate_quantity(product, quantity):
     try:
-        data = json.loads(raw) if isinstance(raw, str) else raw
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, list):
-        return None
-    extras: List[Decimal] = []
-    for item in data:
-        if not isinstance(item, Mapping):
-            continue
-        try:
-            factor = as_decimal(item.get("factor", 1))
-        except (InvalidOperation, ValueError):
-            return None
-        if factor > 1:
-            extras.append(factor)
-    if len(extras) != 1:
-        return None
-    return extras[0]
-
-
-def quantity_in_base_units(
-    product: Mapping[str, Any],
-    package_role: Optional[str],
-    quantity: Any,
-) -> Decimal:
-    qty = as_decimal(quantity)
-    if qty <= 0:
-        raise PosCartError("La cantidad de cada producto debe ser mayor a 0")
-    role = str(package_role or PACKAGE_ROLE_BASE_UNIT).strip() or PACKAGE_ROLE_BASE_UNIT
-    if role not in PACKAGE_ROLES:
-        raise PackagingConversionBlocked(role, "package_role desconocido")
-    if role == PACKAGE_ROLE_BASE_UNIT:
-        return qty
-    if role == PACKAGE_ROLE_FULL_PACKAGE:
-        factor = canonical_full_package_factor(product)
-        if factor is None:
-            raise PackagingConversionBlocked(
-                role, "FULL_PACKAGE sin unidades_por_caja canónica"
-            )
-        return qty * factor
-    factor = canonical_custom_factor(product)
-    if factor is None:
-        raise PackagingConversionBlocked(
-            role, "CUSTOM_PRESENTATION sin factor canónico inequívoco"
-        )
-    return qty * factor
-
-
-def validate_quantity(product: Mapping[str, Any], quantity: Any) -> Decimal:
-    qty = as_decimal(quantity)
-    if qty <= 0:
-        raise PosCartError("La cantidad de cada producto debe ser mayor a 0")
-    permite = _truthy(product.get("permite_decimales"))
-    if not permite and qty != qty.to_integral_value():
-        raise PosCartError("Este producto no permite cantidades decimales")
-    return qty
+        return _validate_quantity(product, quantity)
+    except PackagingError as exc:
+        raise PosCartError(str(exc)) from exc
 
 
 def validate_price(price: Any) -> Decimal:

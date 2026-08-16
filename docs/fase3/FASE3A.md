@@ -12,7 +12,7 @@ Scanner HID → `product_barcodes` → carrito local → confirmación humana �
 
 ## Limitación de empaque
 
-`FULL_PACKAGE` / `CUSTOM_PRESENTATION` solo descuentan si existe metadata canónica inequívoca (`unidades_por_caja` + flag de caja/empaque, o un único factor custom). Si falta: `BLOCKED_BY_PACKAGING_CONVERSION_CONTRACT`. `BASE_UNIT` no se bloquea.
+`FULL_PACKAGE` / `CUSTOM_PRESENTATION` solo descuentan si existe metadata canónica inequívoca (`get_base_units_per_package` / factor custom único). El nombre del empaque (CAJA, SACO, ROLLO, …) no cambia la fórmula. Si falta: `BLOCKED_BY_PACKAGING_CONVERSION_CONTRACT`. `BASE_UNIT` no se bloquea.
 
 ## Datos
 
