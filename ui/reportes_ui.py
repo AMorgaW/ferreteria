@@ -1849,7 +1849,11 @@ class VentanaRentabilidadDashboard(QDialog):
         self.body.addWidget(cards_widget)
 
         # Period label
-        lbl_periodo = QLabel(f"Periodo: {inicio}  a  {fin}")
+        costo_label = d.get("cost_basis") or d.get("profitability_contract") or ""
+        periodo_txt = f"Periodo: {inicio}  a  {fin}"
+        if costo_label:
+            periodo_txt += f"  ·  costo {costo_label}"
+        lbl_periodo = QLabel(periodo_txt)
         lbl_periodo.setFont(QFont('Segoe UI', 8))
         lbl_periodo.setAlignment(Qt.AlignCenter)
         lbl_periodo.setStyleSheet(f"color: {self.TEXTO_LIGHT};")
@@ -3780,18 +3784,7 @@ class VentanaDetalleVenta(QDialog):
             venta_id = self.venta.get('id')
             if not venta_id:
                 return
-            conn = self.reportes_service.db.conectar()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT p.nombre, dv.cantidad, dv.precio_unitario,
-                       dv.descuento, dv.subtotal
-                FROM detalle_ventas dv
-                JOIN productos p ON dv.producto_id = p.id
-                WHERE dv.venta_id = ?
-                ORDER BY dv.id
-            """, (venta_id,))
-            rows = cursor.fetchall()
-            conn.close()
+            rows = self.reportes_service.detalle_venta_lineas(venta_id)
 
             self.table.setRowCount(len(rows))
             for idx, row in enumerate(rows):
@@ -3964,61 +3957,19 @@ class VentanaReporteDia(QDialog):
         self._limpiar_contenido()
         fecha = self.fecha_edit.date().toString("yyyy-MM-dd")
         try:
-            conn = self.reportes_service.db.conectar()
-            cursor = conn.cursor()
-
-            # ── Ventas por método de pago (excluyendo crédito para "dinero real") ──
-            cursor.execute("""
-                SELECT
-                    COUNT(*)                                                           AS num_ventas,
-                    COALESCE(SUM(CASE WHEN metodo_pago='EFECTIVO' THEN total ELSE 0 END), 0) AS efectivo,
-                    COALESCE(SUM(CASE WHEN metodo_pago IN ('TARJETA_DEBITO','TARJETA_CREDITO')
-                                      THEN total ELSE 0 END), 0)                    AS tarjeta,
-                    COALESCE(SUM(CASE WHEN metodo_pago='TRANSFERENCIA' THEN total ELSE 0 END), 0) AS transferencia,
-                    COALESCE(SUM(CASE WHEN metodo_pago NOT IN (
-                        'EFECTIVO','TARJETA_DEBITO','TARJETA_CREDITO','TRANSFERENCIA','CREDITO')
-                                      THEN total ELSE 0 END), 0)                    AS otros,
-                    COALESCE(SUM(CASE WHEN metodo_pago='CREDITO' THEN total ELSE 0 END), 0) AS credito_nuevo
-                FROM ventas
-                WHERE DATE(datetime(fecha, 'localtime')) = ? AND estado = 'COMPLETADA'
-            """, (fecha,))
-            ventas = dict(cursor.fetchone())
-
-            # Abonos cobrados ese día (pagos de créditos de cualquier fecha)
-            cursor.execute("""
-                SELECT COALESCE(SUM(monto_abono), 0) AS total
-                FROM abonos_ventas
-                WHERE DATE(fecha_abono) = ?
-            """, (fecha,))
-            abonos_total = cursor.fetchone()[0]
-
-            # ── Egresos ───────────────────────────────────────────────────
-            cursor.execute("""
-                SELECT COALESCE(SUM(monto), 0) AS total_egresos
-                FROM egresos_caja
-                WHERE DATE(fecha_egreso) = ?
-            """, (fecha,))
-            total_egresos = cursor.fetchone()[0]
-
-            # Egresos por categoría con descripción
-            cursor.execute("""
-                SELECT categoria, descripcion, metodo_pago, monto
-                FROM egresos_caja
-                WHERE DATE(fecha_egreso) = ?
-                ORDER BY categoria, monto DESC
-            """, (fecha,))
-            egresos_rows = [dict(r) for r in cursor.fetchall()]
-
-            # Egresos agrupados por categoría (totales)
-            cursor.execute("""
-                SELECT categoria, COALESCE(SUM(monto), 0) AS total
-                FROM egresos_caja
-                WHERE DATE(fecha_egreso) = ?
-                GROUP BY categoria ORDER BY total DESC
-            """, (fecha,))
-            egresos_cat = [dict(r) for r in cursor.fetchall()]
-
-            conn.close()
+            datos = self.reportes_service.reporte_dia(fecha)
+            ventas = {
+                "num_ventas": datos.get("num_ventas") or 0,
+                "efectivo": datos.get("efectivo") or 0,
+                "tarjeta": datos.get("tarjeta") or 0,
+                "transferencia": datos.get("transferencia") or 0,
+                "otros": datos.get("otros") or 0,
+                "credito_nuevo": datos.get("credito_nuevo") or 0,
+            }
+            abonos_total = datos.get("abonos_total") or 0
+            total_egresos = datos.get("total_egresos") or 0
+            egresos_rows = datos.get("egresos_rows") or []
+            egresos_cat = datos.get("egresos_cat") or []
         except Exception as e:
             self._limpiar_contenido()
             lbl = QLabel(f"Error cargando datos: {e}")

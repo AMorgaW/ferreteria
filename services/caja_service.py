@@ -629,58 +629,83 @@ def compute_session_summary(conn, session: dict) -> dict:
     ).fetchall()
     summary = dict(empty)
     for raw in rows:
-        row = _row_dict(raw)
-        amount = money(row.get("amount") or 0)
-        method = normalize_payment_method(row.get("payment_method"))
-        effect = row.get("cash_effect_kind")
-        kind = row.get("kind")
-        direction = row.get("direction")
-        summary["cantidad_operaciones"] += 1
-        if effect == EFFECT_DRAWER_IN:
-            summary["cash_in"] += amount
-        elif effect == EFFECT_DRAWER_OUT:
-            summary["cash_out"] += amount
-        else:
-            summary["total_no_efectivo"] += amount
-        if kind == KIND_SALE:
-            summary["cantidad_ventas"] += 1
-            summary["total"] += amount
-            if method == METHOD_CASH:
-                summary["efectivo"] += amount
-            elif method in (METHOD_CARD_DEBIT, METHOD_CARD_CREDIT):
-                summary["tarjeta"] += amount
-            elif method == METHOD_TRANSFER:
-                summary["transferencia"] += amount
-            elif method == METHOD_CREDIT:
-                summary["credito"] += amount
-            else:
-                summary["otros"] += amount
-        elif kind == KIND_CUSTOMER_PAYMENT:
-            summary["abonos_cliente"] += amount
-            summary["total"] += amount
-            if method == METHOD_CASH:
-                summary["efectivo"] += amount
-            elif method in (METHOD_CARD_DEBIT, METHOD_CARD_CREDIT):
-                summary["tarjeta"] += amount
-            elif method == METHOD_TRANSFER:
-                summary["transferencia"] += amount
-            else:
-                summary["otros"] += amount
-        elif kind == KIND_SUPPLIER_PAYMENT:
-            summary["pagos_proveedor"] += amount
-            _add_egreso(summary, method, amount)
-        elif kind == KIND_EXPENSE:
-            _add_egreso(summary, method, amount)
-        elif kind == KIND_REFUND:
-            summary["devoluciones"] += amount
-            if method == METHOD_CASH:
-                summary["egresos_efectivo"] += amount
-                summary["egresos_total"] += amount
-            elif direction == DIRECTION_OUT:
-                _add_egreso(summary, method, amount)
-        elif kind == KIND_REINFORCEMENT and method == METHOD_CASH:
-            summary["efectivo"] += amount
+        _apply_cash_movement(summary, _row_dict(raw))
     summary["esperado"] = opening + summary["cash_in"] - summary["cash_out"]
+    return summary
+
+
+def _apply_cash_movement(summary: dict, row: dict) -> None:
+    amount = money(row.get("amount") or 0)
+    method = normalize_payment_method(row.get("payment_method"))
+    effect = row.get("cash_effect_kind")
+    kind = row.get("kind")
+    direction = row.get("direction")
+    summary["cantidad_operaciones"] += 1
+    if effect == EFFECT_DRAWER_IN:
+        summary["cash_in"] += amount
+    elif effect == EFFECT_DRAWER_OUT:
+        summary["cash_out"] += amount
+    else:
+        summary["total_no_efectivo"] += amount
+    if kind == KIND_SALE:
+        summary["cantidad_ventas"] += 1
+        summary["total"] += amount
+        if method == METHOD_CASH:
+            summary["efectivo"] += amount
+        elif method in (METHOD_CARD_DEBIT, METHOD_CARD_CREDIT):
+            summary["tarjeta"] += amount
+        elif method == METHOD_TRANSFER:
+            summary["transferencia"] += amount
+        elif method == METHOD_CREDIT:
+            summary["credito"] += amount
+        else:
+            summary["otros"] += amount
+    elif kind == KIND_CUSTOMER_PAYMENT:
+        summary["abonos_cliente"] += amount
+        summary["total"] += amount
+        if method == METHOD_CASH:
+            summary["efectivo"] += amount
+        elif method in (METHOD_CARD_DEBIT, METHOD_CARD_CREDIT):
+            summary["tarjeta"] += amount
+        elif method == METHOD_TRANSFER:
+            summary["transferencia"] += amount
+        else:
+            summary["otros"] += amount
+    elif kind == KIND_SUPPLIER_PAYMENT:
+        summary["pagos_proveedor"] += amount
+        _add_egreso(summary, method, amount)
+    elif kind == KIND_EXPENSE:
+        _add_egreso(summary, method, amount)
+    elif kind == KIND_REFUND:
+        summary["devoluciones"] += amount
+        if method == METHOD_CASH:
+            summary["egresos_efectivo"] += amount
+            summary["egresos_total"] += amount
+        elif direction == DIRECTION_OUT:
+            _add_egreso(summary, method, amount)
+    elif kind == KIND_REINFORCEMENT and method == METHOD_CASH:
+        summary["efectivo"] += amount
+
+
+def compute_period_cash_summary(conn, fecha_inicio: str, fecha_fin: str) -> dict:
+    """Agrega cash_movements del período. No recalcula ventas - egresos."""
+    summary = _empty_summary()
+    summary["fecha_inicio"] = fecha_inicio
+    summary["fecha_fin"] = fecha_fin
+    if not _table_exists(conn, "cash_movements"):
+        return summary
+    rows = conn.execute(
+        """
+        SELECT * FROM cash_movements
+         WHERE DATE(datetime(created_at, 'localtime')) >= DATE(?)
+           AND DATE(datetime(created_at, 'localtime')) <= DATE(?)
+         ORDER BY id
+        """,
+        (fecha_inicio, fecha_fin),
+    ).fetchall()
+    for raw in rows:
+        _apply_cash_movement(summary, _row_dict(raw))
+    summary["esperado"] = summary["cash_in"] - summary["cash_out"]
     return summary
 
 
@@ -1093,5 +1118,12 @@ class CajaService:
                 (self._usuario().id, self._station()),
             ).fetchone()
             return _row_dict(row) if row else None
+        finally:
+            conn.close()
+
+    def obtener_resumen_periodo(self, fecha_inicio: str, fecha_fin: str) -> dict:
+        conn = self.db.conectar()
+        try:
+            return compute_period_cash_summary(conn, fecha_inicio, fecha_fin)
         finally:
             conn.close()

@@ -160,6 +160,25 @@ def quantity_to_scaled(value: QuantityInput) -> int:
     return as_int
 
 
+def scaled_to_decimal(quantity_scaled: int) -> Decimal:
+    """Convierte BIGINT escala 1000 a Decimal comercial. No usa float.
+
+    1000 → Decimal('1'). No vuelve a multiplicar por SCALE.
+    """
+    if isinstance(quantity_scaled, bool) or not isinstance(quantity_scaled, int):
+        try:
+            quantity_scaled = int(quantity_scaled)
+        except (TypeError, ValueError) as exc:
+            raise QuantityScaleError(
+                f"quantity_scaled no entero: {quantity_scaled!r}"
+            ) from exc
+    if quantity_scaled < SCALED_BIGINT_MIN or quantity_scaled > SCALED_BIGINT_MAX:
+        raise QuantityScaleError(
+            f"quantity_scaled desborda BIGINT: {quantity_scaled!r}"
+        )
+    return Decimal(quantity_scaled) / Decimal(QUANTITY_SCALE)
+
+
 def _canonical_json(payload: Mapping[str, Any]) -> str:
     return json.dumps(
         payload,

@@ -141,106 +141,11 @@ class AlertasService:
             print(f"Error eliminando alerta: {e}")
             return False
     
-    def verificar_stock_bajo(self) -> int:
-        """Verifica productos con stock bajo y crea alertas"""
-        
-        productos = self.productos_repo.listar_productos()
-        alertas_creadas = 0
-        
-        for producto in productos:
-            if not producto.activo:
-                continue
-            
-            if producto.stock <= producto.stock_minimo:
-                # Verificar si ya existe una alerta NO LEÍDA para este producto
-                # Esto evita crear duplicados mientras la alerta esté pendiente
-                conn = self.db.conectar()
-                cursor = conn.cursor()
-                
-                cursor.execute('''
-                    SELECT COUNT(*) as count FROM alertas
-                    WHERE tipo = 'STOCK_BAJO'
-                    AND relacionado_id = ?
-                    AND relacionado_tipo = 'PRODUCTO'
-                    AND leida = 0
-                ''', (producto.id,))
-                
-                existe = cursor.fetchone()['count'] > 0
-                conn.close()
-                
-                if not existe:
-                    prioridad = 'CRITICA' if producto.stock == 0 else 'ALTA'
-                    
-                    titulo = "Stock Crítico" if producto.stock == 0 else "Stock Bajo - Reorden Recomendado"
-                    mensaje = f"El producto '{producto.nombre}' tiene stock {producto.stock} (mínimo: {producto.stock_minimo})"
-                    
-                    # Incluir proveedor si está disponible
-                    if producto.proveedor_id:
-                        try:
-                            proveedor = self.db.conectar().cursor().execute(
-                                "SELECT nombre FROM proveedores WHERE id = ?",
-                                (producto.proveedor_id,)
-                            ).fetchone()
-                            if proveedor:
-                                mensaje += f"\nProveedor recomendado: {proveedor['nombre']}"
-                        except Exception:
-                            pass
-                    
-                    if self.crear_alerta('STOCK_BAJO', titulo, mensaje, prioridad,
-                                       producto.id, 'PRODUCTO'):
-                        alertas_creadas += 1
-        
-        return alertas_creadas
-    
     def obtener_productos_stock_critico(self) -> List[Dict]:
-        """Obtiene lista de productos con stock crítico para reorden"""
-        
-        productos = self.productos_repo.listar_productos()
-        productos_criticos = []
-        
-        for producto in productos:
-            # Trabajar con diccionarios (listar_productos devuelve List[dict])
-            if not producto.get('activo', 1):
-                continue
-            
-            stock_actual = producto.get('stock', 0)
-            stock_minimo = producto.get('stock_minimo', 10)
-            
-            if stock_actual <= stock_minimo:
-                producto_dict = {
-                    'id': producto['id'],
-                    'nombre': producto['nombre'],
-                    'categoria': producto.get('categoria', '-'),
-                    'stock_actual': stock_actual,
-                    'stock_minimo': stock_minimo,
-                    'diferencia': stock_minimo - stock_actual,
-                    'proveedor_id': producto.get('proveedor_id'),
-                    'proveedor_nombre': None
-                }
-                
-                # Obtener nombre del proveedor si existe
-                proveedor_id = producto_dict['proveedor_id']
-                if proveedor_id:
-                    try:
-                        conn = self.db.conectar()
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "SELECT nombre FROM proveedores WHERE id = ?",
-                            (proveedor_id,)
-                        )
-                        proveedor = cursor.fetchone()
-                        conn.close()
-                        if proveedor:
-                            producto_dict['proveedor_nombre'] = proveedor['nombre']
-                    except Exception:
-                        pass
-                
-                productos_criticos.append(producto_dict)
-        
-        # Ordenar por diferencia (mayor urgencia primero)
-        productos_criticos.sort(key=lambda x: x['diferencia'], reverse=True)
-        
-        return productos_criticos
+        """Lista de stock crítico. Misma fuente que dashboard y reporte inventario."""
+        from services.reportes_service import ReportesService
+
+        return ReportesService(self.db).productos_stock_critico()
     
     def verificar_cuentas_vencidas(self) -> int:
         """Verifica cuentas por cobrar vencidas"""
@@ -328,42 +233,47 @@ class AlertasService:
         return alertas_creadas
     
     def verificar_stock_bajo(self) -> int:
-        """Verifica productos con stock bajo en una sola consulta."""
-        conn = self.db.conectar()
-        cursor = conn.cursor()
+        """Crea alertas desde la misma cantidad canónica usada por reporting."""
+        alertas_creadas = 0
+        for producto in self.obtener_productos_stock_critico():
+            conn = self.db.conectar()
+            try:
+                existe = conn.execute(
+                    """
+                    SELECT 1 FROM alertas
+                     WHERE tipo = 'STOCK_BAJO'
+                       AND relacionado_id = ?
+                       AND relacionado_tipo = 'PRODUCTO'
+                       AND leida = 0
+                     LIMIT 1
+                    """,
+                    (producto["id"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            if existe:
+                continue
 
-        try:
-            cursor.execute("""
-                INSERT INTO alertas (tipo, titulo, mensaje, prioridad, relacionado_id, relacionado_tipo)
-                SELECT
-                    'STOCK_BAJO',
-                    CASE WHEN p.stock = 0 THEN 'Stock Critico' ELSE 'Stock Bajo - Reorden Recomendado' END,
-                    'El producto ''' || p.nombre || ''' tiene stock ' || p.stock || ' (minimo: ' || p.stock_minimo || ')' ||
-                        COALESCE(E'\nProveedor recomendado: ' || pr.nombre, ''),
-                    CASE WHEN p.stock = 0 THEN 'CRITICA' ELSE 'ALTA' END,
-                    p.id,
-                    'PRODUCTO'
-                FROM productos p
-                LEFT JOIN proveedores pr ON pr.id = p.proveedor_id
-                WHERE p.activo = 1
-                  AND p.stock <= p.stock_minimo
-                  AND NOT EXISTS (
-                    SELECT 1 FROM alertas a
-                    WHERE a.tipo = 'STOCK_BAJO'
-                      AND a.relacionado_id = p.id
-                      AND a.relacionado_tipo = 'PRODUCTO'
-                      AND a.leida = 0
-                  )
-            """)
-            count = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
-            conn.commit()
-            conn.close()
-            return count
-        except Exception as e:
-            conn.rollback()
-            conn.close()
-            print(f"Error verificando stock bajo: {e}")
-            return 0
+            cantidad = producto["stock_actual"]
+            minimo = producto["stock_minimo"]
+            agotado = cantidad <= 0
+            titulo = "Stock Crítico" if agotado else "Stock Bajo - Reorden Recomendado"
+            mensaje = (
+                f"El producto '{producto['nombre']}' tiene stock {cantidad} "
+                f"(mínimo: {minimo})"
+            )
+            if producto.get("proveedor_nombre"):
+                mensaje += f"\nProveedor recomendado: {producto['proveedor_nombre']}"
+            if self.crear_alerta(
+                "STOCK_BAJO",
+                titulo,
+                mensaje,
+                "CRITICA" if agotado else "ALTA",
+                producto["id"],
+                "PRODUCTO",
+            ):
+                alertas_creadas += 1
+        return alertas_creadas
 
     def verificar_cuentas_vencidas(self) -> int:
         """Verifica cuentas por cobrar vencidas en una sola consulta."""
