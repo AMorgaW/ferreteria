@@ -220,6 +220,35 @@ class ReturnsService:
         finally:
             conn.close()
 
+    def _attach_reversal_cash(self, conn, reversal_id, refund_method=None):
+        from services.caja_service import (
+            _reversal_refund_amount,
+            attach_reversal_cash_effect,
+        )
+
+        doc, _lines = self._load_reversal(conn, reversal_id)
+        if not doc:
+            return
+        method = refund_method
+        if not method and doc.get("original_tipo") == ORIGINAL_TIPO_VENTA:
+            venta = conn.execute(
+                "SELECT metodo_pago FROM ventas WHERE id = ?",
+                (doc.get("original_id"),),
+            ).fetchone()
+            if venta:
+                method = venta["metodo_pago"]
+        cash_ok, cash_message, _cash_id = attach_reversal_cash_effect(
+            conn,
+            reversal_id=reversal_id,
+            kind=doc.get("kind"),
+            refund_method=method or "EFECTIVO",
+            amount=_reversal_refund_amount(conn, reversal_id),
+            usuario=doc.get("usuario_id") or self._usuario_id(),
+            station_id=getattr(self, "cash_station_id", None),
+        )
+        if not cash_ok:
+            raise RuntimeError(cash_message)
+
     def confirmar(
         self,
         reversal_id: int,
@@ -229,6 +258,7 @@ class ReturnsService:
         inventory_gateway=None,
         inventory_transport=None,
         inventory_connection_factory=None,
+        refund_method: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[int]]:
         from inventory_writer_support import (
             WRITER_MODE_AUTHORITATIVE,
@@ -249,10 +279,13 @@ class ReturnsService:
                 inventory_gateway=inventory_gateway,
                 inventory_transport=inventory_transport,
                 inventory_connection_factory=inventory_connection_factory,
+                refund_method=refund_method,
             )
-        return self._confirmar_legacy(reversal_id)
+        return self._confirmar_legacy(reversal_id, refund_method=refund_method)
 
-    def _confirmar_legacy(self, reversal_id: int) -> Tuple[bool, str, Optional[int]]:
+    def _confirmar_legacy(
+        self, reversal_id: int, refund_method: Optional[str] = None
+    ) -> Tuple[bool, str, Optional[int]]:
         from database import obtener_fecha_actual
         from inventory_cutover import commit_legacy_inventory
 
@@ -264,6 +297,11 @@ class ReturnsService:
                 return False, "Reverso no encontrado", None
             estado = str(doc.get("estado") or "").upper()
             if estado == ESTADO_COMPLETED:
+                self._attach_reversal_cash(conn, reversal_id, refund_method)
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
                 return True, "Reverso ya confirmado", reversal_id
             if estado not in (ESTADO_DRAFT, ESTADO_APPLYING, ESTADO_REJECTED):
                 return False, COMPLETED_IMMUTABLE, None
@@ -279,6 +317,7 @@ class ReturnsService:
                     reversal_id,
                 ),
             )
+            self._attach_reversal_cash(conn, reversal_id, refund_method)
             commit_legacy_inventory(conn)
             conn.commit()
             return True, "Reverso confirmado", reversal_id
@@ -299,6 +338,7 @@ class ReturnsService:
         inventory_gateway,
         inventory_transport,
         inventory_connection_factory,
+        refund_method: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[int]]:
         from database import obtener_fecha_actual
         from inventory_cutover import (
@@ -347,6 +387,11 @@ class ReturnsService:
             estado = str(doc.get("estado") or "").upper()
             if estado == ESTADO_COMPLETED:
                 self.last_inventory_command_id = doc.get("inventory_command_id")
+                self._attach_reversal_cash(conn, reversal_id, refund_method)
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
                 return True, "Reverso ya confirmado", reversal_id
             if estado not in (ESTADO_DRAFT, ESTADO_APPLYING, ESTADO_REJECTED):
                 return False, COMPLETED_IMMUTABLE, None
@@ -486,6 +531,7 @@ class ReturnsService:
                     ESTADO_COMPLETED,
                 ),
             )
+            self._attach_reversal_cash(conn, reversal_id, refund_method)
             conn.commit()
             return True, "Reverso confirmado", reversal_id
         except Exception as exc:

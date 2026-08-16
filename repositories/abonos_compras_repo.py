@@ -150,6 +150,19 @@ def registrar_abono_compra_en_transaccion(conn, cursor, abono: Abono) -> int:
         abono.fecha_abono
     )
 
+    from services.caja_service import attach_supplier_payment_cash_effect
+
+    cash_ok, cash_message, _cash_id = attach_supplier_payment_cash_effect(
+        conn,
+        abono_id=abono_id,
+        tipo_pago=abono.tipo_pago,
+        monto=abono.monto_abono,
+        usuario=abono.usuario,
+        descripcion=f"Pago proveedor compra #{abono.id_compra} abono #{abono_id}",
+    )
+    if not cash_ok:
+        raise RuntimeError(cash_message)
+
     _actualizar_estado_compra_en_cursor(cursor, abono.id_compra)
 
     from repositories._outbox import encolar

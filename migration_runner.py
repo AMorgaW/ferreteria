@@ -19,6 +19,7 @@ from barcode_schema import (
 from inventory_import_schema import ensure_inventory_import_schema
 from inventory_apply_schema import ensure_inventory_apply_schema
 from purchase_schema import ensure_sqlite_purchase_receiving_schema
+from cash_schema import ensure_sqlite_cash_operational_schema
 from returns_schema import ensure_sqlite_returns_reversals_schema
 
 
@@ -291,6 +292,19 @@ DEFAULT_MIGRATIONS = (
             "never mutates completed ventas/compras"
         ),
         apply=ensure_sqlite_returns_reversals_schema,
+    ),
+    Migration(
+        version="20260816_009",
+        name="cash_session_ledger",
+        signature=(
+            "cierres_caja.local_id,station_id,estado,usuario_cierre_id;"
+            "unique one OPEN session per station_id;"
+            "cash_movements(local_id UNIQUE,cash_session_id nullable pending OPEN,station_id,kind,"
+            "cash_effect_kind,direction,amount TEXT,payment_method,"
+            "source_kind+source_identity+cash_effect_kind UNIQUE);"
+            "local-first operational cash ledger;no double-entry"
+        ),
+        apply=ensure_sqlite_cash_operational_schema,
     ),
 )
 

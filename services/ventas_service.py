@@ -324,7 +324,18 @@ class VentasService:
                              cliente_payload, "clientes")
 
             from inventory_cutover import commit_legacy_inventory
+            from services.caja_service import attach_sale_cash_effect
 
+            cash_ok, cash_message, _cash_id = attach_sale_cash_effect(
+                conn,
+                venta_id=venta_id,
+                metodo_pago=metodo_pago,
+                total=total,
+                usuario=usuario_id,
+                station_id=getattr(self, "cash_station_id", None),
+            )
+            if not cash_ok:
+                raise RuntimeError(cash_message)
             commit_legacy_inventory(
                 conn, connection_factory=inventory_connection_factory
             )
@@ -635,6 +646,18 @@ class VentasService:
                 enqueue_sync(conn, "customer", cliente_id, "update",
                              cliente_payload, "clientes")
 
+            from services.caja_service import attach_sale_cash_effect
+
+            cash_ok, cash_message, _cash_id = attach_sale_cash_effect(
+                conn,
+                venta_id=venta_id,
+                metodo_pago=metodo_pago,
+                total=total,
+                usuario=usuario_id,
+                station_id=getattr(self, "cash_station_id", None),
+            )
+            if not cash_ok:
+                raise RuntimeError(cash_message)
             conn.commit()
             _finish_open_act(conn)
             conn.close()

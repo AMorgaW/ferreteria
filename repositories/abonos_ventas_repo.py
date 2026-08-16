@@ -57,6 +57,18 @@ class AbonosVentasRepository:
             encolar(conn, "sale_payment", abono_id, "create", "abonos_ventas")
             encolar(conn, "sale", abono.id_venta, "update", "ventas")
 
+            from services.caja_service import attach_customer_payment_cash_effect
+
+            cash_ok, cash_message, _cash_id = attach_customer_payment_cash_effect(
+                conn,
+                abono_id=abono_id,
+                tipo_pago=abono.tipo_pago,
+                monto=abono.monto_abono,
+                usuario=abono.usuario,
+            )
+            if not cash_ok:
+                raise RuntimeError(cash_message)
+
             conn.commit()
             return abono_id
             

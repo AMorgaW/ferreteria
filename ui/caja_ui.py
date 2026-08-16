@@ -12,6 +12,8 @@ from PySide6.QtCore import Qt, Signal, QTimer, QTime
 from PySide6.QtGui import QFont, QColor
 
 from datetime import datetime
+from decimal import Decimal
+from services.caja_service import money
 from ui_config import COLORS, FONTS, ICONS, make_font
 
 
@@ -28,12 +30,6 @@ class CajaUI(QWidget):
 
         self.crear_interfaz()
         self.verificar_estado_caja()
-
-        # Timer que verifica cada minuto si hay que cerrar la caja automáticamente a las 11 PM
-        self._timer_auto_cierre = QTimer(self)
-        self._timer_auto_cierre.setInterval(60_000)  # cada 60 segundos
-        self._timer_auto_cierre.timeout.connect(self._verificar_cierre_automatico)
-        self._timer_auto_cierre.start()
 
     def crear_interfaz(self):
         """Crea la interfaz principal"""
@@ -103,6 +99,8 @@ class CajaUI(QWidget):
             f"QPushButton:hover {{ background: {COLORS['danger_dark']}; }}"
         )
         self.btn_cerrar.clicked.connect(self.cerrar_caja)
+        self.btn_cerrar.setAutoDefault(False)
+        self.btn_cerrar.setDefault(False)
 
         self.btn_egreso = QPushButton("\U0001f4b8 Registrar Egreso")
         self.btn_egreso.setFont(make_font(FONTS['body_bold']))
@@ -145,7 +143,7 @@ class CajaUI(QWidget):
 
         # Título + badge de cantidad de ventas
         hdr_row = QHBoxLayout()
-        resumen_title = QLabel("📊 Resumen del Día")
+        resumen_title = QLabel("📊 Resumen de sesión")
         resumen_title.setFont(make_font(FONTS['heading']))
         resumen_title.setStyleSheet("background: transparent; border: none;")
         hdr_row.addWidget(resumen_title)
@@ -280,9 +278,12 @@ class CajaUI(QWidget):
         self.estado_label.setStyleSheet(f"color: {COLORS['success_dark']}; background: transparent; border: none;")
 
         fecha_apertura = datetime.fromisoformat(caja['fecha_apertura']).strftime('%d/%m/%Y %H:%M')
+        resumen = self.caja_service.obtener_resumen_sesion(caja)
+        esperado = resumen.get('esperado', caja.get('monto_inicial') or 0)
         self.info_label.setText(
             f"Abierta el: {fecha_apertura}\n"
-            f"Monto inicial: ${caja['monto_inicial']:,.0f}"
+            f"Monto inicial: ${caja['monto_inicial']:,.0f}\n"
+            f"Efectivo esperado: ${esperado:,.0f}"
         )
 
         self.btn_abrir.setVisible(False)
@@ -349,20 +350,9 @@ class CajaUI(QWidget):
                                callback=self.verificar_estado_caja)
 
     def cerrar_caja(self):
-        """Cierra la caja actual (manual). Tras cerrarla, la reabre con $200.000
-        para el siguiente turno."""
+        """Cierra la caja actual. Requiere acción explícita; no reabre sola."""
         FormularioCierreCaja(self, self.caja_service,
-                             callback=self._despues_de_cierre_manual)
-
-    def _despues_de_cierre_manual(self):
-        """Si el cierre manual se completó (ya no hay caja abierta), reabrir con
-        el fondo estándar de $200.000. Si el usuario canceló, no hace nada."""
-        try:
-            if not self.caja_service.obtener_caja_abierta():
-                self.caja_service.abrir_caja(self.MONTO_INICIAL_DEFAULT)
-        except Exception as e:
-            print(f"[CIERRE-MANUAL] No se pudo reabrir la caja: {e}")
-        self.verificar_estado_caja()
+                             callback=self.verificar_estado_caja)
 
     def registrar_egreso(self):
         """Abre el formulario para registrar un egreso"""
@@ -371,51 +361,10 @@ class CajaUI(QWidget):
             QMessageBox.warning(self, "Advertencia", "Debe abrir una caja primero")
             return
 
-        FormularioEgreso(self, self.auth,
+        FormularioEgreso(self, self.caja_service,
                          callback=self.verificar_estado_caja)
 
     MONTO_INICIAL_DEFAULT = 200_000
-
-    def _verificar_cierre_automatico(self):
-        """Corte de caja automático por si SE OLVIDARON de cerrarla:
-        - Se dispara pasadas las 11:59 p.m. (o si la caja quedó abierta de un
-          día anterior, p. ej. porque el programa estuvo cerrado a esa hora).
-        - Cierra la caja del día GUARDANDO el resumen (ventas por método y
-          egresos, vía cerrar_caja) y la REABRE con $200.000 para el día
-          siguiente. El cierre manual lo sigue haciendo el usuario cuando quiera.
-        """
-        from datetime import datetime
-        caja = self.caja_service.obtener_caja_abierta()
-        if not caja:
-            return
-
-        ahora = datetime.now()
-        fecha_apertura = None
-        try:
-            fecha_apertura = datetime.strptime(
-                str(caja.get('fecha_apertura'))[:19], "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            pass
-
-        # Cerrar si la caja se abrió un día anterior a hoy (quedó sin cerrar),
-        # o si ya son (o pasaron) las 23:59 de hoy.
-        de_dia_anterior = fecha_apertura and fecha_apertura.date() < ahora.date()
-        paso_1159 = ahora.hour == 23 and ahora.minute >= 59
-        if not (de_dia_anterior or paso_1159):
-            return
-
-        try:
-            resumen = self.caja_service.obtener_resumen_cierre()
-            monto_esperado = resumen.get('esperado', 0)
-            exito, _ = self.caja_service.cerrar_caja(
-                monto_esperado,
-                "Cierre automático (olvido de cierre - corte 11:59 PM)")
-            if exito:
-                # Reabrir con el fondo estándar para el día siguiente.
-                self.caja_service.abrir_caja(self.MONTO_INICIAL_DEFAULT)
-                self.verificar_estado_caja()
-        except Exception as e:
-            print(f"[AUTO-CIERRE] Error: {e}")
 
     def ver_historial_pagos(self):
         """Muestra el historial de pagos a proveedores"""
@@ -485,6 +434,8 @@ class FormularioAperturaCaja(QDialog):
             f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
         )
         btn_abrir.clicked.connect(self.abrir)
+        btn_abrir.setAutoDefault(False)
+        btn_abrir.setDefault(False)
         btn_layout.addWidget(btn_abrir)
 
         btn_cancelar = QPushButton("Cancelar")
@@ -519,7 +470,7 @@ class FormularioAperturaCaja(QDialog):
     def abrir(self):
         """Abre la caja - método real"""
         try:
-            monto = float(self.monto_entry.text().replace('.', '').replace(',', '.'))
+            monto = money(self.monto_entry.text().replace('.', '').replace(',', '.'))
         except ValueError:
             QMessageBox.critical(self, "Error", "Ingrese un monto válido")
             return
@@ -749,6 +700,9 @@ class FormularioCierreCaja(QDialog):
             f"QPushButton:hover {{ background: {COLORS['danger_dark']}; }}"
         )
         btn_cerrar.clicked.connect(self.cerrar)
+        btn_cerrar.setAutoDefault(False)
+        btn_cerrar.setDefault(False)
+        self.btn_cerrar_caja = btn_cerrar
         btn_row.addWidget(btn_cerrar, 2)
 
         bl.addLayout(btn_row)
@@ -758,7 +712,7 @@ class FormularioCierreCaja(QDialog):
         """Carga los datos del resumen"""
         resumen = self.caja_service.obtener_resumen_cierre()
 
-        total_efectivo = resumen['monto_inicial'] + resumen['efectivo'] - resumen['egresos_efectivo']
+        total_efectivo = resumen['esperado']
         total_transfer = resumen['transferencia'] - resumen['egresos_transferencia']
         total_tarjeta  = resumen['tarjeta'] - resumen['egresos_tarjeta']
         gran_total     = total_efectivo + total_transfer + total_tarjeta
@@ -808,7 +762,7 @@ class FormularioCierreCaja(QDialog):
             f" color: {color_total(gran_total)}; font-size: 16pt;"
         )
 
-        self.monto_esperado = total_efectivo
+        self.monto_esperado = resumen['esperado']
         self.calcular_diferencia()
 
     def _formatear_monto_cierre(self, text):
@@ -831,16 +785,16 @@ class FormularioCierreCaja(QDialog):
         """Calcula la diferencia entre esperado y real"""
         try:
             raw = self.monto_real_entry.text().replace('.', '').replace(',', '')
-            monto_real = float(raw) if raw.isdigit() else 0.0
+            monto_real = money(raw) if raw.isdigit() else Decimal("0.00")
 
             # No mostrar aviso si el campo está en 0 (no contado aún)
-            if monto_real == 0:
+            if monto_real == Decimal("0.00"):
                 self.diferencia_label.setText("")
                 return
 
             diferencia = monto_real - self.monto_esperado
 
-            if abs(diferencia) < 0.01:
+            if abs(diferencia) < Decimal("0.01"):
                 texto = "✅  Caja cuadrada"
                 color = COLORS['success']
             elif diferencia > 0:
@@ -858,7 +812,9 @@ class FormularioCierreCaja(QDialog):
     def cerrar(self):
         """Cierra la caja"""
         try:
-            monto_real = float(self.monto_real_entry.text().replace('.', '').replace(',', '.'))
+            monto_real = money(
+                self.monto_real_entry.text().replace('.', '').replace(',', '.')
+            )
         except ValueError:
             QMessageBox.critical(self, "Error", "Ingrese un monto válido")
             return
@@ -867,7 +823,7 @@ class FormularioCierreCaja(QDialog):
         diferencia = monto_real - self.monto_esperado
 
         # Determinar tipo de diferencia
-        if abs(diferencia) < 0.01:
+        if abs(diferencia) < Decimal("0.01"):
             tipo_diff = "\u2705 Caja Cuadrada"
             color_msg = ""
         elif diferencia > 0:
@@ -896,6 +852,21 @@ class FormularioCierreCaja(QDialog):
             return
 
         observaciones = ""
+        if abs(diferencia) >= Decimal("0.01"):
+            from PySide6.QtWidgets import QInputDialog
+
+            observaciones, ok_obs = QInputDialog.getText(
+                self,
+                "Observación de diferencia",
+                "La diferencia es evidencia. Indique una observación:",
+            )
+            if not ok_obs or not str(observaciones).strip():
+                QMessageBox.warning(
+                    self, "Observación requerida",
+                    "Si hay faltante o sobrante debe registrar una observación.",
+                )
+                return
+            observaciones = str(observaciones).strip()
 
         exito, mensaje = self.caja_service.cerrar_caja(monto_real, observaciones)
 
@@ -906,6 +877,11 @@ class FormularioCierreCaja(QDialog):
             self.accept()
         else:
             QMessageBox.critical(self, "Error", mensaje)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            return
+        super().keyPressEvent(event)
 
 
 class VentanaHistorialPagos(QDialog):
@@ -1378,20 +1354,15 @@ class VentanaHistorialPagos(QDialog):
 class FormularioEgreso(QDialog):
     """Formulario para registrar egresos/gastos de caja"""
 
-    def __init__(self, parent, auth, callback=None):
+    def __init__(self, parent, caja_service, callback=None):
         super().__init__(parent)
-        self.auth = auth
+        self.caja_service = caja_service
+        self.auth = caja_service.auth
         self.callback = callback
         self._formatting = False
 
-        # Importar repositorio
-        from repositories.egresos_caja_repo import EgresosCajaRepository
-        import os
-        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ferreteria.db')
-        self.egresos_repo = EgresosCajaRepository(db_path)
-
         self.setWindowTitle("Registrar Egreso")
-        self.setFixedSize(500, 400)
+        self.setFixedSize(500, 460)
         self.setModal(True)
 
         self.crear_formulario()
@@ -1473,6 +1444,15 @@ class FormularioEgreso(QDialog):
         }
 
         main_layout.addLayout(metodos_frame)
+
+        lbl_motivo = QLabel("Motivo / descripción:")
+        lbl_motivo.setFont(make_font(FONTS['body_bold']))
+        main_layout.addWidget(lbl_motivo)
+        self.motivo_entry = QLineEdit()
+        self.motivo_entry.setFont(make_font(FONTS['body']))
+        self.motivo_entry.setPlaceholderText("Obligatorio")
+        main_layout.addWidget(self.motivo_entry)
+
         main_layout.addStretch()
 
         # Botones
@@ -1488,6 +1468,8 @@ class FormularioEgreso(QDialog):
             f"QPushButton:hover {{ background: {COLORS['danger_dark']}; }}"
         )
         btn_guardar.clicked.connect(self.guardar)
+        btn_guardar.setAutoDefault(False)
+        btn_guardar.setDefault(False)
         btn_layout.addWidget(btn_guardar)
 
         btn_cancelar = QPushButton("Cancelar")
@@ -1522,7 +1504,7 @@ class FormularioEgreso(QDialog):
     def guardar(self):
         """Guarda el egreso"""
         try:
-            monto = float(self.monto_entry.text().replace('.', '').replace(',', '.'))
+            monto = money(self.monto_entry.text().replace('.', '').replace(',', '.'))
         except ValueError:
             QMessageBox.critical(self, "Error", "Ingrese un monto v\u00e1lido")
             return
@@ -1532,7 +1514,11 @@ class FormularioEgreso(QDialog):
             return
 
         categoria = self.categoria_combo.currentText()
-        descripcion = categoria  # Usar la categoría como descripción
+        motivo = self.motivo_entry.text().strip()
+        if not motivo:
+            QMessageBox.critical(self, "Error", "El motivo del egreso es obligatorio")
+            return
+        descripcion = f"{categoria}: {motivo}"
         metodo_pago = self._metodo_map.get(self.metodo_group.checkedButton(), 'Efectivo')
 
         # Confirmar
@@ -1547,14 +1533,16 @@ class FormularioEgreso(QDialog):
             return
 
         try:
-            # Registrar egreso
-            self.egresos_repo.crear_egreso(
+            ok, mensaje, _egreso_id = self.caja_service.registrar_egreso(
                 monto=monto,
                 categoria=categoria,
                 descripcion=descripcion,
                 metodo_pago=metodo_pago,
-                usuario=self.auth.usuario_actual.username
+                usuario=self.auth.usuario_actual.username,
             )
+            if not ok:
+                QMessageBox.critical(self, "Error", mensaje)
+                return
 
             QMessageBox.information(self, "\u00c9xito", f"Egreso de ${monto:,.0f} registrado correctamente")
 
