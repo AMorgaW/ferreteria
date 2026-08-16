@@ -2020,6 +2020,7 @@ class VentasUIModern(QWidget):
             lay.addWidget(form_grp, 1)
 
             def guardar_abono():
+                from services.operational_balance import PaymentError
                 try:
                     monto = float(monto_entry.text().strip())
                     if monto <= 0:
@@ -2065,6 +2066,8 @@ class VentasUIModern(QWidget):
                         monto_entry.clear()
                         comprobante_entry.clear()
                         monto_entry.setFocus()
+                except PaymentError as e:
+                    QMessageBox.warning(dlg, "Pago no permitido", str(e))
                 except ValueError:
                     QMessageBox.critical(dlg, "Error", "Ingrese un monto válido")
 

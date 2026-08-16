@@ -19,16 +19,17 @@ PROJECT_DIR = os.path.abspath(os.getcwd())
 
 
 # ── Recursos de datos (se embeben en el .exe) ─────────────────────────────
-# Solo se incluyen si existen, para que el build no falle en otra máquina.
+# No incluir docs/, tests/, ferreteria.db comercial ni .env con secretos.
 datas = []
+_coord_sql = os.path.join(PROJECT_DIR, "supabase_inventory_coordinator.sql")
+if not os.path.exists(_coord_sql):
+    raise SystemExit(
+        "Ferreteria.spec: falta supabase_inventory_coordinator.sql "
+        "(recurso del coordinador; no hay fallback embebido)"
+    )
+datas.append(("supabase_inventory_coordinator.sql", "."))
 for _src, _dst in [
-    ("ferreteria.db", "."),
-    (".env", "."),
-    ("config", "config"),
     ("version.py", "."),
-    # Coordinator SQL used to be embedded in inventory_coordinator.py.
-    # After externalization it must ship as a data file or frozen apply fails.
-    ("supabase_inventory_coordinator.sql", "."),
 ]:
     if os.path.exists(os.path.join(PROJECT_DIR, _src)):
         datas.append((_src, _dst))
@@ -49,6 +50,10 @@ hiddenimports = [
     "pg_compat", "database", "models", "auth", "security",
     "exportar", "formato", "backup_manager", "cert_manager",
     "app_logging", "version", "unidades_venta_manager", "ui_config",
+    "balance_schema", "migration_runner", "inventory_coordinator",
+    "services.operational_balance", "services.document_service",
+    "services.inventory_reporting_adapter",
+    "services.financial_writer_fence", "services.deployment_readiness",
 ]
 # Paquetes del proyecto: incluir TODOS sus submódulos.
 hiddenimports += collect_submodules("ui")

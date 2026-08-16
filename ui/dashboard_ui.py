@@ -1728,6 +1728,7 @@ class DashboardUI(QWidget):
             dlg_layout.addWidget(form_group, 1)
 
             def guardar_cobro():
+                from services.operational_balance import PaymentError
                 try:
                     monto = float(monto_entry.text().strip())
 
@@ -1779,6 +1780,8 @@ class DashboardUI(QWidget):
                         comprobante_entry.clear()
                         monto_entry.setFocus()
 
+                except PaymentError as e:
+                    QMessageBox.warning(dialog, "Pago no permitido", str(e))
                 except ValueError:
                     QMessageBox.critical(
                         dialog, "Error", "Ingrese un monto válido"
@@ -2156,6 +2159,7 @@ class DashboardUI(QWidget):
                 m_lay.addLayout(form)
 
                 def guardar_abono():
+                    from services.operational_balance import PaymentError
                     try:
                         monto = float(
                             monto_entry.text().replace(',', '').strip()
@@ -2212,6 +2216,8 @@ class DashboardUI(QWidget):
                         else:
                             modal_abono.accept()
 
+                    except PaymentError as e:
+                        QMessageBox.warning(modal_abono, "Pago no permitido", str(e))
                     except ValueError:
                         QMessageBox.critical(
                             modal_abono, "Error",

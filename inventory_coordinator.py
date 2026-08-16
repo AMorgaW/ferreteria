@@ -215,11 +215,13 @@ def coordinator_sql_path() -> Path:
     name = REMOTE_COORDINATOR_MIGRATION_FILENAME
     candidates = []
     if getattr(sys, "frozen", False):
+        # Frozen: only bundled locations. No fallback to the developer source tree.
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             candidates.append(Path(meipass) / name)
         candidates.append(Path(sys.executable).resolve().parent / name)
-    candidates.append(Path(__file__).resolve().parent / name)
+    else:
+        candidates.append(Path(__file__).resolve().parent / name)
     seen = []
     for path in candidates:
         key = str(path)

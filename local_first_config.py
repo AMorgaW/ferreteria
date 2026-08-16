@@ -80,6 +80,12 @@ DEFAULT_CONFIG = {
     "iva_incluido": True,
     # Seguridad de red local: HTTPS en el servidor LAN (cert autofirmado).
     "usar_https": False,
+    # Fence operacional 4D: una sola estación puede finalizar abonos/pagos.
+    # No es serialización distribuida. Vacío = no designado (preflight de
+    # producción falla si hay más de una estación prevista).
+    "financial_writer_station_id": "",
+    "expected_station_ids": [],
+    "deployment_profile": "dev",
 }
 
 

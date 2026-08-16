@@ -1315,6 +1315,7 @@ class VentanaHistorialPagos(QDialog):
             btn_layout.setAlignment(Qt.AlignCenter)
 
             def guardar_abono():
+                from services.operational_balance import PaymentError
                 try:
                     monto = float(monto_entry.text())
 
@@ -1355,6 +1356,8 @@ class VentanaHistorialPagos(QDialog):
                     # Recargar tabla
                     self.cargar_pagos()
 
+                except PaymentError as e:
+                    QMessageBox.warning(ventana_abono, "Pago no permitido", str(e))
                 except ValueError:
                     QMessageBox.critical(ventana_abono, "Error", "Ingrese un monto v\u00e1lido")
                 except Exception as e:

@@ -22,6 +22,7 @@ class AbonosVentasRepository:
         from local_first_db import ensure_local_id
         from repositories._outbox import encolar
         from services.caja_service import attach_customer_payment_cash_effect
+        from services.financial_writer_fence import assert_can_finalize_payment
         from services.operational_balance import (
             PaymentError,
             assert_payment_allowed,
@@ -36,6 +37,7 @@ class AbonosVentasRepository:
         conn = connect_local(self.db_path)
         cursor = conn.cursor()
         try:
+            assert_can_finalize_payment()
             begin_immediate(conn)
             local_id = durable_payment_id(getattr(abono, "local_id", None))
             existing = find_payment_by_local_id(conn, "abonos_ventas", local_id)

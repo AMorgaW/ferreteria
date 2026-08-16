@@ -23,6 +23,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!Ferreteria.spec
 
 # Respaldos automáticos de la BD (runtime)
 backups/

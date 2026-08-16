@@ -95,6 +95,7 @@ def _crear_egreso_pago_proveedor(cursor, conn, abono_id: int, id_compra: int,
 def registrar_abono_compra_en_transaccion(conn, cursor, abono: Abono) -> int:
     from local_first_db import ensure_local_id
     from services.caja_service import attach_supplier_payment_cash_effect
+    from services.financial_writer_fence import assert_can_finalize_payment
     from services.operational_balance import (
         PaymentError,
         assert_payment_allowed,
@@ -105,6 +106,7 @@ def registrar_abono_compra_en_transaccion(conn, cursor, abono: Abono) -> int:
         project_payable,
     )
 
+    assert_can_finalize_payment()
     begin_immediate(conn)
     local_id = durable_payment_id(getattr(abono, "local_id", None))
     existing = find_payment_by_local_id(conn, "abonos_compras", local_id)

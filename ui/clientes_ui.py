@@ -586,6 +586,7 @@ class ClientesUI(QWidget):
                 monto_input.setFocus()
 
             def guardar_abono():
+                from services.operational_balance import PaymentError
                 try:
                     monto = float(monto_input.text().strip())
 
@@ -633,6 +634,8 @@ class ClientesUI(QWidget):
                     else:
                         QMessageBox.critical(ventana_abono, "Error",
                                              "Repositorio de abonos no disponible")
+                except PaymentError as e:
+                    QMessageBox.warning(ventana_abono, "Pago no permitido", str(e))
                 except ValueError:
                     QMessageBox.critical(ventana_abono, "Error",
                                          "Ingrese un monto válido")
