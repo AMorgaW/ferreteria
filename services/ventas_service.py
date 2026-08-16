@@ -787,8 +787,9 @@ class VentasService:
                        inventory_connection_factory=None) -> Tuple[bool, str]:
         """Cancela una venta persistida y revierte el inventario.
 
-        No confundir con ui/ventas_ui_modern.cancelar_venta, que solo vacía
-        el carrito y no llama este método. W04 permanece preparado; no se borra.
+        Legacy W04. No es el camino 3C. La UI de producción no lo llama:
+        ui/ventas_ui_modern.cancelar_venta solo vacía el carrito. El reverso
+        certificado es ReturnsService (SALE_VOID). Se conserva por tests.
         """
         from inventory_writer_support import WRITER_MODE_AUTHORITATIVE, resolve_writer_mode_or_frozen
 
@@ -1100,6 +1101,9 @@ class VentasService:
                              inventory_transport=None,
                              inventory_connection_factory=None) -> Tuple[bool, str, Optional[int]]:
         """Registra una devolución total o parcial de una venta.
+
+        Legacy W05. No es el camino 3C. La UI de producción no lo llama;
+        Devolver / Anular usa ReturnsService. Se conserva por tests.
 
         items: lista de {producto_id, cantidad}. Si es None/vacío se devuelve
         TODO lo pendiente (devolución total). Revierte stock atómicamente,

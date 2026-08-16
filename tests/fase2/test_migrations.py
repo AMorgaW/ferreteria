@@ -18,7 +18,7 @@ class MigrationRunnerTest(unittest.TestCase):
                     [
                         "APPLIED", "APPLIED", "APPLIED",
                         "APPLIED", "APPLIED", "APPLIED",
-                        "APPLIED",
+                        "APPLIED", "APPLIED",
                     ],
                 )
                 cols = {row["name"] for row in conn.execute("PRAGMA table_info(compras)")}
@@ -36,7 +36,7 @@ class MigrationRunnerTest(unittest.TestCase):
                         "SKIPPED_APPLIED", "SKIPPED_APPLIED",
                         "SKIPPED_APPLIED", "SKIPPED_APPLIED",
                         "SKIPPED_APPLIED", "SKIPPED_APPLIED",
-                        "SKIPPED_APPLIED",
+                        "SKIPPED_APPLIED", "SKIPPED_APPLIED",
                     ],
                 )
             finally:

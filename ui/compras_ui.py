@@ -374,6 +374,14 @@ class ComprasUI(QWidget):
                                     command=self.ver_detalles_compra)
         btn_bar_layout.addWidget(btn_detalles)
 
+        btn_devolver = ActionButton(btn_bar, text="  Devolver a proveedor  ",
+                                    bg=COLORS['accent_light'], fg=COLORS['accent_dark'],
+                                    hover_bg=COLORS['accent_light'], border_color=COLORS['accent'],
+                                    border_radius=12,
+                                    padx=14, pady=6, font_size=9,
+                                    command=self.devolver_a_proveedor)
+        btn_bar_layout.addWidget(btn_devolver)
+
         btn_abono = ActionButton(btn_bar, text="  Registrar Abono  ",
                                  bg=COLORS['warning_light'], fg=COLORS['warning_dark'],
                                  hover_bg=COLORS['warning_hover_light'], border_color=COLORS['warning_border'],
@@ -577,6 +585,25 @@ class ComprasUI(QWidget):
         compra_id = compra_id_raw.replace('PUR-', '') if compra_id_raw.startswith('PUR-') else compra_id_raw
 
         VentanaDetallesCompra(self, self.compras_repo, compra_id)
+
+    def devolver_a_proveedor(self):
+        row = self.tree.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Advertencia", "Seleccione una recepción completada")
+            return
+        compra_id_raw = self.tree.item(row, 0).text()
+        compra_id = compra_id_raw.replace("PUR-", "") if compra_id_raw.startswith("PUR-") else compra_id_raw
+        from services.returns_service import ReturnsService
+        from ui.returns_ui import open_supplier_return
+
+        svc = ReturnsService(
+            self.db or self.compras_repo.db,
+            auth=self.auth,
+            productos_repo=self.productos_repo,
+        )
+        open_supplier_return(
+            self, int(compra_id), svc, db_manager=self.db or self.compras_repo.db
+        )
 
     def registrar_abono_desde_tabla(self):
         """Abre modal para registrar abono desde la tabla de compras"""
@@ -2229,6 +2256,28 @@ class VentanaDetallesCompra(QDialog):
             btn_wrapper.setStyleSheet("background: transparent; border: none;")
             bw_layout = QHBoxLayout(btn_wrapper)
             bw_layout.addStretch()
+            estado = str(compra.get("estado") or "").upper()
+            if estado in ("COMPLETADA", "COMPLETED"):
+                btn_devolver = QPushButton("Devolver a proveedor")
+                btn_devolver.setFont(make_font(FONTS['body']))
+                btn_devolver.setCursor(Qt.PointingHandCursor)
+                btn_devolver.setDefault(False)
+                btn_devolver.setAutoDefault(False)
+                btn_devolver.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {COLORS['accent']}; color: white;
+                        border: none; border-radius: 6px; padding: 10px 24px;
+                    }}
+                    QPushButton:hover {{ background: {COLORS['accent_dark']}; }}
+                """)
+                def _open_return():
+                    from services.returns_service import ReturnsService
+                    from ui.returns_ui import open_supplier_return
+                    db = getattr(self.compras_repo, "db", None)
+                    svc = ReturnsService(db, auth=getattr(self.parent(), "auth", None))
+                    open_supplier_return(self, int(self.compra_id), svc, db_manager=db)
+                btn_devolver.clicked.connect(_open_return)
+                bw_layout.addWidget(btn_devolver)
             bw_layout.addWidget(btn_cerrar)
             bw_layout.addStretch()
             main_layout.addWidget(btn_wrapper)

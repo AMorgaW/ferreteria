@@ -79,6 +79,19 @@ ALTER TABLE inventory_balance_init_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_commands ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_operations ENABLE ROW LEVEL SECURITY;
 
+CREATE TABLE IF NOT EXISTS inventory_reversal_allocations (
+    command_id TEXT NOT NULL,
+    original_documento_local_id TEXT NOT NULL,
+    producto_local_id TEXT NOT NULL,
+    qty_scaled BIGINT NOT NULL CHECK (qty_scaled > 0),
+    created_at TEXT NOT NULL,
+    CONSTRAINT pk_inventory_reversal_allocations
+        PRIMARY KEY (command_id, producto_local_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reversal_alloc_original
+    ON inventory_reversal_allocations(original_documento_local_id, producto_local_id);
+ALTER TABLE inventory_reversal_allocations ENABLE ROW LEVEL SECURITY;
+
 CREATE OR REPLACE FUNCTION public.ferrepro_inventory_caller_is_allowed()
 RETURNS boolean
 LANGUAGE plpgsql
@@ -159,6 +172,11 @@ DECLARE
     BIGINT_MAX numeric := 9223372036854775807;
     v_pos int := 0;
     v_neg int := 0;
+    v_orig_doc text;
+    v_orig_cmd text;
+    v_orig_n int;
+    v_cap numeric;
+    v_already numeric;
 BEGIN
     IF NOT public.ferrepro_inventory_caller_is_allowed() THEN
         RAISE EXCEPTION 'INVENTORY_FORBIDDEN: el caller no está autorizado para apply_inventory_command'
@@ -441,6 +459,85 @@ BEGIN
         RETURN public.inventory_command_to_json(v_command_id, false);
     END IF;
 
+    SELECT NULLIF(btrim(COALESCE(value->>'original_documento_local_id', '')), '')
+      INTO v_orig_doc
+      FROM jsonb_array_elements(p_operations)
+     WHERE NULLIF(btrim(COALESCE(value->>'original_documento_local_id', '')), '') IS NOT NULL
+     LIMIT 1;
+    IF v_orig_doc IS NOT NULL THEN
+        BEGIN
+            v_orig_doc := (btrim(v_orig_doc))::uuid::text;
+        EXCEPTION WHEN invalid_text_representation THEN
+            RAISE EXCEPTION 'INVALID_COMMAND: original_documento_local_id debe ser UUID'
+                USING ERRCODE = '22023';
+        END;
+        SELECT COUNT(*) INTO v_orig_n
+          FROM (
+              SELECT DISTINCT (btrim(value->>'original_documento_local_id'))::uuid::text AS d
+                FROM jsonb_array_elements(p_operations)
+               WHERE NULLIF(btrim(COALESCE(value->>'original_documento_local_id', '')), '') IS NOT NULL
+          ) s;
+        IF v_orig_n > 1 THEN
+            RAISE EXCEPTION 'INVALID_COMMAND: original_documento_local_id mixto'
+                USING ERRCODE = '22023';
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM jsonb_array_elements(p_operations) e
+             WHERE NULLIF(btrim(COALESCE(e->>'original_documento_local_id', '')), '') IS NULL
+        ) THEN
+            RAISE EXCEPTION 'INVALID_COMMAND: original_documento_local_id incompleto'
+                USING ERRCODE = '22023';
+        END IF;
+        PERFORM pg_advisory_xact_lock(
+            pg_catalog.hashtextextended('ferrepro.revdoc:' || v_orig_doc, 0)
+        );
+        SELECT NULLIF(btrim(COALESCE(value->>'original_command_id', '')), '')
+          INTO v_orig_cmd
+          FROM jsonb_array_elements(p_operations)
+         WHERE NULLIF(btrim(COALESCE(value->>'original_command_id', '')), '') IS NOT NULL
+         LIMIT 1;
+        IF v_orig_cmd IS NOT NULL THEN
+            BEGIN
+                v_orig_cmd := (btrim(v_orig_cmd))::uuid::text;
+            EXCEPTION WHEN invalid_text_representation THEN
+                RAISE EXCEPTION 'INVALID_COMMAND: original_command_id debe ser UUID'
+                    USING ERRCODE = '22023';
+            END;
+        END IF;
+        FOR v_pid, v_net IN
+            SELECT e->>'producto_local_id',
+                   SUM(ABS((e->>'delta_scaled')::numeric))
+              FROM jsonb_array_elements(v_parsed) e
+             GROUP BY 1
+             ORDER BY 1
+        LOOP
+            SELECT COALESCE(SUM(ABS(o.delta_scaled)), 0)
+              INTO v_cap
+              FROM public.inventory_operations o
+              JOIN public.inventory_commands c ON c.command_id = o.command_id
+             WHERE o.producto_local_id = v_pid
+               AND c.estado = 'APPLIED'
+               AND c.tipo IN ('VENTA', 'COMPRA', 'RECEPCION')
+               AND (
+                    (v_orig_cmd IS NOT NULL AND c.command_id = v_orig_cmd)
+                    OR (v_orig_cmd IS NULL AND c.documento_local_id = v_orig_doc)
+               );
+            SELECT COALESCE(SUM(a.qty_scaled), 0)
+              INTO v_already
+              FROM public.inventory_reversal_allocations a
+             WHERE a.original_documento_local_id = v_orig_doc
+               AND a.producto_local_id = v_pid;
+            IF v_cap <= 0 THEN
+                v_failures := v_failures || 'ORIGINAL_DOCUMENT_NOT_FOUND: producto='
+                    || v_pid || '; ';
+            ELSIF v_already + v_net > v_cap THEN
+                v_failures := v_failures || 'RETURNABLE_QTY_EXCEEDED: producto='
+                    || v_pid || ' available=' || (v_cap - v_already)::text
+                    || ' required=' || v_net::text || '; ';
+            END IF;
+        END LOOP;
+    END IF;
+
     FOR v_pid, v_net IN
         SELECT e->>'producto_local_id',
                SUM((e->>'delta_scaled')::numeric)
@@ -593,6 +690,20 @@ BEGIN
             (e->>'delta_scaled')::bigint,
             (e->>'line_no')::int
         FROM jsonb_array_elements(v_parsed) e;
+        IF v_orig_doc IS NOT NULL THEN
+            INSERT INTO public.inventory_reversal_allocations (
+                command_id, original_documento_local_id, producto_local_id,
+                qty_scaled, created_at
+            )
+            SELECT
+                v_command_id,
+                v_orig_doc,
+                e->>'producto_local_id',
+                SUM(ABS((e->>'delta_scaled')::bigint)),
+                v_now
+              FROM jsonb_array_elements(v_parsed) e
+             GROUP BY e->>'producto_local_id';
+        END IF;
     EXCEPTION
         WHEN unique_violation THEN
             GET STACKED DIAGNOSTICS v_constraint = CONSTRAINT_NAME;
@@ -854,6 +965,7 @@ REVOKE ALL ON TABLE public.inventory_balance_init FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_balance_init_state FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_commands FROM PUBLIC;
 REVOKE ALL ON TABLE public.inventory_operations FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_reversal_allocations FROM PUBLIC;
 
 DO $ferrepro_do$
 BEGIN
@@ -868,6 +980,7 @@ BEGIN
         REVOKE ALL ON TABLE public.inventory_balance_init_state FROM anon;
         REVOKE ALL ON TABLE public.inventory_commands FROM anon;
         REVOKE ALL ON TABLE public.inventory_operations FROM anon;
+        REVOKE ALL ON TABLE public.inventory_reversal_allocations FROM anon;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
         REVOKE ALL ON FUNCTION public.apply_inventory_command(text, text, text, text, text, integer, text, jsonb) FROM authenticated;
@@ -880,6 +993,7 @@ BEGIN
         REVOKE ALL ON TABLE public.inventory_balance_init_state FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_commands FROM authenticated;
         REVOKE ALL ON TABLE public.inventory_operations FROM authenticated;
+        REVOKE ALL ON TABLE public.inventory_reversal_allocations FROM authenticated;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
         REVOKE ALL ON FUNCTION public.apply_inventory_command(text, text, text, text, text, integer, text, jsonb) FROM service_role;
@@ -892,6 +1006,7 @@ BEGIN
         REVOKE ALL ON TABLE public.inventory_balance_init_state FROM service_role;
         REVOKE ALL ON TABLE public.inventory_commands FROM service_role;
         REVOKE ALL ON TABLE public.inventory_operations FROM service_role;
+        REVOKE ALL ON TABLE public.inventory_reversal_allocations FROM service_role;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ferrepro_inventory_app') THEN
         GRANT EXECUTE ON FUNCTION public.apply_inventory_command(text, text, text, text, text, integer, text, jsonb) TO ferrepro_inventory_app;
@@ -905,6 +1020,7 @@ BEGIN
         REVOKE ALL ON TABLE public.inventory_balance_init_state FROM ferrepro_inventory_app;
         REVOKE ALL ON TABLE public.inventory_commands FROM ferrepro_inventory_app;
         REVOKE ALL ON TABLE public.inventory_operations FROM ferrepro_inventory_app;
+        REVOKE ALL ON TABLE public.inventory_reversal_allocations FROM ferrepro_inventory_app;
     END IF;
 END
 $ferrepro_do$;

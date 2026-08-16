@@ -31,6 +31,9 @@ DOCUMENTO_TIPO_VENTA = "venta"
 DOCUMENTO_TIPO_COMPRA = "compra"
 DOCUMENTO_TIPO_MEZCLA = "mezcla"
 DOCUMENTO_TIPO_DEVOLUCION = "devolucion"
+DOCUMENTO_TIPO_CUSTOMER_RETURN = "customer_return"
+DOCUMENTO_TIPO_SALE_VOID = "sale_void"
+DOCUMENTO_TIPO_SUPPLIER_RETURN = "supplier_return"
 DOCUMENTO_TIPO_MOVIMIENTO = "movimiento"
 DOCUMENTO_TIPO_AJUSTE = "ajuste"
 DOCUMENTO_TIPO_PRODUCTO = "producto"
@@ -195,6 +198,29 @@ def build_negative_operations(
             }
         )
     return operations
+
+
+def attach_original_document(
+    operations: Sequence[Mapping[str, Any]],
+    *,
+    original_documento_tipo: str,
+    original_documento_local_id: str,
+    original_command_id: Optional[str] = None,
+) -> List[dict]:
+    """Enlaza operations al documento original. No entra al request_hash."""
+    orig = str(uuid.UUID(str(original_documento_local_id)))
+    orig_cmd = None
+    if original_command_id:
+        orig_cmd = str(uuid.UUID(str(original_command_id)))
+    attached = []
+    for raw in operations:
+        item = dict(raw)
+        item["original_documento_tipo"] = str(original_documento_tipo)
+        item["original_documento_local_id"] = orig
+        if orig_cmd:
+            item["original_command_id"] = orig_cmd
+        attached.append(item)
+    return attached
 
 
 def build_positive_operations(

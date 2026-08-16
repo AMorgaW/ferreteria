@@ -19,6 +19,7 @@ from barcode_schema import (
 from inventory_import_schema import ensure_inventory_import_schema
 from inventory_apply_schema import ensure_inventory_apply_schema
 from purchase_schema import ensure_sqlite_purchase_receiving_schema
+from returns_schema import ensure_sqlite_returns_reversals_schema
 
 
 class MigrationError(RuntimeError):
@@ -278,6 +279,18 @@ DEFAULT_MIGRATIONS = (
             "alias_codigo UNIQUE per supplier);not product_barcodes"
         ),
         apply=ensure_sqlite_purchase_receiving_schema,
+    ),
+    Migration(
+        version="20260816_008",
+        name="returns_reversals_documents",
+        signature=(
+            "reversal_documents(local_id UNIQUE,kind CUSTOMER_RETURN/SALE_VOID/"
+            "SUPPLIER_RETURN,original_tipo/id,estado DRAFT/APPLYING/COMPLETED/"
+            "REJECTED,inventory_command_id);reversal_lines(original_line_id,"
+            "package_role,cantidad_presentacion,cantidad_base);"
+            "never mutates completed ventas/compras"
+        ),
+        apply=ensure_sqlite_returns_reversals_schema,
     ),
 )
 

@@ -65,6 +65,9 @@ def reset_lab_balances(admin_conn):
         cur.execute("DELETE FROM inventory_cutover_attestations")
         cur.execute("DELETE FROM inventory_cutover_expected_stations")
         cur.execute("DELETE FROM inventory_cutover_snapshots")
+        cur.execute("SELECT to_regclass('public.inventory_reversal_allocations')")
+        if cur.fetchone()[0] is not None:
+            cur.execute("DELETE FROM inventory_reversal_allocations")
         cur.execute("DELETE FROM inventory_operations")
         cur.execute("DELETE FROM inventory_commands")
         cur.execute("DELETE FROM inventory_balance_init_state WHERE init_key = 'legacy_cutover'")

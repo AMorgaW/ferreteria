@@ -7,6 +7,16 @@ cd /d "%~dp0"
 echo [1/2] Construyendo ejecutable portable (PyInstaller desde Ferreteria.spec)...
 REM Se usa el .spec como UNICA fuente de verdad: incluye todos los recursos,
 REM plugins de Qt, DLLs y modulos, y compila sin consola (aplicacion grafica).
+if not exist "Ferreteria.spec" (
+  echo ERROR: falta Ferreteria.spec
+  pause & exit /b 1
+)
+findstr /C:"supabase_inventory_coordinator.sql" Ferreteria.spec >nul
+if errorlevel 1 (
+  echo ERROR: Ferreteria.spec debe incluir supabase_inventory_coordinator.sql en datas.
+  echo El SQL del coordinador ya no va embebido en inventory_coordinator.py.
+  pause & exit /b 1
+)
 python -m PyInstaller --noconfirm --clean Ferreteria.spec
 if errorlevel 1 ( echo ERROR al construir el ejecutable & pause & exit /b 1 )
 

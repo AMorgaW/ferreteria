@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ast
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -47,6 +50,45 @@ class ContractCoordinatorTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertEqual(artifact, sql)
+
+    def test_coordinator_sql_resource_path_independiente_del_cwd(self):
+        from inventory_coordinator import (
+            CoordinatorError,
+            REMOTE_COORDINATOR_MIGRATION_FILENAME,
+            coordinator_sql_path,
+            postgres_coordinator_sql,
+        )
+
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(tempfile.gettempdir())
+            path = coordinator_sql_path()
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.name, REMOTE_COORDINATOR_MIGRATION_FILENAME)
+            sql = postgres_coordinator_sql()
+            self.assertIn("apply_inventory_command", sql)
+            self.assertIn("inventory_reversal_allocations", sql)
+        finally:
+            os.chdir(original_cwd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled = Path(tmp) / REMOTE_COORDINATOR_MIGRATION_FILENAME
+            bundled.write_text("-- bundled coordinator fixture\n", encoding="utf-8")
+            with mock.patch("inventory_coordinator.sys") as fake_sys:
+                fake_sys.frozen = True
+                fake_sys._MEIPASS = tmp
+                fake_sys.executable = str(Path(tmp) / "Ferreteria.exe")
+                self.assertEqual(
+                    coordinator_sql_path().resolve(), bundled.resolve()
+                )
+
+        with mock.patch(
+            "inventory_coordinator.REMOTE_COORDINATOR_MIGRATION_FILENAME",
+            "missing_ferrepro_coordinator.sql",
+        ):
+            with self.assertRaises(CoordinatorError) as ctx:
+                coordinator_sql_path()
+            self.assertIn("No se encontró", str(ctx.exception))
 
     def test_balance_bigint_y_pk_local_id(self):
         from inventory_coordinator import postgres_coordinator_sql

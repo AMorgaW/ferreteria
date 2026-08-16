@@ -1589,7 +1589,7 @@ class MovimientosUI(QWidget):
         return estado_norm or 'PENDIENTE', COLORS['danger'], COLORS['danger_dark'], "No se registran pagos aplicados."
 
     def _crear_dialogo_detalle(self, titulo, encabezado, color=None, ancho=1120,
-                               alto=700, print_callback=None):
+                               alto=700, print_callback=None, extra_actions=None):
         dialog = QDialog(self.window())
         dialog.setWindowTitle(titulo)
         dialog.resize(ancho, alto)
@@ -1649,6 +1649,21 @@ class MovimientosUI(QWidget):
             )
             btn_print.clicked.connect(lambda: print_callback(dialog))
             footer_l.addWidget(btn_print)
+            footer_l.addSpacing(10)
+
+        for text, callback in extra_actions or ():
+            btn_extra = QPushButton(text)
+            btn_extra.setFont(make_font(FONTS['body_bold']))
+            btn_extra.setCursor(Qt.PointingHandCursor)
+            btn_extra.setDefault(False)
+            btn_extra.setAutoDefault(False)
+            btn_extra.setStyleSheet(
+                f"QPushButton {{ background: {COLORS['accent']}; color: white; border: none; "
+                f"border-radius: 8px; padding: 9px 22px; }}"
+                f"QPushButton:hover {{ background: {COLORS['accent_dark']}; }}"
+            )
+            btn_extra.clicked.connect(callback)
+            footer_l.addWidget(btn_extra)
             footer_l.addSpacing(10)
 
         btn_close = QPushButton("Cerrar")
@@ -2074,7 +2089,13 @@ class MovimientosUI(QWidget):
             f"Detalle Venta: {num_factura}",
             f"📦 Salida de inventario #{num_factura}",
             COLORS['danger'],
-            print_callback=lambda dlg: self._imprimir_factura_desde_detalle(dlg, num_factura)
+            print_callback=lambda dlg: self._imprimir_factura_desde_detalle(dlg, num_factura),
+            extra_actions=[
+                (
+                    "Devolver / Anular",
+                    lambda v=venta: self._abrir_devolucion_venta(v),
+                )
+            ],
         )
         self._add_info_grid(body, [
             ("Factura", num_factura),
@@ -2130,6 +2151,28 @@ class MovimientosUI(QWidget):
         body.addLayout(content)
         dialog.exec()
 
+    def _abrir_devolucion_venta(self, venta):
+        from services.returns_service import ReturnsService
+        from ui.returns_ui import open_customer_return
+
+        svc = ReturnsService(
+            self.db_manager, auth=self.auth, productos_repo=self.productos_repo
+        )
+        open_customer_return(
+            self, venta.get("id"), svc, db_manager=self.db_manager
+        )
+
+    def _abrir_devolucion_compra(self, compra):
+        from services.returns_service import ReturnsService
+        from ui.returns_ui import open_supplier_return
+
+        svc = ReturnsService(
+            self.db_manager, auth=self.auth, productos_repo=self.productos_repo
+        )
+        open_supplier_return(
+            self, compra.get("id"), svc, db_manager=self.db_manager
+        )
+
     def ver_detalle_compra_factura(self, num_factura):
         compra = self._obtener_compra_detalle(num_factura)
         if not compra:
@@ -2150,7 +2193,13 @@ class MovimientosUI(QWidget):
             f"Detalle Compra: {num_factura}",
             f"📦 Entrada de inventario #{num_factura}",
             COLORS['success'],
-            print_callback=lambda dlg: self._imprimir_factura_desde_detalle(dlg, num_factura)
+            print_callback=lambda dlg: self._imprimir_factura_desde_detalle(dlg, num_factura),
+            extra_actions=[
+                (
+                    "Devolver a proveedor",
+                    lambda c=compra: self._abrir_devolucion_compra(c),
+                )
+            ],
         )
         self._add_info_grid(body, [
             ("Factura", num_factura),
