@@ -405,7 +405,9 @@ class IntegrityError(Exception):
 def connect() -> PgConnection:
     """Obtiene una conexion PostgreSQL reutilizable desde el pool."""
     if DB_MODE in ("local", "sqlite", "server"):
-        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30, check_same_thread=False)
+        # Las conexiones se crean por operación/repositorio. Dejar activo el
+        # guard nativo evita compartir accidentalmente conexión/cursor entre hilos.
+        conn = sqlite3.connect(LOCAL_DB_PATH, timeout=30, check_same_thread=True)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")

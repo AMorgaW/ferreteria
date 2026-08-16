@@ -2,10 +2,12 @@
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from datetime import datetime
 import schema_bootstrap
 from sync_registry import pk_column, sync_tables, table_for_entity
+from performance_trace import timed
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +15,8 @@ DEFAULT_DB_PATH = os.environ.get("LOCAL_DB_PATH", os.path.join(BASE_DIR, "ferret
 
 # Derivado del registry canónico. No editar esta lista a mano.
 SYNC_TABLES = sync_tables()
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY = set()
 
 
 def now_iso():
@@ -20,7 +24,9 @@ def now_iso():
 
 
 def connect(db_path=DEFAULT_DB_PATH):
-    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+    # Cada consumidor abre su propia conexión en el hilo donde la usa. Mantener
+    # el guard de sqlite activo hace visible cualquier uso cross-thread inseguro.
+    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -41,6 +47,18 @@ def row_to_dict(row):
 
 
 def ensure_local_first_schema(db_path=DEFAULT_DB_PATH):
+    normalized = os.path.normcase(os.path.abspath(db_path))
+    cacheable = db_path != ":memory:"
+    with _SCHEMA_LOCK:
+        if cacheable and normalized in _SCHEMA_READY and os.path.exists(normalized):
+            return
+        with timed("bootstrap.sqlite.local_first", db_path=normalized):
+            _ensure_local_first_schema_uncached(db_path)
+        if cacheable:
+            _SCHEMA_READY.add(normalized)
+
+
+def _ensure_local_first_schema_uncached(db_path=DEFAULT_DB_PATH):
     conn = connect(db_path)
     try:
         conn.execute("""

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThreadPool
 from PySide6.QtGui import QFont, QColor, QCursor
+import time
 
 from models import Producto
 from ui_config import COLORS, FONTS, make_font
@@ -19,6 +20,7 @@ from ui.async_worker import FunctionWorker
 from ui.barcode_widget import BarcodeCaptureWidget
 from repositories.product_barcodes_repo import ProductBarcodesRepository
 from repositories.productos_repo import PRODUCT_CREATION_FINAL
+from performance_trace import mark
 
 
 class ProductosUI(QWidget):
@@ -54,24 +56,25 @@ class ProductosUI(QWidget):
         self._search_timer.timeout.connect(self.cargar_productos)
         self._thread_pool = QThreadPool.globalInstance()
         self._load_seq = 0
+        self._load_started = {}
 
-        self.cargar_datos_autocompletado()
         self.crear_ui()
         self.cargar_productos()
+        self._cargar_datos_autocompletado_async()
 
-    def cargar_datos_autocompletado(self):
-        """Carga datos para autocompletado"""
+    def _cargar_datos_autocompletado_local(self):
+        """Consulta solo SQLite; se ejecuta dentro del worker."""
+        started_at = time.perf_counter()
         try:
             productos = self.productos_repo.buscar_productos('', limite=1000)
-
-            self.marcas_existentes = sorted(list(set(
+            marcas = sorted(list(set(
                 p['marca'] for p in productos if p.get('marca')
             )))
-
+            proveedores_lista = []
             if self.proveedores_repo:
                 try:
                     proveedores = self.proveedores_repo.listar_proveedores(solo_activos=True)
-                    self.proveedores_lista = [
+                    proveedores_lista = [
                         {'id': p.id, 'nombre': p.nombre}
                         for p in proveedores
                     ]
@@ -79,13 +82,35 @@ class ProductosUI(QWidget):
                     print(f"[AVISO] Error cargando proveedores: {e}")
                     import traceback
                     traceback.print_exc()
-                    self.proveedores_lista = []
+                    proveedores_lista = []
             else:
                 print("[AVISO] proveedores_repo no disponible")
+            return marcas, proveedores_lista
         except Exception as e:
             print(f"Error cargando datos de autocompletado: {e}")
             import traceback
             traceback.print_exc()
+            return [], []
+        finally:
+            mark("ui.productos.autocomplete", started_at, gui_thread=False)
+
+    def _cargar_datos_autocompletado_async(self):
+        worker = FunctionWorker(self._cargar_datos_autocompletado_local)
+        worker.signals.result.connect(self._aplicar_datos_autocompletado)
+        worker.signals.error.connect(
+            lambda e: print(f"Error cargando autocompletado de productos: {e}"))
+        self._thread_pool.start(worker)
+
+    def _aplicar_datos_autocompletado(self, result):
+        try:
+            self.objectName()
+        except RuntimeError:
+            return
+        self.marcas_existentes, self.proveedores_lista = result
+
+    def cargar_datos_autocompletado(self):
+        """Compatibilidad: agenda la carga sin bloquear el GUI thread."""
+        self._cargar_datos_autocompletado_async()
 
     # ------------------------------------------------------------------
     #  UI principal
@@ -219,6 +244,7 @@ class ProductosUI(QWidget):
     # ------------------------------------------------------------------
     def cargar_productos(self):
         """Carga los productos en la tabla"""
+        started_at = time.perf_counter()
         self.table.setRowCount(0)
 
         try:
@@ -226,10 +252,12 @@ class ProductosUI(QWidget):
             if self.productos_repo.cache_disponible():
                 productos = self.productos_repo.buscar_productos_cache(termino, limite=250)
                 self._renderizar_productos(productos)
+                mark("ui.productos.load", started_at, source="cache", gui_thread=True)
                 return
 
             self._load_seq += 1
             seq = self._load_seq
+            self._load_started[seq] = started_at
             worker = FunctionWorker(self.productos_repo.buscar_productos, termino, True, 250)
             worker.signals.result.connect(lambda productos, s=seq: self._on_productos_cargados(productos, s))
             worker.signals.error.connect(lambda e: QMessageBox.critical(self, "Error", f"Error cargando productos:\n{e}"))
@@ -238,9 +266,17 @@ class ProductosUI(QWidget):
             QMessageBox.critical(self, "Error", f"Error cargando productos:\n{str(e)}")
 
     def _on_productos_cargados(self, productos, seq):
+        try:
+            self.table.objectName()
+        except RuntimeError:
+            return
         if seq != self._load_seq:
+            self._load_started.pop(seq, None)
             return
         self._renderizar_productos(productos)
+        started_at = self._load_started.pop(seq, None)
+        if started_at is not None:
+            mark("ui.productos.load", started_at, source="sqlite_worker", gui_thread=True)
 
     def exportar_inventario(self):
         """Exporta el inventario completo a un archivo Excel (.xlsx)."""

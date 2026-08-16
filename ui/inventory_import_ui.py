@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
+import time
 
 from PySide6.QtCore import Qt, QThreadPool
 from PySide6.QtGui import QColor, QCursor
@@ -32,6 +33,7 @@ from services.inventory_apply_service import (
 )
 from ui.async_worker import FunctionWorker
 from ui_config import COLORS, FONTS, make_font
+from performance_trace import mark
 
 
 def _quantity(scaled) -> str:
@@ -46,6 +48,7 @@ class InventoryImportUI(QWidget):
     FILTERS = ("TODOS", "VÁLIDOS", "ERRORES", "NUEVOS", "MATCH", "REVISAR")
 
     def __init__(self, parent, db_manager, product_repository=None, auth_manager=None):
+        started_at = time.perf_counter()
         super().__init__(parent)
         self.auth = auth_manager
         self.service = InventoryImportService(InventoryImportRepository(db_manager))
@@ -59,6 +62,7 @@ class InventoryImportUI(QWidget):
         self._batch_id = None
         self._selected_path = ""
         self._build_ui()
+        mark("ui.inventory_import.open", started_at, gui_thread=True)
 
     def _actor_name(self):
         user = getattr(self.auth, "usuario_actual", None) if self.auth else None

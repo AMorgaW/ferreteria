@@ -12,7 +12,10 @@ la operación controlada. Los PASS de fixtures no sustituyen esa verificación.
 - [ ] authoritative inventory reachable
 - [x] barcode queue works
 - [x] double scan PASS
-- [ ] DIG-X6266 physical PASS
+- [x] DIG-X6266 physical PASS
+- [x] LOCAL-FIRST responsiveness physical PASS
+- [x] startup y navegación offline PASS
+- [x] reconnect/sync background sin freeze PASS
 - [ ] backup operativo preparado
 - [ ] usuario autoriza ejecución real
 
@@ -24,7 +27,11 @@ la operación controlada. Los PASS de fixtures no sustituyen esa verificación.
 - Barcodes secundarios y `FULL_PACKAGE` resuelven el mismo producto/stock.
 - Candidate Excel permanece como referencia y FRP exige acción explícita.
 - SQLite y PostgreSQL de laboratorio validados; Supabase real no fue tocado.
+- DIG-X6266, HID y doble escaneo validados físicamente: PASS.
+- Startup online/offline, navegación local y reconexión validados físicamente:
+  PASS; no se observó “Python no responde”.
 
-**Ready para inventario real hoy:** NO. Fase 2 está completa a nivel software,
-pero falta la prueba física DIG-X6266 y los gates operacionales de este
-checklist. El inventario comercial todavía NO ha sido ejecutado.
+**Ready para inventario real hoy:** NO. Fase 2 está completa a nivel
+software/operacional, incluido DIG-X6266 y local-first responsiveness, pero
+siguen pendientes los demás gates operacionales de este checklist. El
+inventario comercial todavía NO ha sido ejecutado.

@@ -12,6 +12,7 @@ import psycopg2.extensions
 
 from local_first_db import (DEFAULT_DB_PATH, SYNC_TABLES, connect,
                             ensure_local_first_schema, now_iso)
+from performance_trace import mark, timed
 from sync_registry import (
     REMOTE_TABLES_REQUIRED_FOR_STARTUP,
     fk_map,
@@ -129,28 +130,51 @@ class SupabaseSyncService:
         self.db_path = db_path
         self.database_url = database_url or os.environ.get("SUPABASE_URI", "")
         self.interval = int(os.environ.get("SYNC_INTERVAL_SECONDS", interval))
+        self.max_retry_interval = int(os.environ.get("SYNC_MAX_RETRY_SECONDS", "120"))
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread = None
+        self._operation_lock = threading.Lock()
         self._schema_ensured = False
         self._remote_identity_ensured = False
         self._remote_identity_last_error = None
 
     def start_background(self):
         if self._thread and self._thread.is_alive():
-            return
+            return False
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(target=self._loop, name="supabase-sync", daemon=True)
         self._thread.start()
+        mark("sync.worker.started")
+        return True
 
-    def stop(self):
+    def stop(self, timeout=4.0):
         self._stop.set()
+        self._wake.set()
         if self._thread:
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=timeout)
+            stopped = not self._thread.is_alive()
+            if stopped:
+                self._thread = None
+            mark("sync.worker.stopped", clean=stopped)
+            return stopped
+        return True
+
+    def request_sync(self):
+        """Despierta el worker sin ejecutar trabajo en el hilo llamador."""
+        self._wake.set()
 
     def _loop(self):
+        retry_delay = max(1, self.interval)
         while not self._stop.is_set():
-            self.sync_once(limit=50)
-            self._stop.wait(self.interval)
+            result = self.sync_once(limit=50)
+            if result.get("failed") or result.get("error"):
+                retry_delay = min(max(1, retry_delay * 2), self.max_retry_interval)
+            else:
+                retry_delay = max(1, self.interval)
+            self._wake.wait(retry_delay)
+            self._wake.clear()
 
     def _set_state(self, conn, key, value):
         conn.execute(
@@ -165,9 +189,17 @@ class SupabaseSyncService:
     def _remote_connect(self):
         if not self.database_url:
             raise RuntimeError("SUPABASE_URI no esta configurado")
-        remote = psycopg2.connect(self.database_url, connect_timeout=8)
+        started_at = time.perf_counter()
+        timeout = max(1, int(os.environ.get("SYNC_REMOTE_CONNECT_TIMEOUT", "3")))
         try:
-            self._ensure_remote_schema(remote)
+            remote = psycopg2.connect(self.database_url, connect_timeout=timeout)
+        except Exception:
+            mark("sync.remote.connect", started_at, status="error", timeout_s=timeout)
+            raise
+        mark("sync.remote.connect", started_at, status="ok", timeout_s=timeout)
+        try:
+            with timed("sync.remote.schema"):
+                self._ensure_remote_schema(remote)
             if getattr(self, '_schema_ensured', False):
                 remote.commit()
         except Exception:
@@ -511,6 +543,16 @@ class SupabaseSyncService:
             local.close()
 
     def sync_once(self, limit=50):
+        if not self._operation_lock.acquire(blocking=False):
+            return {"processed": 0, "synced": 0, "failed": 0, "busy": True}
+        started_at = time.perf_counter()
+        try:
+            return self._sync_once(limit=limit)
+        finally:
+            mark("sync.push", started_at)
+            self._operation_lock.release()
+
+    def _sync_once(self, limit=50):
         ensure_local_first_schema(self.db_path)
         local = connect(self.db_path)
         self._set_state(local, "last_attempt", now_iso())
@@ -612,6 +654,16 @@ class SupabaseSyncService:
             return default
 
     def pull_from_remote(self, progress=None, since=None):
+        if not self._operation_lock.acquire(blocking=False):
+            return {"ok": False, "busy": True, "rows": 0}
+        started_at = time.perf_counter()
+        try:
+            return self._pull_from_remote(progress=progress, since=since)
+        finally:
+            mark("sync.pull", started_at, delta=bool(since))
+            self._operation_lock.release()
+
+    def _pull_from_remote(self, progress=None, since=None):
         """Descarga datos de Supabase a la BD LOCAL (upsert por id).
 
         - since=None  -> descarga COMPLETA (se usa al iniciar sesión).

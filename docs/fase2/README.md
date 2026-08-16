@@ -1,11 +1,15 @@
 # Fase 2 — migración y saneamiento legacy
 
-**Estado:** FASE 2 SOFTWARE COMPLETE. PENDING DIG-X6266 HUMAN VERIFICATION.
+**Estado:** FASE 2 COMPLETA — SOFTWARE Y OPERACIÓN CERTIFICADOS.
 
 Fase 2G certificó sobre fixtures temporales la integración completa desde
 Excel/staging hasta APPLY, cola `BARCODE_PENDING`, doble scan, persistencia,
-read-back y restart. La certificación física definitiva sigue bloqueada hasta
-que un humano ejecute la prueba con el DIG-X6266 real.
+read-back y restart. La validación humana posterior certificó el DIG-X6266,
+el doble escaneo HID y la responsiveness local-first en escenarios online,
+offline y de reconexión.
+
+El cierre formal y la evidencia consolidada están en
+[FASE2_FINAL.md](FASE2_FINAL.md).
 
 Fase 2 comenzó después de cerrar técnicamente el gate de Fase 1. Su propósito
 es hacer explícito el drift de esquema y calidad de datos, introducir
@@ -40,7 +44,10 @@ autoridad ONLINE certificada de inventario.
 - [FASE2F.md](FASE2F.md): cierre de regularización operacional de barcodes.
 - [BARCODE_REGULARIZATION.md](BARCODE_REGULARIZATION.md): cola, doble scan,
   modo continuo, `package_role`, FRP y candidate Excel.
-- [DIG_X6266_MANUAL_TEST.md](DIG_X6266_MANUAL_TEST.md): prueba física pendiente.
+- [DIG_X6266_MANUAL_TEST.md](DIG_X6266_MANUAL_TEST.md): protocolo usado para la
+  prueba física, resultado final PASS.
+- [FASE2_FINAL.md](FASE2_FINAL.md): cierre software/operacional, DIG-X6266 PASS
+  y local-first responsiveness PASS.
 - [PRE_REAL_INVENTORY_CHECKLIST.md](PRE_REAL_INVENTORY_CHECKLIST.md): gate previo
   a cualquier inventario real.
 
@@ -66,8 +73,9 @@ en SQLite y PostgreSQL de laboratorio, sin importar el Excel ni cambiar stock.
 
 El entregable operativo es `plantillas/FERREPRO_Inventario_Maestro.xlsx`.
 Fue generado desde `ferreteria.db` en modo read-only con 141 productos y 300
-espacios para productos nuevos. El barcode físico permanece pendiente.
+espacios para productos nuevos. El barcode físico y el DIG-X6266 quedaron
+validados con resultado PASS.
 
-La finalización técnica de Fase 2 no significa que el inventario comercial se
-haya ejecutado. El primer inventario real será una operación posterior,
-controlada por el checklist y por autorización humana explícita.
+La finalización software/operacional de Fase 2 no significa que el inventario
+comercial se haya ejecutado. El primer inventario real será una operación
+posterior, controlada por el checklist y por autorización humana explícita.

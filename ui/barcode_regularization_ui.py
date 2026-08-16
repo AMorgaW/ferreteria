@@ -2,7 +2,7 @@
 """Pantalla operacional Fase 2F para regularización de barcodes."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QThreadPool
 from PySide6.QtGui import QColor, QCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -39,6 +39,9 @@ from services.barcode_regularization_service import (
 )
 from services.barcode_service import BarcodeSaveState
 from ui_config import COLORS, FONTS, make_font
+from ui.async_worker import FunctionWorker
+from performance_trace import mark
+import time
 
 
 class BarcodeRegularizationUI(QWidget):
@@ -56,6 +59,8 @@ class BarcodeRegularizationUI(QWidget):
         )
         self.trial = ScannerTrialSession()
         self._rows = []
+        self._thread_pool = QThreadPool.globalInstance()
+        self._refresh_seq = 0
         self._build_ui()
         self.refresh_queue()
 
@@ -269,13 +274,32 @@ class BarcodeRegularizationUI(QWidget):
         QTimer.singleShot(180, self.refresh_queue)
 
     def refresh_queue(self):
-        self.controller.queue_filter = self.filter_combo.currentText() or FILTER_ALL
-        self.controller.search = self.search_input.text()
+        queue_filter = self.filter_combo.currentText() or FILTER_ALL
+        search = self.search_input.text()
+        self.controller.queue_filter = queue_filter
+        self.controller.search = search
+        self._refresh_seq += 1
+        seq = self._refresh_seq
+        started_at = time.perf_counter()
+        worker = FunctionWorker(self.queue_repository.list_queue, queue_filter, search)
+        worker.signals.result.connect(
+            lambda rows, s=seq, started=started_at: self._apply_refreshed_queue(rows, s, started))
+        worker.signals.error.connect(self._refresh_queue_error)
+        self._thread_pool.start(worker)
+
+    def _refresh_queue_error(self, error):
+        self.operation_status.setText(f"ERROR DE COLA: {error}")
+
+    def _apply_refreshed_queue(self, rows, seq, started_at):
         try:
-            self._rows = self.controller.refresh_queue()
-        except Exception as exc:
-            self.operation_status.setText(f"ERROR DE COLA: {exc}")
+            self.table.objectName()
+        except RuntimeError:
             return
+        if seq != self._refresh_seq:
+            return
+        self._rows = list(rows)
+        self.controller.queue = self._rows
+        mark("ui.barcodes.load", started_at, gui_thread=True)
         selected_key = self.controller.current_item.key if self.controller.current_item else None
         self.table.blockSignals(True)
         self.table.setRowCount(len(self._rows))

@@ -9,6 +9,7 @@ from datetime import datetime
 import os
 from local_first_db import ensure_local_first_schema
 import schema_bootstrap
+from performance_trace import timed
 
 def obtener_fecha_actual():
     """Obtiene la fecha/hora actual en formato local (no UTC)"""
@@ -25,14 +26,15 @@ class DatabaseManager:
         # db_name se mantiene por compatibilidad con código existente pero no se usa
         self.db_name = db_name
         if not DatabaseManager._schema_initialized:
-            self.crear_estructura_completa()
-            self.crear_usuario_admin_default()
-            self.crear_usuario_empleado_default()
-            # Usar la MISMA base que pg_compat (LOCAL_DB_PATH), no una ruta
-            # relativa: si difieren, las migraciones/columnas de sync se
-            # aplicarían sobre el archivo equivocado.
-            from local_first_db import DEFAULT_DB_PATH as _LF_DB
-            ensure_local_first_schema(_LF_DB)
+            with timed("bootstrap.sqlite.total"):
+                self.crear_estructura_completa()
+                self.crear_usuario_admin_default()
+                self.crear_usuario_empleado_default()
+                # Usar la MISMA base que pg_compat (LOCAL_DB_PATH), no una ruta
+                # relativa: si difieren, las migraciones/columnas de sync se
+                # aplicarían sobre el archivo equivocado.
+                from local_first_db import DEFAULT_DB_PATH as _LF_DB
+                ensure_local_first_schema(_LF_DB)
             DatabaseManager._schema_initialized = True
 
     def conectar(self):
@@ -500,7 +502,8 @@ class DatabaseManager:
         ''')
 
         try:
-            schema_bootstrap.apply_engine_schema_fixes(conn)
+            with timed("bootstrap.sqlite.migrations"):
+                schema_bootstrap.apply_engine_schema_fixes(conn)
             self.insertar_categorias_predefinidas(cursor)
             conn.commit()
         except Exception:

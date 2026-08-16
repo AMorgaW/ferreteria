@@ -6,6 +6,9 @@ Punto de entrada principal – PySide6
 import sys
 import os
 import logging
+import time
+
+_PROCESS_STARTED_AT = time.perf_counter()
 
 # Logs Unicode-safe en consolas Windows (cp1252) y modo congelado sin consola.
 for _stream in (sys.stdout, sys.stderr):
@@ -49,6 +52,7 @@ from ui.widgets import make_line_icon
 from ui.async_worker import FunctionWorker
 from local_first_config import load_config
 from local_server_manager import LocalServerManager
+from performance_trace import mark, timed
 
 
 # ────────────────────────────────────────────────────────────
@@ -211,6 +215,7 @@ class SistemaFerreteriaApp(QMainWindow):
     """Aplicación principal del sistema"""
 
     def __init__(self, auth_manager=None, server_manager=None):
+        window_started_at = time.perf_counter()
         super().__init__()
         self.setWindowTitle("Sistema de Inventario - Ferretería Profesional")
         self.resize(1600, 900)
@@ -245,6 +250,8 @@ class SistemaFerreteriaApp(QMainWindow):
         # Reutiliza el manager que ya pudo haberse arrancado antes del login.
         self.local_server_manager = server_manager or LocalServerManager(self.local_first_config)
         self._servicios_retry = 0
+        self._sync_service = None
+        self._owns_sync_worker = False
 
         # ── Referencias a UIs para conectar callbacks ──
         self.ventas_ui_modern = None
@@ -264,9 +271,13 @@ class SistemaFerreteriaApp(QMainWindow):
             if _orig is None:
                 continue
 
-            def _wrap(*a, _orig=_orig, **k):
+            def _wrap(*a, _orig=_orig, _nombre=_nombre, **k):
                 self._seccion_actual_fn = _orig
-                return _orig(*a, **k)
+                started_at = time.perf_counter()
+                try:
+                    return _orig(*a, **k)
+                finally:
+                    mark(f"navigation.{_nombre}", started_at, gui_thread=True)
 
             setattr(self, _nombre, _wrap)
 
@@ -283,7 +294,7 @@ class SistemaFerreteriaApp(QMainWindow):
         self._alert_timer.start(60000)
 
         self._update_clock()
-        QTimer.singleShot(300, self._iniciar_servicios_local_first)
+        QTimer.singleShot(100, self._iniciar_servicios_local_first)
         QTimer.singleShot(800, self._auto_backup_async)
         QTimer.singleShot(500, self._preload_common_caches)
         QTimer.singleShot(1200, self._update_alert_count_async)
@@ -293,6 +304,7 @@ class SistemaFerreteriaApp(QMainWindow):
         # Default view by permission. Employees/sellers must enter directly
         # into POS and must not see the administrator dashboard.
         self._mostrar_vista_inicial()
+        mark("startup.main_window.created", window_started_at, gui_thread=True)
 
     # ── UI Construction ──────────────────────────────────────
     def _build_ui(self):
@@ -574,7 +586,7 @@ class SistemaFerreteriaApp(QMainWindow):
         bl = QHBoxLayout(bar)
         bl.setContentsMargins(15, 0, 15, 0)
 
-        self.status_label = QLabel("✓ Sistema listo")
+        self.status_label = QLabel("LOCAL READY · SQLite disponible")
         self.status_label.setStyleSheet(f"font-size: 8pt; color: {COLORS['success_dark']}; background: transparent;")
         bl.addWidget(self.status_label)
         bl.addStretch()
@@ -757,16 +769,17 @@ class SistemaFerreteriaApp(QMainWindow):
             return
         if not (self.local_first_config.get("cloud_sync_enabled", True)
                 and os.environ.get("SUPABASE_URI")):
-            self.status_label.setText("Modo local (sin sincronización con la nube)")
+            self.status_label.setText("LOCAL READY · OFFLINE (sync no configurado)")
             return
-        try:
-            from local_sync import get_service
-            from local_first_db import DEFAULT_DB_PATH
-            get_service(DEFAULT_DB_PATH).start_background()  # PUSH cada 10 s
-            self.status_label.setText(
-                "✓ Local-first activo — cambios se suben a Supabase cada 10 s")
-        except Exception as exc:
-            self.status_label.setText(f"⚠ Sincronización no disponible: {exc}")
+        self.status_label.setText("LOCAL READY · SYNCING en background")
+        mark("sync.start.requested", gui_thread=True)
+
+        # Resolver en background si el servidor local ya es el propietario del
+        # push. Solo se crea el worker in-app como fallback; nunca ambos.
+        worker = FunctionWorker(self._verificar_servicios_local_first)
+        worker.signals.result.connect(self._aplicar_estado_servicios)
+        worker.signals.error.connect(self._on_servicios_local_first_error)
+        self._thread_pool.start(worker)
 
         # ── PULL periódico: descarga automática de cambios de la nube ──
         if self._pull_timer is None:
@@ -778,8 +791,24 @@ class SistemaFerreteriaApp(QMainWindow):
             self._pull_timer.setInterval(max(15, seg) * 1000)
             self._pull_timer.timeout.connect(self._chequear_cambios_nube)
             self._pull_timer.start()
-            # Primer chequeo pronto (por si el admin ya hizo cambios recién).
-            QTimer.singleShot(8000, self._chequear_cambios_nube)
+            # Primer pull después de que la UI ya tuvo oportunidad de pintar.
+            QTimer.singleShot(0, self._chequear_cambios_nube)
+
+    def _start_in_app_sync_worker(self):
+        try:
+            from local_sync import get_service
+            from local_first_db import DEFAULT_DB_PATH
+            self._sync_service = get_service(DEFAULT_DB_PATH)
+            self._sync_service.start_background()
+            self._owns_sync_worker = True
+            return True
+        except Exception as exc:
+            self.status_label.setText(f"LOCAL READY · SYNC ERROR: {exc}")
+            return False
+
+    def _on_servicios_local_first_error(self, error):
+        self._start_in_app_sync_worker()
+        self.status_label.setText(f"LOCAL READY · OFFLINE / RETRYING: {error}")
 
     def _chequear_cambios_nube(self):
         """Descarga (en 2º plano) solo los cambios nuevos de Supabase. Si trae
@@ -806,11 +835,16 @@ class SistemaFerreteriaApp(QMainWindow):
 
     def _on_pull_delta_error(self, _err):
         self._pull_en_curso = False  # sin conexión: se reintenta luego
+        self.status_label.setText("LOCAL READY · OFFLINE / RETRYING")
 
     def _on_pull_delta(self, res):
         self._pull_en_curso = False
+        if res and res.get("busy"):
+            return
         if not (res and res.get("ok")):
+            self.status_label.setText("LOCAL READY · OFFLINE / RETRYING")
             return  # error/sin conexión → silencioso, se reintenta
+        self.status_label.setText("LOCAL READY · ONLINE")
         if res.get("rows", 0) > 0:
             # El pull escribió directo en SQLite (fuera de los repos): invalidar
             # los cachés en memoria para que la vista cargue los datos nuevos.
@@ -844,49 +878,40 @@ class SistemaFerreteriaApp(QMainWindow):
             print(f"[SYNC] No se pudo refrescar la sección: {exc}")
 
     def _verificar_servicios_local_first(self):
-        """(Hilo) Arranca el servidor si hace falta, espera a que responda y
-        comprueba la conectividad con Supabase. Nunca lanza excepción hacia la app."""
-        estado = self.local_server_manager.ensure_running(wait_ready=True, timeout=8.0)
+        """(Worker) Resuelve el propietario del push sin tocar el GUI thread."""
+        if self.local_first_config.get("auto_start_server", True):
+            estado = self.local_server_manager.ensure_running(wait_ready=True, timeout=8.0)
+        else:
+            estado = {"active": False, "url": None, "disabled": True}
         resultado = {
             "server": bool(estado.get("active")),
             "url": estado.get("url"),
             "sync_enabled": self.local_server_manager.sync_enabled(),
             "supabase": None,
         }
-        if resultado["server"] and resultado["sync_enabled"]:
-            try:
-                from local_sync import SupabaseSyncService
-                from local_first_db import DEFAULT_DB_PATH
-                resultado["supabase"] = SupabaseSyncService(
-                    db_path=DEFAULT_DB_PATH).test_connection()
-            except Exception as exc:
-                resultado["supabase"] = {"ok": False, "message": str(exc)}
         return resultado
 
     def _aplicar_estado_servicios(self, resultado):
-        """(Hilo UI) Traduce el estado a un mensaje claro y reintenta una vez
-        si el servidor no respondió. La app nunca se bloquea si Supabase falla."""
+        """(GUI) Publica estado y activa fallback in-app si falta el servidor."""
         if not resultado.get("server"):
-            if self._servicios_retry < 1:
-                self._servicios_retry += 1
-                self.status_label.setText("⚠ Servidor local no respondió, reintentando…")
-                QTimer.singleShot(1500, self._iniciar_servicios_local_first)
-            else:
-                self.status_label.setText(
-                    "⚠ Servidor local no disponible — operando en modo solo-local")
-                print("[LOCAL-FIRST] Servidor local no disponible; la app funciona localmente.")
+            self._start_in_app_sync_worker()
+            self.status_label.setText("LOCAL READY · OFFLINE / RETRYING")
+            print("[LOCAL-FIRST] Servidor local no disponible; sync in-app en background.")
             return
 
         if not resultado.get("sync_enabled"):
             msg = "✓ Servidor local activo · Sincronización deshabilitada en configuración"
         else:
-            supa = resultado.get("supabase") or {}
-            if supa.get("ok"):
-                msg = "✓ Servidor local y sincronización con Supabase activos"
-            else:
-                msg = "✓ Servidor local activo · Supabase sin conexión (se sincronizará al reconectar)"
+            msg = "LOCAL READY · SYNCING en background"
         self.status_label.setText(msg)
         print(f"[LOCAL-FIRST] {msg} · {resultado.get('url')}")
+
+    def closeEvent(self, event):
+        if self._pull_timer is not None:
+            self._pull_timer.stop()
+        if self._owns_sync_worker and self._sync_service is not None:
+            self._sync_service.stop(timeout=4.0)
+        super().closeEvent(event)
 
     def _update_alert_count_async(self):
         worker = FunctionWorker(self.alertas_service.contar_no_leidas)
@@ -1082,61 +1107,16 @@ _app_instance = None
 
 
 def _gate_supabase():
-    """Validación obligatoria de Supabase al iniciar (ETAPA 11).
-
-    Devuelve:
-      False -> Supabase OK, modo normal (lanza sync de pendientes).
-      True  -> Supabase caído, el usuario eligió MODO LOCAL DE EMERGENCIA
-               (luego solo un Administrador podrá ingresar).
-      None  -> el usuario eligió Salir.
-    """
-    from local_sync import SupabaseSyncService
-    while True:
-        svc = SupabaseSyncService()
-        try:
-            res = svc.validar_arranque()
-        except Exception as exc:
-            res = {"ok": False, "mensaje": f"Error validando Supabase: {exc}"}
-
-        if res.get("ok"):
-            # Conexión válida: sincronizar lo pendiente en segundo plano.
-            try:
-                import threading
-                threading.Thread(target=lambda: svc.sync_once(limit=1000),
-                                 daemon=True).start()
-            except Exception:
-                pass
-            return False
-
-        # Supabase no disponible: ventana de decisión.
-        box = QMessageBox()
-        box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle("Conexión con Supabase")
-        box.setText("No fue posible conectarse a Supabase.")
-        box.setInformativeText(
-            f"{res.get('mensaje','')}\n\n"
-            "El sistema puede continuar únicamente en MODO LOCAL DE EMERGENCIA.\n"
-            "Todos los cambios quedarán almacenados en SQLite y en la cola de "
-            "sincronización hasta recuperar la conexión (no se pierde nada).\n\n"
-            "Solo un usuario Administrador puede autorizar el modo local.")
-        b_retry = box.addButton("Reintentar conexión", QMessageBox.AcceptRole)
-        b_local = box.addButton("Trabajar en modo local (Admin)",
-                                QMessageBox.DestructiveRole)
-        b_exit = box.addButton("Salir", QMessageBox.RejectRole)
-        box.exec()
-        clic = box.clickedButton()
-        if clic is b_retry:
-            continue
-        if clic is b_local:
-            return True
-        return None
+    """Compatibilidad legacy: startup siempre continúa contra SQLite local."""
+    return False
 
 
 def _pull_inicial_desde_nube(modo_emergencia=False):
-    """Local-first: descarga los datos de Supabase a la BD local ANTES de abrir
-    la app, para arrancar con el estado de la nube. Muestra un diálogo de
-    progreso y corre el pull en un hilo (no congela). Si Supabase no responde,
-    continúa con los datos locales (no bloquea el ingreso)."""
+    """Programa el pull inicial sin modal, espera, join ni processEvents.
+
+    Se conserva como helper compatible; el flujo normal lo dispara desde la
+    ventana principal una vez que SQLite y la navegación ya están disponibles.
+    """
     try:
         cfg = load_config()
     except Exception:
@@ -1145,19 +1125,7 @@ def _pull_inicial_desde_nube(modo_emergencia=False):
     if (modo_emergencia or modo not in ("local", "sqlite", "server")
             or not cfg.get("cloud_sync_enabled", True)
             or not os.environ.get("SUPABASE_URI")):
-        return  # remoto/emergencia/sin credenciales → no hay pull
-
-    from PySide6.QtWidgets import QProgressDialog
-    import threading
-    dlg = QProgressDialog("Cargando datos de la nube…", None, 0, 0)
-    dlg.setWindowTitle("Sincronizando")
-    dlg.setWindowModality(Qt.ApplicationModal)
-    dlg.setCancelButton(None)
-    dlg.setMinimumDuration(0)
-    dlg.show()
-    QApplication.processEvents()
-
-    resultado = {}
+        return None  # remoto/emergencia/sin credenciales → no hay pull
 
     def _run():
         try:
@@ -1169,19 +1137,14 @@ def _pull_inicial_desde_nube(modo_emergencia=False):
             # descargarán lo que cambie DESPUÉS de esta carga inicial.
             if res.get("ok") and res.get("watermark"):
                 svc.set_pull_watermark(res["watermark"])
-            resultado.update(res)
+            return res
         except Exception as exc:
-            resultado.update({"ok": False, "error": str(exc)})
+            return {"ok": False, "error": str(exc)}
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    while t.is_alive():
-        QApplication.processEvents()
-        t.join(0.05)
-    dlg.close()
-    QApplication.processEvents()
-    if not resultado.get("ok"):
-        print(f"[PULL] No se pudo descargar de la nube: {resultado.get('error')}")
+    worker = FunctionWorker(_run)
+    worker.signals.error.connect(lambda error: print(f"[PULL] {error}"))
+    QThreadPool.globalInstance().start(worker)
+    return worker
 
 
 def show_login_and_run(reuse_app=False, server_manager=None, modo_emergencia=None):
@@ -1189,6 +1152,7 @@ def show_login_and_run(reuse_app=False, server_manager=None, modo_emergencia=Non
     if not reuse_app:
         _app_instance = QApplication(sys.argv)
         _app_instance.setStyleSheet(GLOBAL_QSS)
+        mark("startup.process_to_qapplication", _PROCESS_STARTED_AT, gui_thread=True)
 
     # ── Arranque temprano del servidor local (antes del login) ──
     # Solo en modo LOCAL/servidor LAN. En modo REMOTO (Supabase directo) no se
@@ -1206,8 +1170,9 @@ def show_login_and_run(reuse_app=False, server_manager=None, modo_emergencia=Non
             print(f"[LOCAL-FIRST] No se pudo iniciar el servidor temprano: {exc}")
 
     try:
-        db = DatabaseManager()
-        auth = AuthManager(db)
+        with timed("startup.bootstrap_and_auth", gui_thread=True):
+            db = DatabaseManager()
+            auth = AuthManager(db)
     except Exception as e:
         QMessageBox.critical(None, "Error de Conexión",
                              f"No se pudo conectar a la base de datos:\n\n{str(e)}\n\n"
@@ -1216,15 +1181,9 @@ def show_login_and_run(reuse_app=False, server_manager=None, modo_emergencia=Non
             sys.exit(1)
         return
 
-    # ── ETAPA 11: validación obligatoria de Supabase al iniciar ──
-    # Se ejecuta solo en el primer arranque (no en cada reintento de login).
+    # La disponibilidad remota nunca es prerequisite del login/local UI.
     if modo_emergencia is None:
-        decision = _gate_supabase()
-        if decision is None:          # el usuario eligió Salir
-            if not reuse_app:
-                sys.exit(0)
-            return
-        modo_emergencia = decision    # False = normal, True = emergencia local
+        modo_emergencia = False
 
     dialog = LoginDialog()
     if dialog.exec() != QDialog.Accepted:
@@ -1239,27 +1198,14 @@ def show_login_and_run(reuse_app=False, server_manager=None, modo_emergencia=Non
                            modo_emergencia=modo_emergencia)
         return
 
-    # En modo local de emergencia (Supabase caído) solo entra un Administrador;
-    # los empleados quedan bloqueados hasta recuperar la conexión.
-    if modo_emergencia and (getattr(usuario, 'rol', '') or '').upper() != 'ADMIN':
-        QMessageBox.warning(None, "Modo local de emergencia",
-                            "Supabase está desconectado. Solo un Administrador "
-                            "puede ingresar en modo local de emergencia.\n"
-                            "Contacte al administrador o reintente cuando haya "
-                            "conexión.")
-        show_login_and_run(reuse_app=True, server_manager=server_manager,
-                           modo_emergencia=modo_emergencia)
-        return
-
-    # Local-first: descargar el estado actual de la nube ANTES de abrir la app.
-    _pull_inicial_desde_nube(modo_emergencia)
-
-    window = SistemaFerreteriaApp(auth_manager=auth, server_manager=server_manager)
+    with timed("startup.open_main_window", gui_thread=True):
+        window = SistemaFerreteriaApp(auth_manager=auth, server_manager=server_manager)
     window.show()
+    QTimer.singleShot(0, lambda: mark("startup.first_ui_interactive", gui_thread=True))
     # Bienvenida no bloqueante (sin modal): el nombre/rol ya se ve en el header.
     try:
         window.status_label.setText(
-            f"✓ Sesión iniciada — {usuario.nombre_completo} ({usuario.rol})")
+            f"LOCAL READY · {usuario.nombre_completo} ({usuario.rol})")
     except Exception:
         pass
 
