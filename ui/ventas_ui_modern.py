@@ -16,6 +16,12 @@ from ui_config import COLORS, FONTS, ICONS, make_font
 from unidades_venta_manager import UnidadesVentaManager
 from ui.widgets import ShadowCard, ActionButton
 from ui.async_worker import FunctionWorker
+from services.pos_cart import (
+    PosCart,
+    PosCartError,
+    format_min_receipt,
+    pos_finalize_allowed,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -701,9 +707,10 @@ class VentasUIModern(QWidget):
         self.mezclas_service = mezclas_service
         self.callback_actualizar_caja = callback_actualizar_caja  # Callback para actualizar caja
 
-        self.carrito = []
+        self.pos_cart = PosCart()
         self.cliente_seleccionado = None
         self.productos_data = []
+        self._checkout_blocked_reason = None
 
         self.metodo_pago = "EFECTIVO"
         self.descuento_valor = 0.0
@@ -716,6 +723,14 @@ class VentasUIModern(QWidget):
 
         self._crear_ui()
         self.cargar_productos()
+
+    @property
+    def carrito(self):
+        return self.pos_cart.lines
+
+    @carrito.setter
+    def carrito(self, value):
+        self.pos_cart.replace_lines(value)
 
     # =====================================================================
     # UI CREATION
@@ -838,7 +853,7 @@ class VentasUIModern(QWidget):
         sc_layout.addWidget(search_title)
 
         self.search_entry = QLineEdit()
-        self.search_entry.setPlaceholderText("Buscar por nombre, código o marca…")
+        self.search_entry.setPlaceholderText("Escanear código o buscar por nombre / marca…")
         self.search_entry.setStyleSheet(f"""
             QLineEdit {{
                 font-size: 14pt; padding: 10px 14px;
@@ -920,10 +935,12 @@ class VentasUIModern(QWidget):
     def _crear_seccion_carrito(self, parent_layout):
         transparent = "background: transparent; border: none;"
 
-        # AUTORIZAR button
-        btn_autorizar = QPushButton("AUTORIZAR VENTA")
-        btn_autorizar.setCursor(QCursor(Qt.PointingHandCursor))
-        btn_autorizar.setStyleSheet(f"""
+        # AUTORIZAR button — no autoDefault: el ENTER del scanner HID no debe vender.
+        self.btn_autorizar = QPushButton("AUTORIZAR VENTA")
+        self.btn_autorizar.setCursor(QCursor(Qt.PointingHandCursor))
+        self.btn_autorizar.setAutoDefault(False)
+        self.btn_autorizar.setDefault(False)
+        self.btn_autorizar.setStyleSheet(f"""
             QPushButton {{
                 background: {COLORS['success']}; color: white;
                 border: none; padding: 12px;
@@ -931,9 +948,10 @@ class VentasUIModern(QWidget):
                 border-top-left-radius: 12px; border-top-right-radius: 12px;
             }}
             QPushButton:hover {{ background: {COLORS['success_dark']}; }}
+            QPushButton:disabled {{ background: #94a3b8; color: white; }}
         """)
-        btn_autorizar.clicked.connect(self.procesar_venta)
-        parent_layout.addWidget(btn_autorizar)
+        self.btn_autorizar.clicked.connect(self.procesar_venta)
+        parent_layout.addWidget(self.btn_autorizar)
 
         # Payment method
         self._crear_metodo_pago_section(parent_layout)
@@ -1249,23 +1267,19 @@ class VentasUIModern(QWidget):
         self.mostrar_productos(productos_filtrados)
 
     def agregar_por_codigo_rapido(self):
-        codigo = self.search_entry.text().strip()
-        if not codigo:
+        raw = self.search_entry.text()
+        if not raw or not str(raw).strip(" \t\r\n"):
             return
+        result = self.pos_cart.add_scan(self.productos_repo, raw)
+        self.search_entry.clear()
+        self.search_entry.setFocus(Qt.OtherFocusReason)
+        if not result.ok:
+            QMessageBox.warning(self, "No encontrado", result.error or "Código no resuelto")
+            return
+        self._actualizar_carrito_ui()
 
-        producto = self.productos_repo.obtener_por_codigo(codigo)
-        if not producto:
-            try:
-                producto = self.productos_repo.obtener_por_id(int(codigo))
-            except Exception:
-                pass
-
-        if producto:
-            self.mostrar_dialogo_cantidad_y_agregar(producto)
-            self.search_entry.clear()
-        else:
-            QMessageBox.warning(self, "No encontrado",
-                                f"No se encontró producto: {codigo}")
+    def _refocus_scanner(self):
+        self.search_entry.setFocus(Qt.OtherFocusReason)
 
     def mostrar_dialogo_cantidad_y_agregar(self, producto):
         if producto.get('stock', 0) == 0:
@@ -1280,21 +1294,13 @@ class VentasUIModern(QWidget):
             self.agregar_al_carrito(producto, dialogo.cantidad)
 
     def agregar_al_carrito(self, producto, cantidad=1):
-        prod_id = producto.get('id')
-        if prod_id is not None:
-            for item in self.carrito:
-                if not item.get('es_mezcla') and item['producto']['id'] == prod_id:
-                    item['cantidad'] += cantidad
-                    self._actualizar_carrito_ui()
-                    return
-
-        self.carrito.append({
-            'producto': producto,
-            'cantidad': cantidad,
-            'precio_unitario': producto.get('precio_venta', 0),
-            'descuento': 0,
-        })
+        try:
+            self.pos_cart.add_manual(producto, cantidad)
+        except PosCartError as exc:
+            QMessageBox.warning(self, "Cantidad inválida", str(exc))
+            return
         self._actualizar_carrito_ui()
+        self._refocus_scanner()
 
     def _actualizar_carrito_ui(self):
         # Clear
@@ -1382,13 +1388,19 @@ class VentasUIModern(QWidget):
         self._calcular_totales()
 
     def _calcular_totales(self):
-        subtotal = sum(it['cantidad'] * it['precio_unitario'] for it in self.carrito)
         try:
-            descuento_monto = float(self.descuento_entry.text() or 0)
+            descuento_monto = self.descuento_entry.text() or 0
+            subtotal, total = self.pos_cart.totals(descuento_monto)
         except Exception:
-            descuento_monto = 0
-
-        total = subtotal - descuento_monto
+            subtotal = sum(
+                (it.get('cantidad') or 0) * (it.get('precio_unitario') or 0)
+                for it in self.carrito
+            )
+            try:
+                descuento_monto = float(self.descuento_entry.text() or 0)
+            except Exception:
+                descuento_monto = 0
+            total = subtotal - descuento_monto
         self.subtotal_label.setText(f"${subtotal:,.0f}")
         self.total_label.setText(f"${total:,.0f}")
 
@@ -1399,13 +1411,18 @@ class VentasUIModern(QWidget):
         dialogo = DialogoCantidadModern(self, item['producto'], self.db_manager)
         dialogo.exec()
         if dialogo.cantidad:
-            item['cantidad'] = dialogo.cantidad
+            try:
+                self.pos_cart.set_quantity(idx, dialogo.cantidad)
+            except PosCartError as exc:
+                QMessageBox.warning(self, "Cantidad inválida", str(exc))
+                return
             self._actualizar_carrito_ui()
 
     def quitar_del_carrito(self, idx):
-        if idx >= len(self.carrito):
+        try:
+            self.pos_cart.remove_line(idx)
+        except PosCartError:
             return
-        del self.carrito[idx]
         self._actualizar_carrito_ui()
 
     def limpiar_carrito(self):
@@ -1452,9 +1469,24 @@ class VentasUIModern(QWidget):
     # PROCESAR VENTA
     # =====================================================================
 
+    def _set_checkout_busy(self, busy: bool, label: str = "AUTORIZAR VENTA"):
+        self.btn_autorizar.setEnabled(not busy)
+        self.btn_autorizar.setText("PROCESANDO..." if busy else label)
+
     def procesar_venta(self):
+        if self.pos_cart.checkout_in_flight:
+            return
         if not self.carrito:
             QMessageBox.warning(self, "Carrito vacío", "Agregue productos al carrito")
+            return
+
+        allowed, reason = pos_finalize_allowed(self.db_manager)
+        if not allowed:
+            QMessageBox.warning(
+                self,
+                "FINALIZAR bloqueado",
+                reason or "No se puede confirmar la venta sin autoridad central.",
+            )
             return
 
         try:
@@ -1476,121 +1508,138 @@ class VentasUIModern(QWidget):
                         return
 
             try:
-                descuento = float(self.descuento_entry.text() or 0)
+                descuento = self.descuento_entry.text() or 0
+                self.pos_cart.totals(descuento)
+            except PosCartError as exc:
+                QMessageBox.warning(self, "Totales inválidos", str(exc))
+                return
             except Exception:
                 descuento = 0
 
-            items = []
             mezclas_info = []
             for item in self.carrito:
-                if item.get('es_mezcla'):
-                    componentes = item.get('mezcla_componentes', [])
-                    precio_mezcla = item['precio_unitario'] * item['cantidad']
-                    costo_total_comps = sum(c.get('costo', 0) for c in componentes)
+                if not item.get('es_mezcla'):
+                    continue
+                componentes = item.get('mezcla_componentes', [])
+                nombre = item['producto']['nombre']
+                comps_desc = ', '.join(
+                    f"{c['producto_nombre']} ({c.get('cantidad_litros', c['cantidad']):.3f}L)"
+                    for c in componentes
+                )
+                mezclas_info.append(f"MEZCLA: {nombre} = [{comps_desc}]")
 
-                    for comp in componentes:
-                        if costo_total_comps > 0:
-                            proporcion = comp.get('costo', 0) / costo_total_comps
-                        else:
-                            proporcion = 1.0 / len(componentes) if componentes else 1.0
-
-                        precio_proporcional = (
-                            precio_mezcla * proporcion / comp['cantidad']
-                            if comp['cantidad'] > 0 else 0
-                        )
-
-                        items.append({
-                            'producto_id': comp['producto_id'],
-                            'cantidad': comp['cantidad'],
-                            'precio_unitario': precio_proporcional,
-                            'descuento': 0,
-                        })
-
-                    nombre = item['producto']['nombre']
-                    comps_desc = ', '.join(
-                        f"{c['producto_nombre']} ({c.get('cantidad_litros', c['cantidad']):.3f}L)"
-                        for c in componentes
-                    )
-                    mezclas_info.append(f"MEZCLA: {nombre} = [{comps_desc}]")
-                else:
-                    items.append({
-                        'producto_id': item['producto']['id'],
-                        'cantidad': item['cantidad'],
-                        'precio_unitario': item['precio_unitario'],
-                        'descuento': item.get('descuento', 0),
-                    })
-
+            items = self.pos_cart.to_sale_items()
             obs_mezcla = ' | '.join(mezclas_info) if mezclas_info else None
-
-            exito, mensaje, venta = self.ventas_service.registrar_venta(
-                items=items,
-                cliente_id=cliente_id,
-                metodo_pago=metodo_pago,
-                descuento_general=descuento,
-                observaciones=obs_mezcla,
+            cart_snapshot = [dict(item) for item in self.carrito]
+            cliente_nombre = (
+                self.cliente_seleccionado.nombre
+                if self.cliente_seleccionado else 'Cliente General'
             )
 
-            if exito:
-                self._checkout_act_id = None
-                detalles_impresion = []
-                for item in self.carrito:
-                    det = {
-                        'producto_nombre': item['producto'].get('nombre', 'Producto'),
-                        'cantidad': item['cantidad'],
-                        'precio_unitario': item['precio_unitario'],
-                        'subtotal': item['cantidad'] * item['precio_unitario'],
-                    }
-                    if item.get('es_mezcla'):
-                        det['es_mezcla'] = True
-                        comps = item.get('mezcla_componentes', [])
-                        det['mezcla_componentes'] = [
-                            f"{c['producto_nombre']} ({c.get('cantidad_litros', c['cantidad']):.3f}L)"
-                            for c in comps
-                        ]
-                        det['mezcla_volumen'] = sum(
-                            c.get('cantidad_litros', c['cantidad']) for c in comps
-                        )
-                    detalles_impresion.append(det)
+            if not self.pos_cart.begin_checkout():
+                return
+            self._set_checkout_busy(True)
 
-                venta_data_impresion = {
-                    'numero_factura': venta.numero_factura,
-                    'fecha': str(venta.fecha) if venta.fecha else '',
-                    'total': venta.total,
-                    'subtotal': venta.subtotal,
-                    'descuento': venta.descuento,
-                    'iva': getattr(venta, 'iva', 0) or 0,
-                    'metodo_pago': metodo_pago,
-                    'cliente_nombre': (
-                        self.cliente_seleccionado.nombre
-                        if self.cliente_seleccionado else 'Cliente General'
-                    ),
-                }
+            def _registrar():
+                return self.ventas_service.registrar_venta(
+                    items=items,
+                    cliente_id=cliente_id,
+                    metodo_pago=metodo_pago,
+                    descuento_general=descuento,
+                    observaciones=obs_mezcla,
+                )
 
-                self._mostrar_dialogo_venta_exitosa(venta_data_impresion, detalles_impresion)
-                self.nueva_venta()
-                self.cargar_productos()
-                # Notificar a caja para actualizar resumen
-                if self.callback_actualizar_caja:
-                    try:
-                        self.callback_actualizar_caja()
-                    except Exception as e:
-                        print(f"[VENTAS] Error al llamar callback actualizar caja: {e}")
-                self.venta_completada.emit()
-            else:
-                if mensaje and str(mensaje).startswith("INVENTORY_UNKNOWN"):
-                    QMessageBox.warning(
-                        self,
-                        "Inventario pendiente",
-                        "La venta no se confirmó en el coordinador. "
-                        "Reintente la misma operación; no cree otra venta.",
-                    )
-                    return
-                QMessageBox.critical(self, "Error", mensaje)
-
+            worker = FunctionWorker(_registrar)
+            worker.signals.result.connect(
+                lambda outcome: self._on_venta_resultado(
+                    outcome, metodo_pago, cart_snapshot, cliente_nombre
+                )
+            )
+            worker.signals.error.connect(self._on_venta_error)
+            self._thread_pool.start(worker)
         except Exception as e:
+            self.pos_cart.end_checkout()
+            self._set_checkout_busy(False)
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Error", f"Error al procesar venta: {str(e)}")
+
+    def _on_venta_error(self, mensaje):
+        self.pos_cart.end_checkout()
+        self._set_checkout_busy(False)
+        QMessageBox.critical(self, "Error", mensaje or "Error al procesar venta")
+
+    def _on_venta_resultado(self, outcome, metodo_pago, cart_snapshot, cliente_nombre):
+        try:
+            exito, mensaje, venta = outcome
+        except Exception:
+            self._on_venta_error("Resultado de venta ilegible")
+            return
+
+        if not exito:
+            self.pos_cart.end_checkout()
+            self._set_checkout_busy(False)
+            if mensaje and str(mensaje).startswith("INVENTORY_UNKNOWN"):
+                QMessageBox.warning(
+                    self,
+                    "Inventario pendiente",
+                    "La venta no se confirmó en el coordinador. "
+                    "Reintente la misma operación; no cree otra venta.",
+                )
+                return
+            QMessageBox.critical(self, "Error", mensaje)
+            return
+
+        self._checkout_act_id = None
+        detalles_impresion = []
+        for item in cart_snapshot:
+            det = {
+                'producto_nombre': item['producto'].get('nombre', 'Producto'),
+                'cantidad': item['cantidad'],
+                'precio_unitario': item['precio_unitario'],
+                'subtotal': item['cantidad'] * item['precio_unitario'],
+            }
+            if item.get('es_mezcla'):
+                det['es_mezcla'] = True
+                comps = item.get('mezcla_componentes', [])
+                det['mezcla_componentes'] = [
+                    f"{c['producto_nombre']} ({c.get('cantidad_litros', c['cantidad']):.3f}L)"
+                    for c in comps
+                ]
+                det['mezcla_volumen'] = sum(
+                    c.get('cantidad_litros', c['cantidad']) for c in comps
+                )
+            detalles_impresion.append(det)
+
+        venta_data_impresion = {
+            'sale_id': getattr(venta, 'id', None),
+            'numero_factura': venta.numero_factura,
+            'fecha': str(venta.fecha) if venta.fecha else '',
+            'total': venta.total,
+            'subtotal': venta.subtotal,
+            'descuento': venta.descuento,
+            'iva': getattr(venta, 'iva', 0) or 0,
+            'metodo_pago': metodo_pago,
+            'cliente_nombre': cliente_nombre,
+            'comprobante': format_min_receipt(
+                sale_id=getattr(venta, 'id', None),
+                fecha=str(venta.fecha) if venta.fecha else '',
+                lines=detalles_impresion,
+                total=venta.total,
+                numero_factura=venta.numero_factura,
+            ),
+        }
+
+        self._mostrar_dialogo_venta_exitosa(venta_data_impresion, detalles_impresion)
+        self.pos_cart.end_checkout()
+        self.nueva_venta()
+        self.cargar_productos()
+        if self.callback_actualizar_caja:
+            try:
+                self.callback_actualizar_caja()
+            except Exception as e:
+                print(f"[VENTAS] Error al llamar callback actualizar caja: {e}")
+        self.venta_completada.emit()
 
     # -- Diálogo venta exitosa -----------------------------------------------
 
@@ -1621,11 +1670,15 @@ class VentasUIModern(QWidget):
         total = venta_data.get('total', 0)
         metodo = venta_data.get('metodo_pago', 'EFECTIVO').replace('_', ' ')
 
+        sale_id = venta_data.get('sale_id', '')
         for text in [
             f"Factura: {numero}",
+            f"sale_id: {sale_id}" if sale_id not in (None, '') else None,
             f"Total: ${total:,.0f}",
             f"Método: {metodo}",
         ]:
+            if not text:
+                continue
             lbl = QLabel(text)
             bold = "font-weight: 500;" if "Total" in text else ""
             lbl.setStyleSheet(f"font-size: 11pt; {bold} {transparent}")
@@ -1684,15 +1737,17 @@ class VentasUIModern(QWidget):
                 self.nueva_venta()
 
     def nueva_venta(self):
-        self.carrito = []
+        self.pos_cart.clear()
         self.cliente_seleccionado = None
         self._checkout_act_id = None
         self.cliente_label.setText("Cliente General")
         self.descuento_entry.setText("0")
         self.metodo_pago = "EFECTIVO"
         self._actualizar_botones_metodo_pago()
+        self._set_checkout_busy(False)
         self._actualizar_carrito_ui()
         self.search_entry.clear()
+        self._refocus_scanner()
 
     # -- Mezcla pintura ------------------------------------------------------
 

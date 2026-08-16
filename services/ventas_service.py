@@ -103,13 +103,20 @@ class VentasService:
             cant = item.get('cantidad', 0)
             precio = item.get('precio_unitario', 0)
             desc = item.get('descuento', 0) or 0
-            if cant is None or cant <= 0:
+            try:
+                from decimal import Decimal as _Dec
+                cant_n = cant if not isinstance(cant, str) else _Dec(cant)
+                precio_n = precio if not isinstance(precio, str) else _Dec(precio)
+                desc_n = desc if not isinstance(desc, str) else _Dec(desc)
+            except Exception:
                 return False, "La cantidad de cada producto debe ser mayor a 0", None
-            if precio is None or precio < 0:
+            if cant_n is None or cant_n <= 0:
+                return False, "La cantidad de cada producto debe ser mayor a 0", None
+            if precio_n is None or precio_n < 0:
                 return False, "El precio unitario no puede ser negativo", None
-            if desc < 0:
+            if desc_n < 0:
                 return False, "El descuento no puede ser negativo", None
-            if desc > precio * cant:
+            if desc_n > precio_n * cant_n:
                 return False, "El descuento de un producto no puede superar su subtotal", None
 
         if descuento_general is None or descuento_general < 0:
@@ -497,6 +504,12 @@ class VentasService:
             bound_id = (
                 result.record.documento_local_id if result.record else None
             )
+            if not bound_id:
+                from inventory_ledger import get_inventory_command_or_none
+
+                existing_cmd = get_inventory_command_or_none(conn, command_id)
+                if existing_cmd is not None:
+                    bound_id = existing_cmd.documento_local_id
             if bound_id:
                 row = cursor.execute(
                     "SELECT * FROM ventas WHERE local_id = ?",

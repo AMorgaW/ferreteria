@@ -111,6 +111,9 @@ def _generar_contenido_factura(venta_data, detalles, nombre_negocio):
     L.append(_centrar32("FACTURA DE VENTA", W).strip())
     L.append(SEP.strip())
     L.append(f"Fact: {numero_factura}"[:W].strip())
+    sale_id = venta_data.get("sale_id")
+    if sale_id not in (None, ""):
+        L.append(f"ID: {sale_id}"[:W].strip())
     L.append(f"Fecha: {fecha}"[:W].strip())
     L.append(f"Pago: {metodo_display}"[:W].strip())
     L.append(SEP2.strip())
