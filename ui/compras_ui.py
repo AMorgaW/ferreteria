@@ -2258,6 +2258,24 @@ class VentanaDetallesCompra(QDialog):
             bw_layout.addStretch()
             estado = str(compra.get("estado") or "").upper()
             if estado in ("COMPLETADA", "COMPLETED"):
+                btn_print = QPushButton("Imprimir / PDF")
+                btn_print.setFont(make_font(FONTS['body']))
+                btn_print.setCursor(Qt.PointingHandCursor)
+                btn_print.setDefault(False)
+                btn_print.setAutoDefault(False)
+                btn_print.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {COLORS['primary']}; color: white;
+                        border: none; border-radius: 6px; padding: 10px 24px;
+                    }}
+                    QPushButton:hover {{ background: {COLORS['primary_dark']}; }}
+                """)
+                def _print_purchase():
+                    from ui.imprimir_factura import imprimir_por_identidad
+                    db = getattr(self.compras_repo, "db", None)
+                    imprimir_por_identidad(self, db, "PURCHASE", int(self.compra_id))
+                btn_print.clicked.connect(_print_purchase)
+                bw_layout.addWidget(btn_print)
                 btn_devolver = QPushButton("Devolver a proveedor")
                 btn_devolver.setFont(make_font(FONTS['body']))
                 btn_devolver.setCursor(Qt.PointingHandCursor)

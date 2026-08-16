@@ -1726,7 +1726,9 @@ class VentasUIModern(QWidget):
 
     def _imprimir_factura_venta(self, dialogo, venta_data, detalles):
         from ui.imprimir_factura import imprimir_factura
-        imprimir_factura(dialogo, venta_data, detalles)
+        imprimir_factura(
+            dialogo, venta_data, detalles, db=self.db_manager
+        )
 
     # -- Cancelar / Nueva venta ----------------------------------------------
 

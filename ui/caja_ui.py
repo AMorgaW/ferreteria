@@ -117,6 +117,19 @@ class CajaUI(QWidget):
         self.botones_layout.addWidget(self.btn_egreso)
         self.botones_layout.addWidget(self.btn_cerrar)
 
+        self.btn_reimprimir_cierre = QPushButton("Reimprimir último cierre")
+        self.btn_reimprimir_cierre.setFont(make_font(FONTS['body_bold']))
+        self.btn_reimprimir_cierre.setCursor(Qt.PointingHandCursor)
+        self.btn_reimprimir_cierre.setDefault(False)
+        self.btn_reimprimir_cierre.setAutoDefault(False)
+        self.btn_reimprimir_cierre.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
+            f"border-radius: 9px; padding: 12px 22px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
+        )
+        self.btn_reimprimir_cierre.clicked.connect(self.reimprimir_ultimo_cierre)
+        self.botones_layout.addWidget(self.btn_reimprimir_cierre)
+
         # Botón para historial de pagos a proveedores
         if self.abonos_repo:
             btn_historial = QPushButton("\U0001f4dc Historial de Pagos a Proveedores")
@@ -289,6 +302,17 @@ class CajaUI(QWidget):
         self.btn_abrir.setVisible(False)
         self.btn_egreso.setVisible(True)
         self.btn_cerrar.setVisible(es_admin)
+        last = self.caja_service.obtener_ultimo_cierre_usuario()
+        self.btn_reimprimir_cierre.setVisible(bool(last) and es_admin)
+
+    def reimprimir_ultimo_cierre(self):
+        cierre = self.caja_service.obtener_ultimo_cierre_usuario()
+        if not cierre:
+            QMessageBox.information(self, "Caja", "No hay un cierre para reimprimir.")
+            return
+        from ui.imprimir_factura import imprimir_por_identidad
+        identity = cierre.get("local_id") or cierre.get("id")
+        imprimir_por_identidad(self, self.caja_service.db, "CASH_CLOSE", identity)
 
     def mostrar_caja_cerrada(self):
         """Muestra estado de caja cerrada"""
@@ -306,6 +330,8 @@ class CajaUI(QWidget):
         self.btn_cerrar.setVisible(False)
         self.btn_egreso.setVisible(False)
         self.btn_abrir.setVisible(es_admin)
+        last = self.caja_service.obtener_ultimo_cierre_usuario()
+        self.btn_reimprimir_cierre.setVisible(bool(last) and es_admin)
 
     def actualizar_resumen(self):
         """Actualiza el resumen del día"""
@@ -872,6 +898,23 @@ class FormularioCierreCaja(QDialog):
 
         if exito:
             QMessageBox.information(self, "Éxito", mensaje)
+            ver = QMessageBox.question(
+                self,
+                "Comprobante",
+                "¿Ver comprobante de cierre?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ver == QMessageBox.Yes:
+                from ui.imprimir_factura import imprimir_por_identidad
+                last = self.caja_service.obtener_ultimo_cierre_usuario()
+                if last:
+                    imprimir_por_identidad(
+                        self,
+                        self.caja_service.db,
+                        "CASH_CLOSE",
+                        last.get("local_id") or last.get("id"),
+                    )
             if self.callback:
                 self.callback()
             self.accept()

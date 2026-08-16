@@ -245,9 +245,22 @@ class ReversalDialog(QDialog):
     def _on_done(self, result):
         self.cart.end_confirm()
         self._set_busy(False)
-        ok, msg, _rid = result
+        ok, msg, rid = result
         if ok:
             QMessageBox.information(self, "Reverso", msg)
+            if rid:
+                ver = QMessageBox.question(
+                    self,
+                    "Comprobante",
+                    "¿Ver comprobante operacional?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if ver == QMessageBox.Yes and self.db_manager is not None:
+                    from ui.imprimir_factura import imprimir_por_identidad
+                    imprimir_por_identidad(
+                        self, self.db_manager, self.kind, rid
+                    )
             self.accept()
             return
         QMessageBox.warning(self, "Reverso", msg)

@@ -319,6 +319,8 @@ class ReturnsService:
             )
             self._attach_reversal_cash(conn, reversal_id, refund_method)
             commit_legacy_inventory(conn)
+            from services.operational_balance import project_after_reversal
+            project_after_reversal(conn, doc)
             conn.commit()
             return True, "Reverso confirmado", reversal_id
         except Exception as exc:
@@ -532,6 +534,8 @@ class ReturnsService:
                 ),
             )
             self._attach_reversal_cash(conn, reversal_id, refund_method)
+            from services.operational_balance import project_after_reversal
+            project_after_reversal(conn, doc)
             conn.commit()
             return True, "Reverso confirmado", reversal_id
         except Exception as exc:

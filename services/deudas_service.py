@@ -1,225 +1,221 @@
 # -*- coding: utf-8 -*-
-"""
-Servicio de gestión de deudas en compras
-Proporciona cálculos y reportes de deudas por proveedor
-"""
-import pg_compat
-from typing import List, Dict
-from datetime import datetime, timedelta
-from models import ResumenDeuda
+"""Cuentas por pagar: lectura canónica local-first. No reescribe compras COMPLETED."""
+from decimal import Decimal
+from typing import Dict, List, Optional
+
+from services.operational_balance import (
+    add_aging,
+    compute_payable,
+    connect_local,
+    days_outstanding,
+    empty_aging,
+    list_payable_snapshots,
+    reconcile_payable,
+)
 
 
 class DeudasService:
     """Servicio para gestión y análisis de deudas en compras"""
-    
+
     def __init__(self, db_path: str):
-        pass  # db_path ignorado; se usa PostgreSQL
-    
+        self.db_path = db_path
+
+    def _connect(self):
+        return connect_local(self.db_path)
+
     def obtener_resumen_deudas(self) -> List[Dict]:
-        """
-        Obtiene resumen completo de deudas por proveedor
-        Incluye métricas de vencimiento y análisis de flujo
-        """
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT 
-                p.id as id_proveedor,
-                p.nombre as nombre_proveedor,
-                COALESCE(SUM(c.saldo_pendiente), 0) as total_deuda,
-                COUNT(CASE WHEN c.estado_pago != 'PAGADO' THEN 1 END) as facturas_pendientes,
-                COALESCE(SUM(CASE 
-                    WHEN (julianday('now') - julianday(c.fecha)) <= 30 AND c.estado_pago != 'PAGADO'
-                    THEN c.saldo_pendiente ELSE 0 END), 0) as deuda_30,
-                COALESCE(SUM(CASE 
-                    WHEN (julianday('now') - julianday(c.fecha)) BETWEEN 31 AND 60 AND c.estado_pago != 'PAGADO'
-                    THEN c.saldo_pendiente ELSE 0 END), 0) as deuda_60,
-                COALESCE(SUM(CASE 
-                    WHEN (julianday('now') - julianday(c.fecha)) > 60 AND c.estado_pago != 'PAGADO'
-                    THEN c.saldo_pendiente ELSE 0 END), 0) as deuda_90,
-                MIN(c.fecha) as factura_mas_antigua
-            FROM proveedores p
-            LEFT JOIN compras c ON p.id = c.proveedor_id
-            WHERE c.id IS NULL OR c.estado_pago != 'PAGADO' OR c.saldo_pendiente > 0
-            GROUP BY p.id, p.nombre
-            ORDER BY total_deuda DESC
-        ''')
-        
-        resultados = cursor.fetchall()
-        conn.close()
-        
-        return [
-            {
-                'id_proveedor': r[0],
-                'nombre_proveedor': r[1],
-                'total_deuda': r[2] or 0,
-                'facturas_pendientes': r[3] or 0,
-                'deuda_30': r[4] or 0,
-                'deuda_60': r[5] or 0,
-                'deuda_90': r[6] or 0,
-                'factura_mas_antigua': r[7],
-                'estado_vencimiento': self._calcular_vencimiento(r[6] or 0, r[7]),
-                'dias_antiguo': self._calcular_dias_antiguo(r[7]) if r[7] else 0
-            }
-            for r in resultados if r[2] > 0  # Solo proveedores con deuda
-        ]
-    
-    def obtener_deudas_proveedor(self, id_proveedor: int) -> Dict:
-        """Obtiene detalles de deuda de un proveedor específico"""
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        # Información general del proveedor
-        cursor.execute('''
-            SELECT nombre, nit, telefono, correo FROM proveedores WHERE id = ?
-        ''', (id_proveedor,))
-        
-        proveedor = cursor.fetchone()
-        
-        if not proveedor:
-            conn.close()
-            return None
-        
-        # Facturas pendientes
-        cursor.execute('''
-            SELECT 
-                id, numero_factura, fecha, total, monto_pagado, 
-                saldo_pendiente, estado_pago, tipo_compra
-            FROM compras
-            WHERE proveedor_id = ? AND estado_pago != 'PAGADO'
-            ORDER BY fecha ASC
-        ''', (id_proveedor,))
-        
-        facturas = [
-            {
-                'id': f[0],
-                'numero_factura': f[1],
-                'fecha': f[2],
-                'total': f[3],
-                'monto_pagado': f[4],
-                'saldo_pendiente': f[5],
-                'estado_pago': f[6],
-                'tipo_compra': f[7],
-                'dias_antiguo': self._calcular_dias_antiguo(f[2])
-            }
-            for f in cursor.fetchall()
-        ]
-        
-        conn.close()
-        
-        # Cálculos totales
-        total_deuda = sum(f['saldo_pendiente'] for f in facturas)
-        total_pagado = sum(f['monto_pagado'] for f in facturas)
-        
-        return {
-            'id_proveedor': id_proveedor,
-            'nombre': proveedor[0],
-            'nit': proveedor[1],
-            'telefono': proveedor[2],
-            'correo': proveedor[3],
-            'total_deuda': total_deuda,
-            'total_pagado': total_pagado,
-            'cantidad_facturas': len(facturas),
-            'facturas': facturas
-        }
-    
-    def obtener_totales_deudas(self) -> Dict:
-        """Obtiene totales globales de deudas"""
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT
-                COALESCE(SUM(saldo_pendiente), 0) as total_deuda_general,
-                COUNT(DISTINCT CASE WHEN saldo_pendiente > 0 THEN id END) as total_facturas_pendientes,
-                COUNT(DISTINCT proveedor_id) as total_proveedores,
-                COALESCE(SUM(CASE 
-                    WHEN (julianday('now') - julianday(fecha)) <= 30 AND estado_pago != 'PAGADO'
-                    THEN saldo_pendiente ELSE 0 END), 0) as deuda_30,
-                COALESCE(SUM(CASE 
-                    WHEN (julianday('now') - julianday(fecha)) BETWEEN 31 AND 60 AND estado_pago != 'PAGADO'
-                    THEN saldo_pendiente ELSE 0 END), 0) as deuda_60,
-                COALESCE(SUM(CASE 
-                    WHEN (julianday('now') - julianday(fecha)) > 60 AND estado_pago != 'PAGADO'
-                    THEN saldo_pendiente ELSE 0 END), 0) as deuda_90
-            FROM compras
-            WHERE estado_pago != 'PAGADO' OR saldo_pendiente > 0
-        ''')
-        
-        resultado = cursor.fetchone()
-        conn.close()
-        
-        return {
-            'total_deuda': resultado[0] or 0,
-            'facturas_pendientes': resultado[1] or 0,
-            'proveedores_con_deuda': resultado[2] or 0,
-            'deuda_30_dias': resultado[3] or 0,
-            'deuda_31_60_dias': resultado[4] or 0,
-            'deuda_91_mas_dias': resultado[5] or 0
-        }
-    
-    def obtener_facturas_vencidas(self, dias: int = 60) -> List[Dict]:
-        """
-        Obtiene facturas cuya deuda tiene más de X días sin pagar
-        Por defecto 60 días
-        """
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT 
-                c.id, c.numero_factura, p.nombre, c.fecha, c.total,
-                c.saldo_pendiente, c.tipo_compra,
-                CAST(julianday('now') - julianday(c.fecha) AS INTEGER) as dias_antiguo
-            FROM compras c
-            JOIN proveedores p ON c.proveedor_id = p.id
-            WHERE c.estado_pago != 'PAGADO' AND saldo_pendiente > 0
-                AND (julianday('now') - julianday(c.fecha)) > ?
-            ORDER BY c.fecha ASC
-        ''', (dias,))
-        
-        resultados = cursor.fetchall()
-        conn.close()
-        
-        return [
-            {
-                'id': r[0],
-                'numero_factura': r[1],
-                'proveedor': r[2],
-                'fecha': r[3],
-                'total': r[4],
-                'saldo_pendiente': r[5],
-                'tipo_compra': r[6],
-                'dias_antiguo': r[7]
-            }
-            for r in resultados
-        ]
-    
-    def _calcular_vencimiento(self, deuda_90: float, fecha_mas_antigua: str) -> str:
-        """Calcula el estado de vencimiento"""
-        if deuda_90 > 0:
-            return '[AVISO] VENCIDA (90+ días)'
-        elif fecha_mas_antigua:
-            dias = self._calcular_dias_antiguo(fecha_mas_antigua)
-            if dias > 60:
-                return '[AVISO] Próxima a vencer'
-            elif dias > 30:
-                return '⏳ En plazo'
-            else:
-                return '[OK] Al día'
-        return '[OK] Al día'
-    
-    def _calcular_dias_antiguo(self, fecha_str: str) -> int:
-        """Calcula cuántos días hace que es una fecha"""
+        conn = self._connect()
         try:
-            # Parsear fecha en formato ISO
-            if isinstance(fecha_str, str):
-                fecha = datetime.fromisoformat(fecha_str.replace('Z', '+00:00').split('+')[0])
-            else:
-                fecha = fecha_str
-            
-            dias = (datetime.now() - fecha).days
-            return max(0, dias)
+            grouped = {}
+            for compra, snap in list_payable_snapshots(conn):
+                if snap.balance <= 0:
+                    continue
+                pid = compra.get("proveedor_id")
+                key = pid if pid is not None else f"compra-{compra['id']}"
+                bucket = grouped.setdefault(
+                    key,
+                    {
+                        "id_proveedor": pid,
+                        "nombre_proveedor": compra.get("proveedor_nombre") or "Proveedor",
+                        "total_deuda": Decimal("0.00"),
+                        "facturas_pendientes": 0,
+                        "aging": empty_aging(),
+                        "factura_mas_antigua": compra.get("fecha"),
+                    },
+                )
+                bucket["total_deuda"] += snap.balance
+                bucket["facturas_pendientes"] += 1
+                days = days_outstanding(compra.get("fecha"))
+                add_aging(bucket["aging"], days, snap.balance)
+                antigua = bucket["factura_mas_antigua"]
+                if compra.get("fecha") and (not antigua or str(compra["fecha"]) < str(antigua)):
+                    bucket["factura_mas_antigua"] = compra.get("fecha")
+            resultados = []
+            for item in grouped.values():
+                aging = item["aging"]
+                resultados.append(
+                    {
+                        "id_proveedor": item["id_proveedor"],
+                        "nombre_proveedor": item["nombre_proveedor"],
+                        "total_deuda": item["total_deuda"],
+                        "facturas_pendientes": item["facturas_pendientes"],
+                        "deuda_30": aging["deuda_30"],
+                        "deuda_60": aging["deuda_60"],
+                        "deuda_90": aging["deuda_90"],
+                        "aging_0_30": aging["aging_0_30"],
+                        "aging_31_60": aging["aging_31_60"],
+                        "aging_61_90": aging["aging_61_90"],
+                        "aging_90_plus": aging["aging_90_plus"],
+                        "factura_mas_antigua": item["factura_mas_antigua"],
+                        "estado_vencimiento": self._calcular_vencimiento(
+                            aging["deuda_90"], item["factura_mas_antigua"]
+                        ),
+                        "dias_antiguo": days_outstanding(item["factura_mas_antigua"])
+                        if item["factura_mas_antigua"]
+                        else 0,
+                    }
+                )
+            resultados.sort(key=lambda r: r["total_deuda"], reverse=True)
+            return resultados
+        finally:
+            conn.close()
+
+    def obtener_deudas_proveedor(self, id_proveedor: int) -> Optional[Dict]:
+        conn = self._connect()
+        try:
+            proveedor_row = conn.execute(
+                "SELECT id, nombre, nit, telefono, correo FROM proveedores WHERE id = ?",
+                (id_proveedor,),
+            ).fetchone()
+            if not proveedor_row:
+                return None
+            proveedor = dict(proveedor_row)
+            facturas = []
+            creditos = []
+            for compra, snap in list_payable_snapshots(conn):
+                if compra.get("proveedor_id") != id_proveedor:
+                    continue
+                item = {
+                    "id": compra["id"],
+                    "numero_factura": compra.get("numero_factura"),
+                    "fecha": compra.get("fecha"),
+                    "total": snap.original,
+                    "monto_pagado": snap.payments,
+                    "saldo_pendiente": snap.balance,
+                    "credito_a_favor": snap.credit_balance,
+                    "credit_kind": snap.credit_kind,
+                    "reversals": snap.reversals,
+                    "net_obligation": snap.net_obligation,
+                    "estado_pago": snap.estado_pago,
+                    "tipo_compra": compra.get("tipo_compra"),
+                    "dias_antiguo": days_outstanding(compra.get("fecha")),
+                }
+                if snap.balance > 0:
+                    facturas.append(item)
+                elif snap.credit_balance > 0:
+                    creditos.append(item)
+            return {
+                "id_proveedor": id_proveedor,
+                "nombre": proveedor.get("nombre"),
+                "nit": proveedor.get("nit"),
+                "telefono": proveedor.get("telefono"),
+                "correo": proveedor.get("correo"),
+                "total_deuda": sum((f["saldo_pendiente"] for f in facturas), Decimal("0.00")),
+                "total_pagado": sum((f["monto_pagado"] for f in facturas), Decimal("0.00")),
+                "cantidad_facturas": len(facturas),
+                "facturas": facturas,
+                "creditos_a_favor": creditos,
+            }
+        finally:
+            conn.close()
+
+    def obtener_totales_deudas(self) -> Dict:
+        conn = self._connect()
+        try:
+            aging = empty_aging()
+            proveedores = set()
+            facturas = 0
+            total = Decimal("0.00")
+            for compra, snap in list_payable_snapshots(conn):
+                if snap.balance <= 0:
+                    continue
+                facturas += 1
+                total += snap.balance
+                if compra.get("proveedor_id") is not None:
+                    proveedores.add(compra["proveedor_id"])
+                add_aging(aging, days_outstanding(compra.get("fecha")), snap.balance)
+            return {
+                "total_deuda": total,
+                "facturas_pendientes": facturas,
+                "proveedores_con_deuda": len(proveedores),
+                "deuda_30_dias": aging["deuda_30"],
+                "deuda_31_60_dias": aging["deuda_60"],
+                "deuda_91_mas_dias": aging["deuda_90"],
+                "aging_0_30": aging["aging_0_30"],
+                "aging_31_60": aging["aging_31_60"],
+                "aging_61_90": aging["aging_61_90"],
+                "aging_90_plus": aging["aging_90_plus"],
+            }
+        finally:
+            conn.close()
+
+    def obtener_facturas_vencidas(self, dias: int = 60) -> List[Dict]:
+        conn = self._connect()
+        try:
+            resultados = []
+            for compra, snap in list_payable_snapshots(conn):
+                if snap.balance <= 0:
+                    continue
+                days = days_outstanding(compra.get("fecha"))
+                if days <= dias:
+                    continue
+                resultados.append(
+                    {
+                        "id": compra["id"],
+                        "numero_factura": compra.get("numero_factura"),
+                        "proveedor": compra.get("proveedor_nombre"),
+                        "fecha": compra.get("fecha"),
+                        "total": snap.original,
+                        "saldo_pendiente": snap.balance,
+                        "credito_a_favor": snap.credit_balance,
+                        "tipo_compra": compra.get("tipo_compra"),
+                        "dias_antiguo": days,
+                    }
+                )
+            return resultados
+        finally:
+            conn.close()
+
+    def obtener_saldo_compra(self, compra_id: int):
+        conn = self._connect()
+        try:
+            snap = compute_payable(conn, compra_id)
+            return None if snap is None else snap.as_dict()
+        finally:
+            conn.close()
+
+    def reconciliar_compra(self, compra_id: int):
+        conn = self._connect()
+        try:
+            snap = reconcile_payable(conn, compra_id)
+            conn.commit()
+            return snap.as_dict()
         except Exception:
-            return 0
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _calcular_vencimiento(self, deuda_90, fecha_mas_antigua: str) -> str:
+        if deuda_90 and deuda_90 > 0:
+            return "[AVISO] VENCIDA (90+ días)"
+        if fecha_mas_antigua:
+            dias = days_outstanding(fecha_mas_antigua)
+            if dias > 60:
+                return "[AVISO] Próxima a vencer"
+            if dias > 30:
+                return "⏳ En plazo"
+        return "[OK] Al día"
+
+    def _calcular_dias_antiguo(self, fecha_str: str) -> int:
+        return days_outstanding(fecha_str)

@@ -3,84 +3,118 @@
 Repositorio para gestión de abonos en ventas
 Maneja la persistencia de cobros parciales a facturas de clientes
 """
-import pg_compat
 from typing import List, Dict, Optional
 from models import AbonoVenta
+from services.operational_balance import connect_local
 
 
 class AbonosVentasRepository:
     """Repositorio para gestión de abonos a facturas de venta"""
     
     def __init__(self, db_path: str):
-        pass  # db_path ignorado; se usa PostgreSQL
+        self.db_path = db_path
     
     def crear_abono(self, abono: AbonoVenta) -> int:
         """
-        Registra un abono (cobro) a una factura de venta
-        Returns: ID del abono creado
+        Registra un abono (cobro) a una factura de venta.
+        Identidad durable: local_id UUID. Retry same identity → mismo efecto.
         """
-        conn = pg_compat.connect()
+        from local_first_db import ensure_local_id
+        from repositories._outbox import encolar
+        from services.caja_service import attach_customer_payment_cash_effect
+        from services.operational_balance import (
+            PaymentError,
+            assert_payment_allowed,
+            begin_immediate,
+            compute_receivable,
+            connect_local,
+            durable_payment_id,
+            find_payment_by_local_id,
+            project_receivable,
+        )
+
+        conn = connect_local(self.db_path)
         cursor = conn.cursor()
-        
         try:
-            cursor.execute('''
-                INSERT INTO abonos_ventas 
-                (id_venta, monto_abono, fecha_abono, tipo_pago, 
-                 numero_comprobante, usuario, observaciones)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                abono.id_venta,
-                abono.monto_abono,
-                abono.fecha_abono,
-                abono.tipo_pago,
-                abono.numero_comprobante,
-                abono.usuario,
-                abono.observaciones
-            ))
-            
+            begin_immediate(conn)
+            local_id = durable_payment_id(getattr(abono, "local_id", None))
+            existing = find_payment_by_local_id(conn, "abonos_ventas", local_id)
+            if existing:
+                cash_ok, cash_message, _cash_id = attach_customer_payment_cash_effect(
+                    conn,
+                    abono_id=existing["id"],
+                    tipo_pago=existing.get("tipo_pago") or abono.tipo_pago,
+                    monto=existing.get("monto_abono") or abono.monto_abono,
+                    usuario=abono.usuario,
+                    source_identity=local_id,
+                )
+                if not cash_ok:
+                    raise RuntimeError(cash_message)
+                project_receivable(conn, abono.id_venta)
+                conn.commit()
+                return existing["id"]
+
+            snap = compute_receivable(conn, abono.id_venta)
+            if not snap:
+                raise PaymentError("NOT_FOUND", "Venta no encontrada")
+            monto = assert_payment_allowed(snap, abono.monto_abono)
+            monto_txt = format(monto, "f")
+
+            try:
+                cursor.execute(
+                    '''
+                    INSERT INTO abonos_ventas
+                    (id_venta, monto_abono, fecha_abono, tipo_pago,
+                     numero_comprobante, usuario, observaciones, local_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        abono.id_venta,
+                        monto_txt,
+                        abono.fecha_abono,
+                        abono.tipo_pago,
+                        abono.numero_comprobante,
+                        abono.usuario,
+                        abono.observaciones,
+                        local_id,
+                    ),
+                )
+            except Exception as exc:
+                if "UNIQUE" in str(exc).upper() or "local_id" in str(exc).lower():
+                    row = find_payment_by_local_id(conn, "abonos_ventas", local_id)
+                    if row:
+                        conn.commit()
+                        return row["id"]
+                raise
+
             abono_id = cursor.lastrowid
-
-            # NOTA: antes se insertaba un movimiento 'COBRO_CREDITO' con
-            # producto_id=-1 como marcador. Eso violaba la FK movimientos→productos
-            # (con foreign_keys=ON rompía el registro del abono) y la UI de
-            # movimientos lo filtraba en todos lados, por lo que no aportaba nada.
-            # El abono queda registrado en abonos_ventas (fuente de verdad) y el
-            # estado de la venta se actualiza abajo; no es un movimiento de
-            # inventario, así que ya no se inserta en 'movimientos'.
-
-            # Actualizar estado de la venta automáticamente
-            self._actualizar_estado_venta(cursor, abono.id_venta)
-
-            # Local-first: encolar el abono y la venta (estado/saldo) a Supabase.
-            # (El movimiento COBRO_CREDITO usa producto_id=-1 y no se sincroniza.)
-            from repositories._outbox import encolar
+            ensure_local_id(conn, "abonos_ventas", abono_id)
+            project_receivable(conn, abono.id_venta)
             encolar(conn, "sale_payment", abono_id, "create", "abonos_ventas")
             encolar(conn, "sale", abono.id_venta, "update", "ventas")
-
-            from services.caja_service import attach_customer_payment_cash_effect
 
             cash_ok, cash_message, _cash_id = attach_customer_payment_cash_effect(
                 conn,
                 abono_id=abono_id,
                 tipo_pago=abono.tipo_pago,
-                monto=abono.monto_abono,
+                monto=monto_txt,
                 usuario=abono.usuario,
+                source_identity=local_id,
             )
             if not cash_ok:
                 raise RuntimeError(cash_message)
 
             conn.commit()
             return abono_id
-            
-        except Exception as e:
+        except Exception:
             conn.rollback()
-            raise e
+            raise
         finally:
             conn.close()
     
     def obtener_abonos_factura(self, id_venta: int) -> List[Dict]:
         """Obtiene todos los abonos de una factura"""
-        conn = pg_compat.connect()
+        conn = connect_local(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -110,24 +144,20 @@ class AbonosVentasRepository:
             for a in abonos
         ]
     
-    def obtener_total_abonado(self, id_venta: int) -> float:
-        """Obtiene el total abonado a una factura"""
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT COALESCE(SUM(monto_abono), 0) FROM abonos_ventas 
-            WHERE id_venta = ?
-        ''', (id_venta,))
-        
-        total = cursor.fetchone()[0]
-        conn.close()
-        
-        return total
+    def obtener_total_abonado(self, id_venta: int):
+        """Obtiene el total abonado a una factura (Decimal canónico)."""
+        from services.operational_balance import compute_receivable, connect_local
+
+        conn = connect_local(self.db_path)
+        try:
+            snap = compute_receivable(conn, id_venta)
+            return snap.payments if snap else 0
+        finally:
+            conn.close()
     
     def eliminar_abono(self, id_abono: int) -> bool:
         """Elimina un abono (solo si se necesita corregir)"""
-        conn = pg_compat.connect()
+        conn = connect_local(self.db_path)
         cursor = conn.cursor()
         
         try:
@@ -161,42 +191,10 @@ class AbonosVentasRepository:
             conn.close()
     
     def _actualizar_estado_venta(self, cursor, id_venta: int):
-        """
-        Actualiza el estado y saldo pendiente de una venta
-        basado en los abonos registrados (INTERNA)
-        """
-        # Obtener total abonado
-        cursor.execute('''
-            SELECT COALESCE(SUM(monto_abono), 0) FROM abonos_ventas 
-            WHERE id_venta = ?
-        ''', (id_venta,))
-        total_abonado = cursor.fetchone()[0]
-        
-        # Obtener monto total de la factura
-        cursor.execute('''
-            SELECT total FROM ventas WHERE id = ?
-        ''', (id_venta,))
-        resultado = cursor.fetchone()
-        
-        if not resultado:
-            return
-        
-        total_factura = resultado[0]
-        
-        # Calcular estado
-        if total_abonado == 0:
-            estado_pago = 'PENDIENTE'
-        elif total_abonado >= total_factura:
-            estado_pago = 'PAGADO'
-        else:
-            estado_pago = 'PARCIAL'
-        
-        # Actualizar venta
-        cursor.execute('''
-            UPDATE ventas 
-            SET estado_pago = ?, monto_pagado = ?
-            WHERE id = ?
-        ''', (estado_pago, total_abonado, id_venta))
+        """Proyección idempotente desde el saldo canónico (reversos + abonos)."""
+        from services.operational_balance import project_receivable
+
+        project_receivable(cursor.connection, id_venta)
     
     def obtener_abonos_por_usuario(self, usuario: str, 
                                   fecha_inicio: str = None, 
@@ -205,7 +203,7 @@ class AbonosVentasRepository:
         Obtiene los abonos registrados por un usuario en un rango de fechas
         Útil para auditoría
         """
-        conn = pg_compat.connect()
+        conn = connect_local(self.db_path)
         cursor = conn.cursor()
         
         query = '''

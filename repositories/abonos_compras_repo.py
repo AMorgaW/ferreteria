@@ -3,10 +3,10 @@
 Repositorio para gestión de abonos en compras
 Maneja la persistencia de pagos parciales a facturas de proveedores
 """
-import pg_compat
 from typing import List, Dict, Optional
 from datetime import datetime
 from models import Abono
+from services.operational_balance import connect_local
 
 
 def _row_value(row, key, index, default=None):
@@ -32,36 +32,9 @@ def _obtener_caja_abierta_id(cursor):
 
 
 def _actualizar_estado_compra_en_cursor(cursor, id_compra: int):
-    cursor.execute('''
-        SELECT COALESCE(SUM(monto_abono), 0) FROM abonos_compras
-        WHERE id_compra = ?
-    ''', (id_compra,))
-    total_abonado = cursor.fetchone()[0]
+    from services.operational_balance import project_payable
 
-    cursor.execute('''
-        SELECT total FROM compras WHERE id = ?
-    ''', (id_compra,))
-    resultado = cursor.fetchone()
-
-    if not resultado:
-        return
-
-    monto_total = resultado[0]
-
-    if total_abonado >= monto_total:
-        estado = 'PAGADO'
-    elif total_abonado > 0:
-        estado = 'PARCIAL'
-    else:
-        estado = 'PENDIENTE'
-
-    saldo = max(0, monto_total - total_abonado)
-
-    cursor.execute('''
-        UPDATE compras
-        SET estado_pago = ?, monto_pagado = ?, saldo_pendiente = ?
-        WHERE id = ?
-    ''', (estado, total_abonado, saldo, id_compra))
+    project_payable(cursor.connection, id_compra)
 
 
 def _normalizar_fecha_egreso(fecha):
@@ -120,29 +93,78 @@ def _crear_egreso_pago_proveedor(cursor, conn, abono_id: int, id_compra: int,
 
 
 def registrar_abono_compra_en_transaccion(conn, cursor, abono: Abono) -> int:
-    cursor.execute('''
-        INSERT INTO abonos_compras
-        (id_compra, monto_abono, fecha_abono, tipo_pago,
-         numero_comprobante, usuario, observaciones)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        abono.id_compra,
-        abono.monto_abono,
-        abono.fecha_abono,
-        abono.tipo_pago,
-        abono.numero_comprobante,
-        abono.usuario,
-        abono.observaciones
-    ))
+    from local_first_db import ensure_local_id
+    from services.caja_service import attach_supplier_payment_cash_effect
+    from services.operational_balance import (
+        PaymentError,
+        assert_payment_allowed,
+        begin_immediate,
+        compute_payable,
+        durable_payment_id,
+        find_payment_by_local_id,
+        project_payable,
+    )
+
+    begin_immediate(conn)
+    local_id = durable_payment_id(getattr(abono, "local_id", None))
+    existing = find_payment_by_local_id(conn, "abonos_compras", local_id)
+    if existing:
+        cash_ok, cash_message, _cash_id = attach_supplier_payment_cash_effect(
+            conn,
+            abono_id=existing["id"],
+            tipo_pago=existing.get("tipo_pago") or abono.tipo_pago,
+            monto=existing.get("monto_abono") or abono.monto_abono,
+            usuario=abono.usuario,
+            descripcion=f"Pago proveedor compra #{abono.id_compra} abono #{existing['id']}",
+            source_identity=local_id,
+        )
+        if not cash_ok:
+            raise RuntimeError(cash_message)
+        project_payable(conn, abono.id_compra)
+        return existing["id"]
+
+    snap = compute_payable(conn, abono.id_compra)
+    if not snap:
+        raise PaymentError("NOT_FOUND", "Compra no encontrada")
+    monto = assert_payment_allowed(snap, abono.monto_abono)
+    monto_txt = format(monto, "f")
+
+    try:
+        cursor.execute(
+            '''
+            INSERT INTO abonos_compras
+            (id_compra, monto_abono, fecha_abono, tipo_pago,
+             numero_comprobante, usuario, observaciones, local_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                abono.id_compra,
+                monto_txt,
+                abono.fecha_abono,
+                abono.tipo_pago,
+                abono.numero_comprobante,
+                abono.usuario,
+                abono.observaciones,
+                local_id,
+            ),
+        )
+    except Exception as exc:
+        if "UNIQUE" in str(exc).upper() or "local_id" in str(exc).lower():
+            row = find_payment_by_local_id(conn, "abonos_compras", local_id)
+            if row:
+                return row["id"]
+        raise
 
     abono_id = cursor.lastrowid
+    ensure_local_id(conn, "abonos_compras", abono_id)
+    project_payable(conn, abono.id_compra)
 
     _crear_egreso_pago_proveedor(
         cursor,
         conn,
         abono_id,
         abono.id_compra,
-        abono.monto_abono,
+        monto_txt,
         abono.tipo_pago,
         abono.usuario,
         abono.numero_comprobante,
@@ -150,20 +172,17 @@ def registrar_abono_compra_en_transaccion(conn, cursor, abono: Abono) -> int:
         abono.fecha_abono
     )
 
-    from services.caja_service import attach_supplier_payment_cash_effect
-
     cash_ok, cash_message, _cash_id = attach_supplier_payment_cash_effect(
         conn,
         abono_id=abono_id,
         tipo_pago=abono.tipo_pago,
-        monto=abono.monto_abono,
+        monto=monto_txt,
         usuario=abono.usuario,
         descripcion=f"Pago proveedor compra #{abono.id_compra} abono #{abono_id}",
+        source_identity=local_id,
     )
     if not cash_ok:
         raise RuntimeError(cash_message)
-
-    _actualizar_estado_compra_en_cursor(cursor, abono.id_compra)
 
     from repositories._outbox import encolar
     encolar(conn, "purchase_payment", abono_id, "create", "abonos_compras")
@@ -173,7 +192,7 @@ def registrar_abono_compra_en_transaccion(conn, cursor, abono: Abono) -> int:
 
 
 def reconciliar_pagos_proveedor_huerfanos() -> dict:
-    conn = pg_compat.connect()
+    conn = connect_local()
     cursor = conn.cursor()
     creados = {'abonos': 0, 'egresos': 0}
 
@@ -209,45 +228,8 @@ def reconciliar_pagos_proveedor_huerfanos() -> dict:
             )
             creados['egresos'] += 1
 
-        cursor.execute('''
-            SELECT c.id, c.monto_pagado, c.fecha, c.usuario_id,
-                   COALESCE(SUM(a.monto_abono), 0) AS total_abonos
-            FROM compras c
-            LEFT JOIN abonos_compras a ON a.id_compra = c.id
-            WHERE COALESCE(c.monto_pagado, 0) > 0
-            GROUP BY c.id, c.monto_pagado, c.fecha, c.usuario_id
-            HAVING COALESCE(c.monto_pagado, 0) > COALESCE(SUM(a.monto_abono), 0)
-        ''')
-        compras = cursor.fetchall()
-
-        for row in compras:
-            id_compra = _row_value(row, 'id', 0)
-            monto_pagado = float(_row_value(row, 'monto_pagado', 1) or 0)
-            total_abonos = float(_row_value(row, 'total_abonos', 4) or 0)
-            diferencia = monto_pagado - total_abonos
-            if diferencia <= 0:
-                continue
-
-            usuario = 'Sistema'
-            usuario_id = _row_value(row, 'usuario_id', 3)
-            if usuario_id:
-                cursor.execute("SELECT username FROM usuarios WHERE id = ?", (usuario_id,))
-                usuario_row = cursor.fetchone()
-                if usuario_row:
-                    usuario = _row_value(usuario_row, 'username', 0, 'Sistema')
-
-            abono = Abono(
-                id_compra=id_compra,
-                monto_abono=diferencia,
-                fecha_abono=_normalizar_fecha_egreso(_row_value(row, 'fecha', 2)),
-                tipo_pago='Efectivo',
-                numero_comprobante=None,
-                usuario=usuario,
-                observaciones='Pago histórico registrado en compra'
-            )
-            registrar_abono_compra_en_transaccion(conn, cursor, abono)
-            creados['abonos'] += 1
-            creados['egresos'] += 1
+        # monto_pagado/saldo_pendiente son proyección. No se materializan
+        # abonos nuevos desde esa cache: la autoridad es abonos_compras.
 
         conn.commit()
         return creados
@@ -262,14 +244,16 @@ class AbonosaComprasRepository:
     """Repositorio para gestión de abonos a facturas de compra"""
     
     def __init__(self, db_path: str):
-        pass  # db_path ignorado; se usa PostgreSQL
+        self.db_path = db_path
     
     def crear_abono(self, abono: Abono) -> int:
         """
         Registra un abono a una factura
         Returns: ID del abono creado
         """
-        conn = pg_compat.connect()
+        from services.operational_balance import connect_local
+
+        conn = connect_local(self.db_path)
         cursor = conn.cursor()
         
         try:
@@ -285,7 +269,7 @@ class AbonosaComprasRepository:
     
     def obtener_abonos_factura(self, id_compra: int) -> List[Dict]:
         """Obtiene todos los abonos de una factura"""
-        conn = pg_compat.connect()
+        conn = connect_local(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -315,24 +299,20 @@ class AbonosaComprasRepository:
             for a in abonos
         ]
     
-    def obtener_total_abonado(self, id_compra: int) -> float:
-        """Obtiene el total abonado a una factura"""
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT COALESCE(SUM(monto_abono), 0) FROM abonos_compras 
-            WHERE id_compra = ?
-        ''', (id_compra,))
-        
-        total = cursor.fetchone()[0]
-        conn.close()
-        
-        return total
+    def obtener_total_abonado(self, id_compra: int):
+        """Obtiene el total abonado a una factura (Decimal canónico)."""
+        from services.operational_balance import compute_payable
+
+        conn = connect_local(self.db_path)
+        try:
+            snap = compute_payable(conn, id_compra)
+            return snap.payments if snap else 0
+        finally:
+            conn.close()
     
     def eliminar_abono(self, id_abono: int) -> bool:
         """Elimina un abono (solo si se necesita corregir)"""
-        conn = pg_compat.connect()
+        conn = connect_local(self.db_path)
         cursor = conn.cursor()
         
         try:
@@ -363,7 +343,7 @@ class AbonosaComprasRepository:
                                   fecha_inicio: str = None, 
                                   fecha_fin: str = None) -> List[Dict]:
         """Obtiene abonos registrados por un usuario en un rango de fechas"""
-        conn = pg_compat.connect()
+        conn = connect_local(self.db_path)
         cursor = conn.cursor()
         
         query = '''
@@ -419,7 +399,7 @@ class AbonosaComprasRepository:
         Returns:
             Lista de abonos con información de compra y proveedor
         """
-        conn = pg_compat.connect()
+        conn = connect_local(self.db_path)
         # pg_compat usa DictCursor automaticamente
         cursor = conn.cursor()
         
@@ -466,7 +446,7 @@ class AbonosaComprasRepository:
         Returns:
             Lista de compras con sus abonos más recientes
         """
-        conn = pg_compat.connect()
+        conn = connect_local(self.db_path)
         # pg_compat usa DictCursor automaticamente
         cursor = conn.cursor()
         

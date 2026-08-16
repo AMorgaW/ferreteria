@@ -1994,27 +1994,11 @@ class MovimientosUI(QWidget):
 
     def _imprimir_factura_desde_detalle(self, ventana_padre, num_factura):
         try:
-            movimientos = self.movimientos_service.obtener_historial(limite=1000)
-            items_factura = [
-                m for m in movimientos
-                if m.get('num_factura') == num_factura
-                and m.get('tipo') != 'COBRO_CREDITO'
-            ]
-            if not items_factura:
-                QMessageBox.warning(
-                    ventana_padre,
-                    "Sin datos",
-                    f"No se encontraron productos para imprimir la factura {num_factura}"
-                )
-                return
-            total_factura = sum(item.get('costo_total') or 0 for item in items_factura)
-            self._imprimir_factura_movimiento(
-                ventana_padre, num_factura, items_factura, total_factura
-            )
+            from ui.imprimir_factura import imprimir_por_identidad
+            imprimir_por_identidad(ventana_padre, self.db_manager, "SALE", num_factura)
         except Exception as e:
             QMessageBox.critical(
-                ventana_padre,
-                "Error",
+                self, "Error",
                 f"No se pudo imprimir la factura:\n{str(e)}"
             )
 
@@ -2872,54 +2856,8 @@ class MovimientosUI(QWidget):
     def _imprimir_factura_movimiento(self, ventana_padre, num_factura, items_factura, total_factura):
         """Imprime una factura desde la sección de movimientos"""
         try:
-            from ui.imprimir_factura import imprimir_factura
-            from services.ventas_service import VentasService
-
-            ventas_service = VentasService(self.db_manager, self.productos_repo,
-                                          self.clientes_repo, self.auth)
-            venta = ventas_service.obtener_venta_por_factura(num_factura)
-
-            if venta and venta.get('detalles'):
-                venta_data = {
-                    'numero_factura': num_factura,
-                    'fecha': venta.get('fecha', ''),
-                    'total': venta.get('total', total_factura),
-                    'subtotal': venta.get('subtotal', total_factura),
-                    'descuento': venta.get('descuento', 0),
-                    'metodo_pago': venta.get('metodo_pago', 'EFECTIVO'),
-                    'cliente_nombre': venta.get('cliente_nombre', 'Cliente General'),
-                    'vendedor': venta.get('vendedor', 'Sistema'),
-                }
-                detalles = []
-                for det in venta['detalles']:
-                    detalles.append({
-                        'producto_nombre': det.get('producto_nombre', 'Producto'),
-                        'cantidad': det.get('cantidad', 0),
-                        'precio_unitario': det.get('precio_unitario', 0),
-                        'subtotal': det.get('subtotal', 0),
-                    })
-            else:
-                venta_data = {
-                    'numero_factura': num_factura,
-                    'fecha': items_factura[0].get('fecha', '')[:16] if items_factura else '',
-                    'total': total_factura,
-                    'subtotal': total_factura,
-                    'descuento': 0,
-                    'metodo_pago': 'EFECTIVO',
-                    'cliente_nombre': 'Cliente General',
-                    'vendedor': items_factura[0].get('usuario_nombre', 'Sistema') if items_factura else 'Sistema',
-                }
-                detalles = []
-                for item in items_factura:
-                    detalles.append({
-                        'producto_nombre': item.get('producto_nombre', 'Producto'),
-                        'cantidad': item.get('cantidad', 0),
-                        'precio_unitario': item.get('precio_unitario', 0),
-                        'subtotal': item.get('costo_total', 0),
-                    })
-
-            imprimir_factura(ventana_padre, venta_data, detalles)
-
+            from ui.imprimir_factura import imprimir_por_identidad
+            imprimir_por_identidad(ventana_padre, self.db_manager, "SALE", num_factura)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error al preparar impresión:\n{str(e)}")
 

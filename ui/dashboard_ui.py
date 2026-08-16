@@ -1587,7 +1587,16 @@ class DashboardUI(QWidget):
                 'PENDIENTE': '⏳',
                 'PARCIAL': '🟡',
                 'PAGADO': '✅',
+                'CREDITO_A_FAVOR': '💠',
             }.get(venta['estado_pago'], '')
+            estado_txt = f"{estado_emoji} {venta['estado_pago']}"
+            credito = venta.get('credito_a_favor') or 0
+            try:
+                credito_val = float(credito)
+            except (TypeError, ValueError):
+                credito_val = 0
+            if credito_val > 0:
+                estado_txt += f" (crédito ${credito_val:,.0f})"
 
             valores = (
                 venta['numero_factura'],
@@ -1596,7 +1605,7 @@ class DashboardUI(QWidget):
                 f"${venta['total']:,.0f}",
                 f"${venta['monto_pagado']:,.0f}",
                 f"${venta['saldo_pendiente']:,.0f}",
-                f"{estado_emoji} {venta['estado_pago']}",
+                estado_txt,
                 f"{venta['dias_transcurridos']}",
             )
 

@@ -357,6 +357,7 @@ class Abono:
     usuario: Optional[str] = None
     observaciones: Optional[str] = None
     created_at: Optional[str] = None
+    local_id: Optional[str] = None
 
 @dataclass
 class ResumenDeuda:
@@ -385,6 +386,7 @@ class AbonoVenta:
     usuario: Optional[str] = None
     observaciones: Optional[str] = None
     created_at: Optional[str] = None
+    local_id: Optional[str] = None
 
 @dataclass
 class ResumenCuentaPorCobrar:

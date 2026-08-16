@@ -1,263 +1,250 @@
 # -*- coding: utf-8 -*-
-"""
-Servicio de gestión de cuentas por cobrar (ventas a crédito)
-Proporciona cálculos y reportes de deudas por cliente
-"""
-import pg_compat
-from typing import List, Dict, Optional
-from datetime import datetime, timedelta
-from models import ResumenCuentaPorCobrar
+"""Cuentas por cobrar: lectura canónica local-first. No reescribe ventas COMPLETED."""
+from decimal import Decimal
+from typing import Dict, List, Optional
+
+from services.operational_balance import (
+    add_aging,
+    compute_receivable,
+    connect_local,
+    days_outstanding,
+    empty_aging,
+    list_receivable_snapshots,
+    reconcile_receivable,
+)
 
 
 class CuentasPorCobrarService:
     """Servicio para gestión y análisis de cuentas por cobrar"""
-    
+
     def __init__(self, db_path: str):
-        pass  # db_path ignorado; se usa PostgreSQL
-    
+        self.db_path = db_path
+
+    def _connect(self):
+        return connect_local(self.db_path)
+
     def obtener_resumen_cuentas_por_cobrar(self) -> List[Dict]:
-        """
-        Obtiene resumen completo de cuentas por cobrar por cliente
-        Incluye métricas de vencimiento y análisis de flujo
-        """
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT 
-                c.id as id_cliente,
-                c.nombre as nombre_cliente,
-                COALESCE(SUM(v.total - v.monto_pagado), 0) as total_deuda,
-                COUNT(CASE WHEN v.estado_pago != 'PAGADO' THEN 1 END) as facturas_pendientes,
-                COALESCE(SUM(CASE 
-                    WHEN (julianday('now') - julianday(v.fecha)) <= 30 AND v.estado_pago != 'PAGADO'
-                    THEN (v.total - v.monto_pagado) ELSE 0 END), 0) as deuda_30,
-                COALESCE(SUM(CASE 
-                    WHEN (julianday('now') - julianday(v.fecha)) BETWEEN 31 AND 60 AND v.estado_pago != 'PAGADO'
-                    THEN (v.total - v.monto_pagado) ELSE 0 END), 0) as deuda_60,
-                COALESCE(SUM(CASE 
-                    WHEN (julianday('now') - julianday(v.fecha)) > 60 AND v.estado_pago != 'PAGADO'
-                    THEN (v.total - v.monto_pagado) ELSE 0 END), 0) as deuda_90,
-                MIN(v.fecha) as factura_mas_antigua
-            FROM clientes c
-            LEFT JOIN ventas v ON c.id = v.cliente_id
-            WHERE v.metodo_pago = 'CREDITO' AND (v.estado_pago = 'PENDIENTE' OR v.estado_pago = 'PARCIAL')
-            GROUP BY c.id, c.nombre
-            ORDER BY total_deuda DESC
-        ''')
-        
-        resultados = cursor.fetchall()
-        conn.close()
-        
-        return [
-            {
-                'id_cliente': r[0],
-                'nombre_cliente': r[1],
-                'total_deuda': r[2] or 0,
-                'facturas_pendientes': r[3] or 0,
-                'deuda_30': r[4] or 0,
-                'deuda_60': r[5] or 0,
-                'deuda_90': r[6] or 0,
-                'factura_mas_antigua': r[7],
-                'estado_vencimiento': self._calcular_vencimiento(r[6] or 0, r[7]),
-                'dias_antiguo': self._calcular_dias_antiguo(r[7]) if r[7] else 0
-            }
-            for r in resultados if r[2] > 0  # Solo clientes con deuda
-        ]
-    
-    def obtener_cuentas_cliente(self, id_cliente: int) -> Dict:
-        """Obtiene detalles de cuentas por cobrar de un cliente específico"""
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        # Información general del cliente
-        cursor.execute('''
-            SELECT nombre, documento, telefono, correo, limite_credito 
-            FROM clientes WHERE id = ?
-        ''', (id_cliente,))
-        
-        cliente = cursor.fetchone()
-        
-        if not cliente:
-            conn.close()
-            return None
-        
-        # Facturas pendientes
-        cursor.execute('''
-            SELECT 
-                id, numero_factura, fecha, total, monto_pagado, 
-                (total - monto_pagado) as saldo_pendiente, estado_pago
-            FROM ventas
-            WHERE cliente_id = ? 
-                AND metodo_pago = 'CREDITO' 
-                AND estado_pago != 'PAGADO'
-            ORDER BY fecha ASC
-        ''', (id_cliente,))
-        
-        facturas = [
-            {
-                'id': f[0],
-                'numero_factura': f[1],
-                'fecha': f[2],
-                'total': f[3],
-                'monto_pagado': f[4],
-                'saldo_pendiente': f[5],
-                'estado_pago': f[6],
-                'dias_vencido': self._calcular_dias_antiguo(f[2])
-            }
-            for f in cursor.fetchall()
-        ]
-        
-        # Totales
-        total_deuda = sum(f['saldo_pendiente'] for f in facturas)
-        total_pagado = sum(f['monto_pagado'] for f in facturas)
-        
-        conn.close()
-        
-        return {
-            'cliente': {
-                'id': id_cliente,
-                'nombre': cliente[0],
-                'documento': cliente[1],
-                'telefono': cliente[2],
-                'correo': cliente[3],
-                'limite_credito': cliente[4]
-            },
-            'facturas': facturas,
-            'total_deuda': total_deuda,
-            'total_pagado': total_pagado,
-            'cantidad_facturas': len(facturas)
-        }
-    
-    def obtener_totales_cuentas_por_cobrar(self) -> Dict:
-        """Obtiene totales generales de cuentas por cobrar"""
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT 
-                COUNT(DISTINCT v.id) as total_facturas,
-                COUNT(DISTINCT v.cliente_id) as total_clientes,
-                COALESCE(SUM(v.total - v.monto_pagado), 0) as total_por_cobrar
-            FROM ventas v
-            WHERE v.metodo_pago = 'CREDITO' 
-                AND (v.estado_pago = 'PENDIENTE' OR v.estado_pago = 'PARCIAL')
-        ''')
-        
-        resultado = cursor.fetchone()
-        conn.close()
-        
-        return {
-            'total_facturas_pendientes': resultado[0] or 0,
-            'total_clientes_con_deuda': resultado[1] or 0,
-            'total_por_cobrar': resultado[2] or 0
-        }
-    
-    def obtener_facturas_vencidas(self, dias_vencimiento: int = 60) -> List[Dict]:
-        """
-        Obtiene facturas con más de X días de vencimiento
-        Por defecto, 60 días
-        """
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        fecha_limite = (datetime.now() - timedelta(days=dias_vencimiento)).strftime('%Y-%m-%d')
-        
-        cursor.execute('''
-            SELECT 
-                v.id, v.numero_factura, v.fecha, v.total, v.monto_pagado,
-                (v.total - v.monto_pagado) as saldo_pendiente,
-                v.estado_pago, c.nombre as cliente_nombre,
-                (julianday('now') - julianday(v.fecha)) as dias_vencido
-            FROM ventas v
-            INNER JOIN clientes c ON v.cliente_id = c.id
-            WHERE v.metodo_pago = 'CREDITO'
-                AND v.estado_pago != 'PAGADO'
-                AND v.fecha <= ?
-            ORDER BY v.fecha ASC
-        ''', (fecha_limite,))
-        
-        facturas = [
-            {
-                'id': f[0],
-                'numero_factura': f[1],
-                'fecha': f[2],
-                'total': f[3],
-                'monto_pagado': f[4],
-                'saldo_pendiente': f[5],
-                'estado_pago': f[6],
-                'cliente_nombre': f[7],
-                'dias_vencido': int(f[8])
-            }
-            for f in cursor.fetchall()
-        ]
-        
-        conn.close()
-        return facturas
-    
-    def obtener_ventas_credito_pendientes(self) -> List[Dict]:
-        """
-        Obtiene todas las ventas a crédito con saldo pendiente
-        Para mostrar en panel de ventas
-        """
-        conn = pg_compat.connect()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT 
-                v.id, v.numero_factura, v.fecha, v.total, 
-                COALESCE(v.monto_pagado, 0) as monto_pagado,
-                (v.total - COALESCE(v.monto_pagado, 0)) as saldo_pendiente,
-                v.estado_pago, c.nombre as cliente_nombre, c.id as cliente_id,
-                (julianday('now') - julianday(v.fecha)) as dias_transcurridos
-            FROM ventas v
-            LEFT JOIN clientes c ON v.cliente_id = c.id
-            WHERE v.metodo_pago = 'CREDITO'
-                AND v.estado_pago != 'PAGADO'
-            ORDER BY v.fecha ASC
-        ''')
-        
-        ventas = [
-            {
-                'id': f[0],
-                'numero_factura': f[1],
-                'fecha': f[2],
-                'total': f[3],
-                'monto_pagado': f[4],
-                'saldo_pendiente': f[5],
-                'estado_pago': f[6],
-                'cliente_nombre': f[7] or 'CLIENTE GENERAL',
-                'cliente_id': f[8],
-                'dias_transcurridos': int(f[9])
-            }
-            for f in cursor.fetchall()
-        ]
-        
-        conn.close()
-        return ventas
-    
-    def _calcular_vencimiento(self, deuda_90_dias: float, fecha_antigua: str) -> str:
-        """Calcula estado de vencimiento"""
-        if deuda_90_dias > 0:
-            return 'VENCIDA'
-        
-        if fecha_antigua:
-            dias = self._calcular_dias_antiguo(fecha_antigua)
-            if dias > 60:
-                return 'ALERTA'
-            elif dias > 30:
-                return 'PROXIMO'
-        
-        return 'RECIENTE'
-    
-    def _calcular_dias_antiguo(self, fecha_str: str) -> int:
-        """Calcula días transcurridos desde una fecha"""
-        if not fecha_str:
-            return 0
-        
+        conn = self._connect()
         try:
-            fecha = datetime.fromisoformat(fecha_str.replace(' ', 'T'))
-            dias = (datetime.now() - fecha).days
-            return dias
+            grouped = {}
+            for venta, snap in list_receivable_snapshots(conn):
+                if snap.balance <= 0:
+                    continue
+                cid = venta.get("cliente_id") or venta.get("cliente_id_join")
+                key = cid if cid is not None else f"venta-{venta['id']}"
+                bucket = grouped.setdefault(
+                    key,
+                    {
+                        "id_cliente": cid,
+                        "nombre_cliente": venta.get("cliente_nombre") or "CLIENTE GENERAL",
+                        "total_deuda": Decimal("0.00"),
+                        "facturas_pendientes": 0,
+                        "aging": empty_aging(),
+                        "factura_mas_antigua": venta.get("fecha"),
+                    },
+                )
+                bucket["total_deuda"] += snap.balance
+                bucket["facturas_pendientes"] += 1
+                days = days_outstanding(venta.get("fecha"))
+                add_aging(bucket["aging"], days, snap.balance)
+                antigua = bucket["factura_mas_antigua"]
+                if venta.get("fecha") and (not antigua or str(venta["fecha"]) < str(antigua)):
+                    bucket["factura_mas_antigua"] = venta.get("fecha")
+            resultados = []
+            for item in grouped.values():
+                aging = item["aging"]
+                resultados.append(
+                    {
+                        "id_cliente": item["id_cliente"],
+                        "nombre_cliente": item["nombre_cliente"],
+                        "total_deuda": item["total_deuda"],
+                        "facturas_pendientes": item["facturas_pendientes"],
+                        "deuda_30": aging["deuda_30"],
+                        "deuda_60": aging["deuda_60"],
+                        "deuda_90": aging["deuda_90"],
+                        "aging_0_30": aging["aging_0_30"],
+                        "aging_31_60": aging["aging_31_60"],
+                        "aging_61_90": aging["aging_61_90"],
+                        "aging_90_plus": aging["aging_90_plus"],
+                        "factura_mas_antigua": item["factura_mas_antigua"],
+                        "estado_vencimiento": self._calcular_vencimiento(
+                            aging["deuda_90"], item["factura_mas_antigua"]
+                        ),
+                        "dias_antiguo": days_outstanding(item["factura_mas_antigua"])
+                        if item["factura_mas_antigua"]
+                        else 0,
+                    }
+                )
+            resultados.sort(key=lambda r: r["total_deuda"], reverse=True)
+            return resultados
+        finally:
+            conn.close()
+
+    def obtener_cuentas_cliente(self, id_cliente: int) -> Optional[Dict]:
+        conn = self._connect()
+        try:
+            cliente_row = conn.execute(
+                """
+                SELECT id, nombre, numero_documento, telefono,
+                       COALESCE(email, '') AS correo, limite_credito
+                  FROM clientes WHERE id = ?
+                """,
+                (id_cliente,),
+            ).fetchone()
+            if not cliente_row:
+                return None
+            cliente = dict(cliente_row)
+            facturas = []
+            creditos = []
+            for venta, snap in list_receivable_snapshots(conn):
+                if venta.get("cliente_id") != id_cliente:
+                    continue
+                item = {
+                    "id": venta["id"],
+                    "numero_factura": venta.get("numero_factura"),
+                    "fecha": venta.get("fecha"),
+                    "total": snap.original,
+                    "monto_pagado": snap.payments,
+                    "saldo_pendiente": snap.balance,
+                    "credito_a_favor": snap.credit_balance,
+                    "credit_kind": snap.credit_kind,
+                    "reversals": snap.reversals,
+                    "net_obligation": snap.net_obligation,
+                    "estado_pago": snap.estado_pago,
+                    "dias_vencido": days_outstanding(venta.get("fecha")),
+                }
+                if snap.balance > 0:
+                    facturas.append(item)
+                elif snap.credit_balance > 0:
+                    creditos.append(item)
+            return {
+                "cliente": {
+                    "id": id_cliente,
+                    "nombre": cliente["nombre"],
+                    "documento": cliente.get("numero_documento"),
+                    "telefono": cliente.get("telefono"),
+                    "correo": cliente.get("correo"),
+                    "limite_credito": cliente.get("limite_credito"),
+                },
+                "facturas": facturas,
+                "creditos_a_favor": creditos,
+                "total_deuda": sum((f["saldo_pendiente"] for f in facturas), Decimal("0.00")),
+                "total_pagado": sum((f["monto_pagado"] for f in facturas), Decimal("0.00")),
+                "cantidad_facturas": len(facturas),
+            }
+        finally:
+            conn.close()
+
+    def obtener_totales_cuentas_por_cobrar(self) -> Dict:
+        conn = self._connect()
+        try:
+            clientes = set()
+            facturas = 0
+            total = Decimal("0.00")
+            for venta, snap in list_receivable_snapshots(conn):
+                if snap.balance <= 0:
+                    continue
+                facturas += 1
+                total += snap.balance
+                if venta.get("cliente_id") is not None:
+                    clientes.add(venta["cliente_id"])
+            return {
+                "total_facturas_pendientes": facturas,
+                "total_clientes_con_deuda": len(clientes),
+                "total_por_cobrar": total,
+            }
+        finally:
+            conn.close()
+
+    def obtener_facturas_vencidas(self, dias_vencimiento: int = 60) -> List[Dict]:
+        conn = self._connect()
+        try:
+            facturas = []
+            for venta, snap in list_receivable_snapshots(conn):
+                if snap.balance <= 0:
+                    continue
+                days = days_outstanding(venta.get("fecha"))
+                if days < dias_vencimiento:
+                    continue
+                facturas.append(
+                    {
+                        "id": venta["id"],
+                        "numero_factura": venta.get("numero_factura"),
+                        "fecha": venta.get("fecha"),
+                        "total": snap.original,
+                        "monto_pagado": snap.payments,
+                        "saldo_pendiente": snap.balance,
+                        "credito_a_favor": snap.credit_balance,
+                        "estado_pago": snap.estado_pago,
+                        "cliente_nombre": venta.get("cliente_nombre"),
+                        "dias_vencido": days,
+                    }
+                )
+            return facturas
+        finally:
+            conn.close()
+
+    def obtener_ventas_credito_pendientes(self) -> List[Dict]:
+        conn = self._connect()
+        try:
+            ventas = []
+            for venta, snap in list_receivable_snapshots(conn):
+                if snap.balance <= 0 and snap.credit_balance <= 0:
+                    continue
+                if snap.balance <= 0 and snap.credit_balance > 0:
+                    # Crédito a favor: visible, no es deuda vencida.
+                    pass
+                item = {
+                    "id": venta["id"],
+                    "numero_factura": venta.get("numero_factura"),
+                    "fecha": venta.get("fecha"),
+                    "total": snap.original,
+                    "monto_pagado": snap.payments,
+                    "saldo_pendiente": snap.balance,
+                    "credito_a_favor": snap.credit_balance,
+                    "credit_kind": snap.credit_kind,
+                    "reversals": snap.reversals,
+                    "net_obligation": snap.net_obligation,
+                    "estado_pago": snap.estado_pago,
+                    "cliente_nombre": venta.get("cliente_nombre") or "CLIENTE GENERAL",
+                    "cliente_id": venta.get("cliente_id"),
+                    "dias_transcurridos": days_outstanding(venta.get("fecha")),
+                }
+                ventas.append(item)
+            return ventas
+        finally:
+            conn.close()
+
+    def obtener_saldo_venta(self, venta_id: int):
+        conn = self._connect()
+        try:
+            snap = compute_receivable(conn, venta_id)
+            return None if snap is None else snap.as_dict()
+        finally:
+            conn.close()
+
+    def reconciliar_venta(self, venta_id: int):
+        conn = self._connect()
+        try:
+            snap = reconcile_receivable(conn, venta_id)
+            conn.commit()
+            return snap.as_dict()
         except Exception:
-            return 0
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _calcular_vencimiento(self, deuda_90_dias, fecha_antigua: str) -> str:
+        if deuda_90_dias and deuda_90_dias > 0:
+            return "VENCIDA"
+        if fecha_antigua:
+            dias = days_outstanding(fecha_antigua)
+            if dias > 60:
+                return "ALERTA"
+            if dias > 30:
+                return "PROXIMO"
+        return "RECIENTE"
+
+    def _calcular_dias_antiguo(self, fecha_str: str) -> int:
+        return days_outstanding(fecha_str)

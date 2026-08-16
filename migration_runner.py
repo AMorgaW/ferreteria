@@ -21,6 +21,7 @@ from inventory_apply_schema import ensure_inventory_apply_schema
 from purchase_schema import ensure_sqlite_purchase_receiving_schema
 from cash_schema import ensure_sqlite_cash_operational_schema
 from returns_schema import ensure_sqlite_returns_reversals_schema
+from balance_schema import ensure_sqlite_operational_balance_schema
 
 
 class MigrationError(RuntimeError):
@@ -305,6 +306,17 @@ DEFAULT_MIGRATIONS = (
             "local-first operational cash ledger;no double-entry"
         ),
         apply=ensure_sqlite_cash_operational_schema,
+    ),
+    Migration(
+        version="20260816_010",
+        name="operational_balance_payment_identity",
+        signature=(
+            "abonos_ventas.local_id UNIQUE;abonos_compras.local_id UNIQUE;"
+            "payments identified by UUID not ROWID;no REAL rewrite;"
+            "legacy payment baseline captured only for documents without abonos;"
+            "legacy monto_pagado/saldo_pendiente remain projection after cutover"
+        ),
+        apply=ensure_sqlite_operational_balance_schema,
     ),
 )
 
