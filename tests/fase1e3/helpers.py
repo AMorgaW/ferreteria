@@ -60,6 +60,11 @@ def reset_lab_balances(admin_conn):
         )
     admin_conn.commit()
     with admin_conn.cursor() as cur:
+        cur.execute("DELETE FROM inventory_cutover_snapshot_lines")
+        cur.execute("DELETE FROM inventory_cutover_attestation_lines")
+        cur.execute("DELETE FROM inventory_cutover_attestations")
+        cur.execute("DELETE FROM inventory_cutover_expected_stations")
+        cur.execute("DELETE FROM inventory_cutover_snapshots")
         cur.execute("DELETE FROM inventory_operations")
         cur.execute("DELETE FROM inventory_commands")
         cur.execute("DELETE FROM inventory_balance_init_state WHERE init_key = 'legacy_cutover'")

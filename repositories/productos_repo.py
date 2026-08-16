@@ -706,11 +706,28 @@ class ProductosRepository:
                 conn.close()
                 return False, "Producto no encontrado"
             target_stock = producto.stock
-            already = command_already_applied(conn, command_id)
             try:
                 existing_cmd = get_inventory_command_or_none(conn, command_id)
                 if existing_cmd is not None:
-                    operations = operations_from_command_record(existing_cmd)
+                    stored_operations = operations_from_command_record(existing_cmd)
+                    stored_base = (
+                        stored_operations[0].get("expected_base_scaled")
+                        if stored_operations else None
+                    )
+                    base = (
+                        inventory_stock_base_scaled
+                        if inventory_stock_base_scaled is not None
+                        else stored_base
+                    )
+                    if base is None:
+                        raise InventoryGatewayError(
+                            "command absoluto histórico sin expected_base_scaled; "
+                            "requiere resolución manual"
+                        )
+                    operations = build_absolute_operations(
+                        conn, command_id=command_id, producto_id=producto.id,
+                        target_qty=target_stock, base_scaled=int(base),
+                    )
                 else:
                     local_id = require_producto_local_id(conn, producto.id)
                     base = resolve_authoritative_base_scaled(
@@ -726,6 +743,18 @@ class ProductosRepository:
                 conn.close()
                 return False, str(exc)
             except InventoryGatewayError as exc:
+                conn.close()
+                return False, str(exc)
+            try:
+                already = command_already_applied(
+                    conn,
+                    command_id,
+                    tipo="AJUSTE",
+                    operations=operations,
+                    documento_tipo=DOCUMENTO_TIPO_PRODUCTO,
+                    documento_local_id=current["local_id"],
+                )
+            except Exception as exc:
                 conn.close()
                 return False, str(exc)
             stock_changed = bool(operations) or already is not None

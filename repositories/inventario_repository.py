@@ -662,37 +662,57 @@ class InventarioRepository:
                 open_act=True,
             )
             self.last_inventory_command_id = command_id
-            already = command_already_applied(conn, command_id)
-            if already is not None and find_rows_marked_for_command(
-                conn, command_id, table="movimientos_inventario", column="observaciones"
-            ):
-                conn.close()
-                return True, "Stock ajustado"
             row = cursor.execute(
                 "SELECT id, local_id FROM productos WHERE id = ?", (producto_id,)
             ).fetchone()
             if not row:
                 conn.close()
                 return False, "Producto no encontrado"
+            try:
+                existing_cmd = get_inventory_command_or_none(conn, command_id)
+                if existing_cmd is not None:
+                    stored_operations = operations_from_command_record(existing_cmd)
+                    stored_base = (
+                        stored_operations[0].get("expected_base_scaled")
+                        if stored_operations else None
+                    )
+                    base = (
+                        inventory_stock_base_scaled
+                        if inventory_stock_base_scaled is not None
+                        else stored_base
+                    )
+                    if base is None:
+                        raise InventoryGatewayError(
+                            "command absoluto histórico sin expected_base_scaled; "
+                            "requiere resolución manual"
+                        )
+                else:
+                    local_id = require_producto_local_id(conn, producto_id)
+                    base = resolve_authoritative_base_scaled(
+                        local_id,
+                        explicit_base_scaled=inventory_stock_base_scaled,
+                        connection_factory=inventory_connection_factory,
+                    )
+                operations = build_absolute_operations(
+                    conn, command_id=command_id, producto_id=producto_id,
+                    target_qty=nuevo_stock, base_scaled=int(base),
+                )
+                already = command_already_applied(
+                    conn,
+                    command_id,
+                    tipo="AJUSTE",
+                    operations=operations,
+                    documento_tipo=DOCUMENTO_TIPO_AJUSTE,
+                )
+            except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError, InventoryGatewayError) as exc:
+                conn.close()
+                return False, str(exc)
+            if already is not None and find_rows_marked_for_command(
+                conn, command_id, table="movimientos_inventario", column="observaciones"
+            ):
+                conn.close()
+                return True, "Stock ajustado"
             if already is None:
-                try:
-                    existing_cmd = get_inventory_command_or_none(conn, command_id)
-                    if existing_cmd is not None:
-                        operations = operations_from_command_record(existing_cmd)
-                    else:
-                        local_id = require_producto_local_id(conn, producto_id)
-                        base = resolve_authoritative_base_scaled(
-                            local_id,
-                            explicit_base_scaled=inventory_stock_base_scaled,
-                            connection_factory=inventory_connection_factory,
-                        )
-                        operations = build_absolute_operations(
-                            conn, command_id=command_id, producto_id=producto_id,
-                            target_qty=nuevo_stock, base_scaled=base,
-                        )
-                except (MissingProductLocalIdError, QuantityScaleError, UnknownProductError, InventoryGatewayError) as exc:
-                    conn.close()
-                    return False, str(exc)
                 if not operations:
                     conn.close()
                     self.last_gateway_result = NO_INVENTORY_CHANGE

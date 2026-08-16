@@ -2,6 +2,12 @@
 
 Aplicación de escritorio para gestión integral de una ferretería. Desarrollada en **Python + PySide6** con base de datos local **SQLite** y sincronización en la nube con **Supabase (PostgreSQL)**.
 
+## Estado de desarrollo
+
+- **FASE 1 COMPLETA:** autoridad ONLINE de inventario certificada en PostgreSQL 16.
+- **FASE 2 EN CURSO:** migración y saneamiento legacy.
+- El cutover productivo todavía **NO** ha sido ejecutado.
+
 ## Modo Local-First
 
 El sistema incluye un servidor local para que el computador administrador trabaje como base central de la ferreteria y las PCs trabajadoras se conecten por WiFi/LAN sin depender de Supabase para cada accion.

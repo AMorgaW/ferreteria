@@ -128,17 +128,26 @@ class VentasService:
         if frozen:
             return False, frozen, None
         if mode == WRITER_MODE_AUTHORITATIVE:
-            return self._registrar_venta_authoritative(
-                items,
-                cliente_id=cliente_id,
-                metodo_pago=metodo_pago,
-                descuento_general=descuento_general,
-                observaciones=observaciones,
-                inventory_command_id=inventory_command_id,
-                inventory_gateway=inventory_gateway,
-                inventory_transport=inventory_transport,
-                inventory_connection_factory=inventory_connection_factory,
+            from contextlib import nullcontext
+            from inventory_cutover import serialize_implicit_pos_act
+
+            guard = (
+                serialize_implicit_pos_act()
+                if inventory_command_id is None
+                else nullcontext()
             )
+            with guard:
+                return self._registrar_venta_authoritative(
+                    items,
+                    cliente_id=cliente_id,
+                    metodo_pago=metodo_pago,
+                    descuento_general=descuento_general,
+                    observaciones=observaciones,
+                    inventory_command_id=inventory_command_id,
+                    inventory_gateway=inventory_gateway,
+                    inventory_transport=inventory_transport,
+                    inventory_connection_factory=inventory_connection_factory,
+                )
 
         conn = self.db.conectar()
         cursor = conn.cursor()

@@ -355,7 +355,7 @@ class W13Test(unittest.TestCase):
                 inventory_mode="authoritative",
                 inventory_command_id=cid,
                 inventory_transport=tretry,
-                inventory_stock_base_scaled=99999,
+                inventory_stock_base_scaled=10000,
             )
             self.assertTrue(ok2, msg2)
             self.assertEqual(

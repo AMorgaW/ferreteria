@@ -51,7 +51,10 @@ def _app_dsn() -> str:
 
 
 def _app_environ():
-    return {"FERREPRO_INVENTORY_DSN": _app_dsn()}
+    return {
+        "FERREPRO_INVENTORY_DSN": _app_dsn(),
+        "FERREPRO_CUTOVER_EXPECTED_STATIONS": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    }
 
 
 class Fase1E4PostgresTest(unittest.TestCase):
@@ -220,7 +223,8 @@ class Fase1E4PostgresTest(unittest.TestCase):
                 load_postgres_cutover_state(self.admin).status, STATUS_CUTOVER_IN_PROGRESS
             )
 
-    def test_05_legacy_reconciliation_required(self):
+    def test_05_pg_stock_does_not_override_explicit_fleet_attestation(self):
+        from inventory_coordinator import InventoryCoordinatorClient
         from inventory_cutover import run_cutover
 
         lid = str(uuid.uuid4())
@@ -237,9 +241,11 @@ class Fase1E4PostgresTest(unittest.TestCase):
                     app_factory=app_factory(),
                     environ=_app_environ(),
                 )
-                self.assertTrue(result.aborted)
-                self.assertEqual(result.error, "legacy_reconciliation")
-                self.assertNotEqual(result.state.status, "AUTHORITATIVE")
+                self.assertFalse(result.aborted, result.error)
+                self.assertEqual(result.state.status, "AUTHORITATIVE")
+                self.assertEqual(
+                    InventoryCoordinatorClient(self.admin).get_balance(lid), 99000
+                )
             finally:
                 conn.close()
 

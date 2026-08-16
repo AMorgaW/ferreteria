@@ -347,6 +347,11 @@ BEGIN
             (
                 SELECT string_agg(
                     '{"delta_scaled":' || (e->>'delta_scaled')
+                    || CASE
+                        WHEN e ? 'expected_base_scaled' THEN
+                            ',"expected_base_scaled":' || (e->>'expected_base_scaled')
+                        ELSE ''
+                       END
                     || ',"line_no":' || (e->>'line_no')
                     || ',"operation_id":'
                     || pg_catalog.to_jsonb(e->>'operation_id')::text

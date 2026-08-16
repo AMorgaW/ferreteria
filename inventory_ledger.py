@@ -177,19 +177,34 @@ def command_request_hash(
     documento_local_id: Optional[str],
     operations: Sequence[Mapping[str, Any]],
 ) -> str:
-    """Fingerprint determinístico del payload semántico."""
-    normalized_ops = sorted(
-        (
-            {
+    """Fingerprint determinístico del payload semántico.
+
+    ``expected_base_scaled`` participa cuando existe porque cambia la
+    precondición CAS del comando. Se omite para comandos sin CAS para conservar
+    la identidad histórica de payloads anteriores al cierre 1E.4D.
+    """
+    normalized_ops = []
+    for op in operations:
+        item = {
                 "delta_scaled": int(op["delta_scaled"]),
                 "line_no": int(op["line_no"]),
                 "operation_id": str(op["operation_id"]),
                 "producto_local_id": str(op["producto_local_id"]),
-            }
-            for op in operations
-        ),
-        key=lambda item: item["line_no"],
-    )
+        }
+        expected_base = op.get("expected_base_scaled")
+        if expected_base is not None:
+            if isinstance(expected_base, float):
+                raise QuantityScaleError(
+                    "expected_base_scaled debe ser entero; no float"
+                )
+            try:
+                item["expected_base_scaled"] = int(expected_base)
+            except (TypeError, ValueError) as exc:
+                raise QuantityScaleError(
+                    "expected_base_scaled debe ser entero"
+                ) from exc
+        normalized_ops.append(item)
+    normalized_ops.sort(key=lambda item: item["line_no"])
     payload = {
         "command_id": str(command_id),
         "documento_local_id": documento_local_id,
@@ -520,7 +535,7 @@ def _ensure_intent_class_column(conn) -> None:
 
 
 def _ensure_expected_base_column(conn) -> None:
-    """1E.2: CAS absoluto. No forma parte del request_hash."""
+    """1E.2/1E.4D: CAS absoluto; desde 1E.4D forma parte del request_hash."""
     rows = conn.execute("PRAGMA table_info(inventory_operations)").fetchall()
     cols = {
         (row["name"] if hasattr(row, "keys") else row[1])

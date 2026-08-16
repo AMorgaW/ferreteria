@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -101,6 +102,7 @@ class LegacyReconciliationRequiredError(InventoryCutoverError):
 STATION_MODE_ENV = "FERREPRO_INVENTORY_STATION_MODE"
 STATION_MODE_ONLINE = "ONLINE"
 STATION_MODE_OFFLINE = "OFFLINE"
+CUTOVER_EXPECTED_STATIONS_ENV = "FERREPRO_CUTOVER_EXPECTED_STATIONS"
 
 ALLOWED_CUTOVER_TRANSITIONS = frozenset(
     {
@@ -124,6 +126,19 @@ LEGACY_WRITE_ALLOWED_STATUSES = frozenset(
 _after_legacy_allow_hook = None
 _after_legacy_share_hook = None
 _after_postgres_freeze_hook = None
+_pos_open_act_lock = threading.RLock()
+
+
+@contextmanager
+def serialize_implicit_pos_act():
+    """Evita que dos checkouts implícitos compartan el mismo OPEN act.
+
+    La identidad sigue persistida en SQLite. Este lock solo ordena callers
+    concurrentes del mismo proceso cuando la UI no entregó command_id; tras un
+    crash, ``inventory_open_acts`` continúa siendo la fuente de recuperación.
+    """
+    with _pos_open_act_lock:
+        yield
 
 
 @dataclass(frozen=True)
@@ -374,16 +389,419 @@ BEGIN
 END;
 $ferrepro_fence$;
 REVOKE ALL ON FUNCTION public.lock_legacy_cutover_fence() FROM PUBLIC;
-CREATE OR REPLACE FUNCTION public.initialize_inventory_balances_from_snapshot(p_snapshot jsonb)
+CREATE TABLE IF NOT EXISTS public.inventory_cutover_snapshots (
+    cutover_id text PRIMARY KEY,
+    epoch bigint NOT NULL,
+    status text NOT NULL CHECK (status IN ('COLLECTING', 'APPROVED', 'SEEDED')),
+    checksum text,
+    product_count bigint,
+    created_at text NOT NULL,
+    approved_at text,
+    seeded_at text
+);
+CREATE TABLE IF NOT EXISTS public.inventory_cutover_expected_stations (
+    cutover_id text NOT NULL REFERENCES public.inventory_cutover_snapshots(cutover_id) ON DELETE CASCADE,
+    epoch bigint NOT NULL,
+    device_id text NOT NULL,
+    PRIMARY KEY (cutover_id, device_id)
+);
+CREATE TABLE IF NOT EXISTS public.inventory_cutover_attestations (
+    cutover_id text NOT NULL,
+    epoch bigint NOT NULL,
+    device_id text NOT NULL,
+    checksum text NOT NULL,
+    product_count bigint NOT NULL,
+    attested_at text NOT NULL,
+    PRIMARY KEY (cutover_id, device_id),
+    FOREIGN KEY (cutover_id, device_id)
+        REFERENCES public.inventory_cutover_expected_stations(cutover_id, device_id)
+        ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS public.inventory_cutover_attestation_lines (
+    cutover_id text NOT NULL,
+    device_id text NOT NULL,
+    producto_local_id text NOT NULL,
+    quantity_scaled bigint NOT NULL,
+    PRIMARY KEY (cutover_id, device_id, producto_local_id),
+    FOREIGN KEY (cutover_id, device_id)
+        REFERENCES public.inventory_cutover_attestations(cutover_id, device_id)
+        ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS public.inventory_cutover_snapshot_lines (
+    cutover_id text NOT NULL REFERENCES public.inventory_cutover_snapshots(cutover_id) ON DELETE CASCADE,
+    producto_local_id text NOT NULL,
+    quantity_scaled bigint NOT NULL,
+    PRIMARY KEY (cutover_id, producto_local_id)
+);
+REVOKE ALL ON TABLE public.inventory_cutover_snapshots FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_cutover_expected_stations FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_cutover_attestations FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_cutover_attestation_lines FROM PUBLIC;
+REVOKE ALL ON TABLE public.inventory_cutover_snapshot_lines FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION public.inventory_cutover_checksum(
+    p_cutover_id text,
+    p_epoch bigint,
+    p_lines jsonb
+) RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $ferrepro_checksum$
+DECLARE
+    v_count bigint;
+    v_distinct bigint;
+    v_lines text;
+    v_material text;
+BEGIN
+    IF p_cutover_id IS NULL OR btrim(p_cutover_id) = ''
+       OR p_lines IS NULL OR jsonb_typeof(p_lines) <> 'array' THEN
+        RAISE EXCEPTION 'INVENTORY_SNAPSHOT_INVALID: referencia o líneas inválidas'
+            USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM jsonb_array_elements(p_lines) e
+         WHERE jsonb_typeof(e) <> 'object'
+            OR btrim(COALESCE(e->>'producto_local_id', '')) = ''
+            OR COALESCE(e->>'quantity_scaled', '') !~ '^-?[0-9]+$'
+    ) THEN
+        RAISE EXCEPTION 'INVENTORY_SNAPSHOT_INVALID: línea inválida'
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT COUNT(*), COUNT(DISTINCT btrim(e->>'producto_local_id'))
+      INTO v_count, v_distinct
+      FROM jsonb_array_elements(p_lines) e;
+    IF v_count IS DISTINCT FROM v_distinct THEN
+        RAISE EXCEPTION 'INVENTORY_SNAPSHOT_INVALID: producto duplicado'
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT string_agg(
+               btrim(e->>'producto_local_id') || ':'
+               || ((e->>'quantity_scaled')::bigint)::text || E'\n',
+               '' ORDER BY btrim(e->>'producto_local_id')
+           )
+      INTO v_lines
+      FROM jsonb_array_elements(p_lines) e;
+    v_material := p_cutover_id || E'\n' || p_epoch::text || E'\n'
+        || v_count::text || E'\n' || COALESCE(v_lines, '');
+    RETURN encode(
+        pg_catalog.sha256(pg_catalog.convert_to(v_material, 'UTF8')),
+        'hex'
+    );
+END;
+$ferrepro_checksum$;
+
+CREATE OR REPLACE FUNCTION public.register_inventory_cutover_fleet(
+    p_cutover_id text,
+    p_epoch bigint,
+    p_expected_device_ids jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $ferrepro_register$
+DECLARE
+    v_status text;
+    v_epoch bigint;
+    v_now text;
+    v_count bigint;
+    v_distinct bigint;
+BEGIN
+    IF session_user IS DISTINCT FROM current_user THEN
+        RAISE EXCEPTION 'INVENTORY_FORBIDDEN: register fleet solo el owner'
+            USING ERRCODE = '42501';
+    END IF;
+    IF p_expected_device_ids IS NULL
+       OR jsonb_typeof(p_expected_device_ids) <> 'array'
+       OR jsonb_array_length(p_expected_device_ids) = 0 THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_REQUIRED: estaciones esperadas obligatorias'
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT COUNT(*), COUNT(DISTINCT value)
+      INTO v_count, v_distinct
+      FROM jsonb_array_elements_text(p_expected_device_ids);
+    IF v_count IS DISTINCT FROM v_distinct THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_INVALID: device_id duplicado'
+            USING ERRCODE = '22023';
+    END IF;
+    BEGIN
+        PERFORM (value::uuid)
+          FROM jsonb_array_elements_text(p_expected_device_ids);
+    EXCEPTION WHEN invalid_text_representation THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_INVALID: device_id debe ser UUID'
+            USING ERRCODE = '22023';
+    END;
+    SELECT status, epoch INTO v_status, v_epoch
+      FROM public.inventory_cutover_control WHERE id = 1 FOR UPDATE;
+    IF v_status IS DISTINCT FROM 'CUTOVER_IN_PROGRESS'
+       OR v_epoch IS DISTINCT FROM p_epoch THEN
+        RAISE EXCEPTION 'STALE_CUTOVER_STATE: fleet plan exige CUTOVER_IN_PROGRESS/epoch actual'
+            USING ERRCODE = '40001';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM public.inventory_cutover_snapshots
+         WHERE cutover_id = p_cutover_id
+    ) THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_INVALID: cutover_id ya registrado'
+            USING ERRCODE = '22023';
+    END IF;
+    v_now := to_char(timezone('UTC', clock_timestamp()), 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+    INSERT INTO public.inventory_cutover_snapshots (
+        cutover_id, epoch, status, created_at
+    ) VALUES (p_cutover_id, p_epoch, 'COLLECTING', v_now);
+    INSERT INTO public.inventory_cutover_expected_stations (
+        cutover_id, epoch, device_id
+    )
+    SELECT p_cutover_id, p_epoch, value
+      FROM jsonb_array_elements_text(p_expected_device_ids);
+    UPDATE public.inventory_cutover_control
+       SET cutover_id = p_cutover_id,
+           snapshot = NULL,
+           snapshot_checksum = NULL,
+           updated_at = v_now
+     WHERE id = 1 AND status = 'CUTOVER_IN_PROGRESS' AND epoch = p_epoch;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'STALE_CUTOVER_STATE: fleet plan perdió CAS'
+            USING ERRCODE = '40001';
+    END IF;
+    RETURN jsonb_build_object(
+        'cutover_id', p_cutover_id,
+        'epoch', p_epoch,
+        'expected_stations', v_count,
+        'status', 'COLLECTING'
+    );
+END;
+$ferrepro_register$;
+
+CREATE OR REPLACE FUNCTION public.submit_inventory_cutover_attestation(
+    p_cutover_id text,
+    p_epoch bigint,
+    p_device_id text,
+    p_checksum text,
+    p_product_count bigint,
+    p_lines jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $ferrepro_attest$
+DECLARE
+    v_status text;
+    v_epoch bigint;
+    v_plan_status text;
+    v_checksum text;
+    v_count bigint;
+    v_now text;
+BEGIN
+    IF session_user IS DISTINCT FROM current_user THEN
+        RAISE EXCEPTION 'INVENTORY_FORBIDDEN: atestación solo el cutover admin'
+            USING ERRCODE = '42501';
+    END IF;
+    SELECT status, epoch INTO v_status, v_epoch
+      FROM public.inventory_cutover_control WHERE id = 1 FOR SHARE;
+    IF v_status IS DISTINCT FROM 'CUTOVER_IN_PROGRESS'
+       OR v_epoch IS DISTINCT FROM p_epoch THEN
+        RAISE EXCEPTION 'STALE_CUTOVER_STATE: atestación fuera del epoch activo'
+            USING ERRCODE = '40001';
+    END IF;
+    SELECT status INTO v_plan_status
+      FROM public.inventory_cutover_snapshots
+     WHERE cutover_id = p_cutover_id AND epoch = p_epoch
+     FOR UPDATE;
+    IF NOT FOUND OR v_plan_status IS DISTINCT FROM 'COLLECTING' THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_CLOSED: snapshot no acepta atestaciones'
+            USING ERRCODE = '22023';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM public.inventory_cutover_expected_stations
+         WHERE cutover_id = p_cutover_id
+           AND epoch = p_epoch
+           AND device_id = p_device_id
+    ) THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_UNEXPECTED_STATION: %', p_device_id
+            USING ERRCODE = '22023';
+    END IF;
+    v_count := jsonb_array_length(p_lines);
+    IF p_product_count IS DISTINCT FROM v_count THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_INVALID: product_count divergente'
+            USING ERRCODE = '22023';
+    END IF;
+    v_checksum := public.inventory_cutover_checksum(p_cutover_id, p_epoch, p_lines);
+    IF lower(COALESCE(p_checksum, '')) IS DISTINCT FROM v_checksum THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_INVALID: checksum inválido'
+            USING ERRCODE = '22023';
+    END IF;
+    DELETE FROM public.inventory_cutover_attestation_lines
+     WHERE cutover_id = p_cutover_id AND device_id = p_device_id;
+    DELETE FROM public.inventory_cutover_attestations
+     WHERE cutover_id = p_cutover_id AND device_id = p_device_id;
+    v_now := to_char(timezone('UTC', clock_timestamp()), 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+    INSERT INTO public.inventory_cutover_attestations (
+        cutover_id, epoch, device_id, checksum, product_count, attested_at
+    ) VALUES (
+        p_cutover_id, p_epoch, p_device_id, v_checksum, v_count, v_now
+    );
+    INSERT INTO public.inventory_cutover_attestation_lines (
+        cutover_id, device_id, producto_local_id, quantity_scaled
+    )
+    SELECT p_cutover_id, p_device_id,
+           btrim(e->>'producto_local_id'),
+           (e->>'quantity_scaled')::bigint
+      FROM jsonb_array_elements(p_lines) e;
+    RETURN jsonb_build_object(
+        'cutover_id', p_cutover_id,
+        'epoch', p_epoch,
+        'device_id', p_device_id,
+        'checksum', v_checksum,
+        'product_count', v_count
+    );
+END;
+$ferrepro_attest$;
+
+CREATE OR REPLACE FUNCTION public.approve_inventory_cutover_snapshot(
+    p_cutover_id text,
+    p_epoch bigint
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $ferrepro_approve$
+DECLARE
+    v_status text;
+    v_epoch bigint;
+    v_control_cutover text;
+    v_plan_status text;
+    v_expected bigint;
+    v_received bigint;
+    v_checksums bigint;
+    v_counts bigint;
+    v_checksum text;
+    v_product_count bigint;
+    v_reference text;
+    v_lines jsonb;
+    v_now text;
+BEGIN
+    IF session_user IS DISTINCT FROM current_user THEN
+        RAISE EXCEPTION 'INVENTORY_FORBIDDEN: approve snapshot solo el owner'
+            USING ERRCODE = '42501';
+    END IF;
+    SELECT status, epoch, cutover_id
+      INTO v_status, v_epoch, v_control_cutover
+      FROM public.inventory_cutover_control WHERE id = 1 FOR UPDATE;
+    IF v_status IS DISTINCT FROM 'CUTOVER_IN_PROGRESS'
+       OR v_epoch IS DISTINCT FROM p_epoch
+       OR v_control_cutover IS DISTINCT FROM p_cutover_id THEN
+        RAISE EXCEPTION 'STALE_CUTOVER_STATE: aprobación fuera del cutover activo'
+            USING ERRCODE = '40001';
+    END IF;
+    SELECT status INTO v_plan_status
+      FROM public.inventory_cutover_snapshots
+     WHERE cutover_id = p_cutover_id AND epoch = p_epoch
+     FOR UPDATE;
+    IF NOT FOUND OR v_plan_status IS DISTINCT FROM 'COLLECTING' THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_INVALID: snapshot no está COLLECTING'
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT COUNT(*) INTO v_expected
+      FROM public.inventory_cutover_expected_stations
+     WHERE cutover_id = p_cutover_id AND epoch = p_epoch;
+    SELECT COUNT(*), COUNT(DISTINCT checksum), COUNT(DISTINCT product_count),
+           MIN(checksum), MIN(product_count), MIN(device_id)
+      INTO v_received, v_checksums, v_counts,
+           v_checksum, v_product_count, v_reference
+      FROM public.inventory_cutover_attestations
+     WHERE cutover_id = p_cutover_id AND epoch = p_epoch;
+    IF v_expected = 0 OR v_received IS DISTINCT FROM v_expected THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_MISSING: expected=% received=%',
+            v_expected, v_received USING ERRCODE = '22023';
+    END IF;
+    IF v_checksums IS DISTINCT FROM 1 OR v_counts IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_DIVERGENT: estaciones no convergen'
+            USING ERRCODE = '22023';
+    END IF;
+    DELETE FROM public.inventory_cutover_snapshot_lines
+     WHERE cutover_id = p_cutover_id;
+    INSERT INTO public.inventory_cutover_snapshot_lines (
+        cutover_id, producto_local_id, quantity_scaled
+    )
+    SELECT cutover_id, producto_local_id, quantity_scaled
+      FROM public.inventory_cutover_attestation_lines
+     WHERE cutover_id = p_cutover_id AND device_id = v_reference;
+    SELECT COALESCE(
+               jsonb_agg(
+                   jsonb_build_object(
+                       'producto_local_id', producto_local_id,
+                       'quantity_scaled', quantity_scaled
+                   ) ORDER BY producto_local_id
+               ),
+               '[]'::jsonb
+           )
+      INTO v_lines
+      FROM public.inventory_cutover_snapshot_lines
+     WHERE cutover_id = p_cutover_id;
+    IF public.inventory_cutover_checksum(p_cutover_id, p_epoch, v_lines)
+       IS DISTINCT FROM v_checksum THEN
+        RAISE EXCEPTION 'FLEET_ATTESTATION_DIVERGENT: líneas no coinciden con checksum'
+            USING ERRCODE = '22023';
+    END IF;
+    v_now := to_char(timezone('UTC', clock_timestamp()), 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
+    UPDATE public.inventory_cutover_snapshots
+       SET status = 'APPROVED', checksum = v_checksum,
+           product_count = v_product_count, approved_at = v_now
+     WHERE cutover_id = p_cutover_id AND epoch = p_epoch
+       AND status = 'COLLECTING';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'STALE_CUTOVER_STATE: aprobación perdió CAS'
+            USING ERRCODE = '40001';
+    END IF;
+    UPDATE public.inventory_cutover_control
+       SET snapshot = jsonb_build_object(
+               'cutover_id', p_cutover_id,
+               'epoch', p_epoch,
+               'checksum', v_checksum,
+               'product_count', v_product_count,
+               'status', 'APPROVED'
+           ),
+           snapshot_checksum = v_checksum,
+           updated_at = v_now
+     WHERE id = 1 AND status = 'CUTOVER_IN_PROGRESS'
+       AND epoch = p_epoch AND cutover_id = p_cutover_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'STALE_CUTOVER_STATE: metadata approval perdió CAS'
+            USING ERRCODE = '40001';
+    END IF;
+    RETURN jsonb_build_object(
+        'cutover_id', p_cutover_id,
+        'epoch', p_epoch,
+        'checksum', v_checksum,
+        'product_count', v_product_count,
+        'status', 'APPROVED'
+    );
+END;
+$ferrepro_approve$;
+
+DROP FUNCTION IF EXISTS public.initialize_inventory_balances_from_snapshot(jsonb);
+CREATE OR REPLACE FUNCTION public.initialize_inventory_balances_from_snapshot(
+    p_cutover_id text,
+    p_epoch bigint
+)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $ferrepro_snap$
 DECLARE
+    v_status text;
+    v_epoch bigint;
+    v_control_cutover text;
+    v_snapshot_status text;
+    v_checksum text;
+    v_computed_checksum text;
+    v_product_count bigint;
+    v_lines jsonb;
     v_now text;
     v_inserted bigint := 0;
-    v_line jsonb;
     v_pid text;
     v_qty bigint;
     v_inserted_one integer;
@@ -392,8 +810,47 @@ BEGIN
         RAISE EXCEPTION 'INVENTORY_FORBIDDEN: initialize_inventory_balances_from_snapshot solo el owner'
             USING ERRCODE = '42501';
     END IF;
-    IF p_snapshot IS NULL OR jsonb_typeof(p_snapshot->'lines') IS DISTINCT FROM 'array' THEN
-        RAISE EXCEPTION 'INVENTORY_SNAPSHOT_INVALID'
+    SELECT status, epoch, cutover_id
+      INTO v_status, v_epoch, v_control_cutover
+      FROM public.inventory_cutover_control WHERE id = 1 FOR UPDATE;
+    IF v_status IS DISTINCT FROM 'CUTOVER_IN_PROGRESS'
+       OR v_epoch IS DISTINCT FROM p_epoch
+       OR v_control_cutover IS DISTINCT FROM p_cutover_id THEN
+        RAISE EXCEPTION 'STALE_CUTOVER_STATE: seed fuera del cutover aprobado'
+            USING ERRCODE = '40001';
+    END IF;
+    SELECT status, checksum, product_count
+      INTO v_snapshot_status, v_checksum, v_product_count
+      FROM public.inventory_cutover_snapshots
+     WHERE cutover_id = p_cutover_id AND epoch = p_epoch
+     FOR UPDATE;
+    IF NOT FOUND OR v_snapshot_status NOT IN ('APPROVED', 'SEEDED')
+       OR v_checksum IS NULL THEN
+        RAISE EXCEPTION 'INVENTORY_SNAPSHOT_NOT_APPROVED'
+            USING ERRCODE = '22023';
+    END IF;
+    PERFORM 1
+      FROM public.inventory_cutover_snapshot_lines
+     WHERE cutover_id = p_cutover_id
+     FOR SHARE;
+    SELECT COALESCE(
+               jsonb_agg(
+                   jsonb_build_object(
+                       'producto_local_id', producto_local_id,
+                       'quantity_scaled', quantity_scaled
+                   ) ORDER BY producto_local_id
+               ),
+               '[]'::jsonb
+           )
+      INTO v_lines
+      FROM public.inventory_cutover_snapshot_lines
+     WHERE cutover_id = p_cutover_id;
+    v_computed_checksum := public.inventory_cutover_checksum(
+        p_cutover_id, p_epoch, v_lines
+    );
+    IF jsonb_array_length(v_lines) IS DISTINCT FROM v_product_count
+       OR v_computed_checksum IS DISTINCT FROM v_checksum THEN
+        RAISE EXCEPTION 'INVENTORY_SNAPSHOT_INVALID: líneas aprobadas no coinciden con checksum'
             USING ERRCODE = '22023';
     END IF;
     PERFORM pg_advisory_xact_lock(
@@ -408,24 +865,19 @@ BEGIN
             'inserted', 0,
             'source', 'cutover_snapshot',
             'already_initialized', true,
-            'checksum', p_snapshot->>'checksum'
+            'checksum', v_checksum
         );
     END IF;
     v_now := to_char(
         timezone('UTC', clock_timestamp()),
         'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
     );
-    FOR v_line IN
-        SELECT value
-          FROM jsonb_array_elements(p_snapshot->'lines')
-         ORDER BY value->>'producto_local_id'
+    FOR v_pid, v_qty IN
+        SELECT producto_local_id, quantity_scaled
+          FROM public.inventory_cutover_snapshot_lines
+         WHERE cutover_id = p_cutover_id
+         ORDER BY producto_local_id
     LOOP
-        v_pid := btrim(v_line->>'producto_local_id');
-        v_qty := (v_line->>'quantity_scaled')::bigint;
-        IF v_pid IS NULL OR v_pid = '' THEN
-            RAISE EXCEPTION 'INVENTORY_SNAPSHOT_INVALID: local_id vacío'
-                USING ERRCODE = '22023';
-        END IF;
         PERFORM pg_advisory_xact_lock(
             pg_catalog.hashtextextended('ferrepro.invbal:' || v_pid, 0)
         );
@@ -444,15 +896,23 @@ BEGIN
     END LOOP;
     INSERT INTO public.inventory_balance_init_state (init_key, initialized_at)
     VALUES ('legacy_cutover', v_now);
+    UPDATE public.inventory_cutover_snapshots
+       SET status = 'SEEDED', seeded_at = v_now
+     WHERE cutover_id = p_cutover_id AND epoch = p_epoch
+       AND status = 'APPROVED';
     RETURN jsonb_build_object(
         'inserted', v_inserted,
         'source', 'cutover_snapshot',
         'already_initialized', false,
-        'checksum', p_snapshot->>'checksum'
+        'checksum', v_checksum
     );
 END;
 $ferrepro_snap$;
-REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_snapshot(jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.inventory_cutover_checksum(text, bigint, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.register_inventory_cutover_fleet(text, bigint, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.submit_inventory_cutover_attestation(text, bigint, text, text, bigint, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.approve_inventory_cutover_snapshot(text, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_snapshot(text, bigint) FROM PUBLIC;
 DO $ferrepro_cutover_grants$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ferrepro_inventory_app') THEN
@@ -463,7 +923,20 @@ BEGIN
             TO ferrepro_inventory_app;
         GRANT EXECUTE ON FUNCTION public.lock_legacy_cutover_fence()
             TO ferrepro_inventory_app;
-        REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_snapshot(jsonb)
+        REVOKE ALL ON TABLE public.inventory_cutover_snapshots,
+            public.inventory_cutover_expected_stations,
+            public.inventory_cutover_attestations,
+            public.inventory_cutover_attestation_lines,
+            public.inventory_cutover_snapshot_lines
+            FROM ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.register_inventory_cutover_fleet(text, bigint, jsonb)
+            FROM ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.submit_inventory_cutover_attestation(
+            text, bigint, text, text, bigint, jsonb
+        ) FROM ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.approve_inventory_cutover_snapshot(text, bigint)
+            FROM ferrepro_inventory_app;
+        REVOKE ALL ON FUNCTION public.initialize_inventory_balances_from_snapshot(text, bigint)
             FROM ferrepro_inventory_app;
     END IF;
 END
@@ -1779,8 +2252,28 @@ def reconcile_legacy_sources(sqlite_conn, admin_conn) -> SeedReconciliation:
 
 
 def snapshot_checksum(payload: Mapping[str, Any]) -> str:
-    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    """Checksum canónico de snapshot 1E.4D.
+
+    La fuente no participa: la identidad aprobada es cutover/epoch + conjunto
+    completo de cantidades. El formato coincide byte a byte con la función
+    PostgreSQL ``inventory_cutover_checksum``.
+    """
+    lines = payload.get("lines") or ()
+    pairs = tuple(
+        sorted(
+            (
+                str(item["producto_local_id"]),
+                int(item["quantity_scaled"]),
+            )
+            for item in lines
+        )
+    )
+    material = (
+        f"{str(payload['cutover_id'])}\n{int(payload['epoch'])}\n"
+        f"{len(pairs)}\n"
+        + "".join(f"{lid}:{qty}\n" for lid, qty in pairs)
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def build_cutover_snapshot(
@@ -1923,6 +2416,177 @@ def capture_cutover_snapshot(sqlite_conn, admin_conn, *, epoch: int) -> CutoverS
     return build_cutover_snapshot(tuple(lines), epoch=epoch)
 
 
+def _station_attestation_lines(sqlite_conn, admin_conn) -> Tuple[Tuple[str, int], ...]:
+    """Valida identidad de productos y devuelve cantidades de UNA estación.
+
+    PostgreSQL ``productos.stock`` no decide cantidades. Solo se usa el
+    conjunto de ``local_id`` remotos para impedir productos faltantes/extra.
+    La convergencia de cantidades se decide entre todas las atestaciones.
+    """
+    local_info = _classify_product_rows(_sqlite_legacy_rows(sqlite_conn), sqlite=True)
+    remote_info = _classify_product_rows(_postgres_legacy_rows(admin_conn), sqlite=False)
+    local_ids = set(local_info["valid"])
+    remote_ids = set(remote_info["valid"])
+    problems = {
+        "sqlite_only": sorted(local_ids - remote_ids),
+        "postgres_only": sorted(remote_ids - local_ids),
+        "invalid_local_id": sorted(
+            set(local_info["invalid"]) | set(remote_info["invalid"])
+        ),
+        "null_local_id": sorted(
+            set(local_info["null"]) | set(remote_info["null"])
+        ),
+        "duplicates": sorted(
+            set(local_info["duplicates"]) | set(remote_info["duplicates"])
+        ),
+    }
+    if any(problems.values()):
+        raise LegacyReconciliationRequiredError(
+            "FLEET_PRODUCT_SET_MISMATCH: " + json.dumps(problems, sort_keys=True)
+        )
+    return tuple(sorted((lid, int(qty)) for lid, qty in local_info["valid"].items()))
+
+
+def register_inventory_cutover_fleet(
+    admin_conn,
+    *,
+    cutover_id: str,
+    epoch: int,
+    expected_station_ids: Sequence[str],
+) -> dict:
+    expected = tuple(str(item).strip() for item in expected_station_ids)
+    if not expected or any(not item for item in expected):
+        raise InventoryCutoverError(
+            "FLEET_ATTESTATION_REQUIRED: expected_station_ids explícito y no vacío"
+        )
+    if len(set(expected)) != len(expected):
+        raise InventoryCutoverError("FLEET_ATTESTATION_INVALID: device_id duplicado")
+    for item in expected:
+        try:
+            uuid.UUID(item)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise InventoryCutoverError(
+                f"FLEET_ATTESTATION_INVALID: device_id no UUID: {item!r}"
+            ) from exc
+    try:
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.register_inventory_cutover_fleet(%s, %s, %s::jsonb)",
+                (str(cutover_id), int(epoch), json.dumps(expected)),
+            )
+            row = cur.fetchone()
+        admin_conn.commit()
+    except Exception:
+        admin_conn.rollback()
+        raise
+    data = row[0] if row else {}
+    if isinstance(data, str):
+        data = json.loads(data)
+    return dict(data or {})
+
+
+def submit_inventory_cutover_attestation(
+    sqlite_conn,
+    pg_conn,
+    *,
+    cutover_id: str,
+    epoch: int,
+    device_id: str,
+    product_catalog_conn=None,
+) -> CutoverSnapshot:
+    lines = _station_attestation_lines(
+        sqlite_conn, product_catalog_conn if product_catalog_conn is not None else pg_conn
+    )
+    snapshot = build_cutover_snapshot(
+        lines,
+        epoch=int(epoch),
+        cutover_id=str(cutover_id),
+        source="fleet_attestation",
+    )
+    payload = json.dumps(
+        [
+            {
+                "producto_local_id": line.producto_local_id,
+                "quantity_scaled": line.quantity_scaled,
+            }
+            for line in snapshot.lines
+        ]
+    )
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.submit_inventory_cutover_attestation("
+                "%s, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    snapshot.cutover_id,
+                    snapshot.epoch,
+                    str(device_id),
+                    snapshot.checksum,
+                    len(snapshot.lines),
+                    payload,
+                ),
+            )
+            cur.fetchone()
+        pg_conn.commit()
+    except Exception:
+        pg_conn.rollback()
+        raise
+    return snapshot
+
+
+def load_approved_inventory_cutover_snapshot(
+    admin_conn, *, cutover_id: str, epoch: int
+) -> CutoverSnapshot:
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, checksum, approved_at FROM "
+            "public.inventory_cutover_snapshots "
+            "WHERE cutover_id = %s AND epoch = %s",
+            (str(cutover_id), int(epoch)),
+        )
+        head = cur.fetchone()
+        if head is None or str(head[0]) not in ("APPROVED", "SEEDED"):
+            admin_conn.rollback()
+            raise InventoryCutoverError("INVENTORY_SNAPSHOT_NOT_APPROVED")
+        cur.execute(
+            "SELECT producto_local_id, quantity_scaled FROM "
+            "public.inventory_cutover_snapshot_lines "
+            "WHERE cutover_id = %s ORDER BY producto_local_id",
+            (str(cutover_id),),
+        )
+        lines = tuple((str(row[0]), int(row[1])) for row in cur.fetchall())
+    admin_conn.rollback()
+    snapshot = build_cutover_snapshot(
+        lines,
+        epoch=int(epoch),
+        cutover_id=str(cutover_id),
+        captured_at=str(head[2] or _now_iso()),
+        source="fleet_approved",
+    )
+    if snapshot.checksum != str(head[1]):
+        raise InventoryCutoverError("INVENTORY_SNAPSHOT_INVALID: checksum aprobado")
+    return snapshot
+
+
+def approve_inventory_cutover_snapshot(
+    admin_conn, *, cutover_id: str, epoch: int
+) -> CutoverSnapshot:
+    try:
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.approve_inventory_cutover_snapshot(%s, %s)",
+                (str(cutover_id), int(epoch)),
+            )
+            cur.fetchone()
+        admin_conn.commit()
+    except Exception:
+        admin_conn.rollback()
+        raise
+    return load_approved_inventory_cutover_snapshot(
+        admin_conn, cutover_id=str(cutover_id), epoch=int(epoch)
+    )
+
+
 def list_in_flight_inventory(sqlite_conn, admin_conn=None) -> Tuple[str, ...]:
     inflight = list(list_transmittable_command_ids(sqlite_conn))
     if admin_conn is None:
@@ -1964,14 +2628,18 @@ def list_in_flight_inventory(sqlite_conn, admin_conn=None) -> Tuple[str, ...]:
 
 
 def initialize_inventory_balances_from_snapshot(admin_conn, snapshot: CutoverSnapshot) -> dict:
-    """One-shot desde snapshot congelado. No relee productos.stock mutable."""
+    """One-shot por referencia al snapshot aprobado en PostgreSQL.
+
+    Las líneas del objeto Python se ignoran deliberadamente: después de la
+    aprobación el servidor solo acepta ``cutover_id``/``epoch`` y siembra las
+    líneas inmutables persistidas en PostgreSQL.
+    """
     if schema_bootstrap.is_sqlite_connection(admin_conn):
         raise InventoryCutoverError("seed de snapshot solo PostgreSQL")
-    payload = json.dumps(snapshot.as_dict())
     with admin_conn.cursor() as cur:
         cur.execute(
-            "SELECT public.initialize_inventory_balances_from_snapshot(%s::jsonb)",
-            (payload,),
+            "SELECT public.initialize_inventory_balances_from_snapshot(%s, %s)",
+            (snapshot.cutover_id, int(snapshot.epoch)),
         )
         row = cur.fetchone()
     admin_conn.commit()
@@ -2205,15 +2873,20 @@ def run_cutover(
     admin_conn,
     app_factory,
     device_id: Optional[str] = None,
+    expected_station_ids: Optional[Sequence[str]] = None,
+    station_sqlite_connections: Optional[Mapping[str, Any]] = None,
     environ: Optional[Mapping[str, str]] = None,
     require_app_dsn: bool = True,
 ) -> CutoverResult:
-    """precondiciones → freeze global → in-flight → reconciliar legacy →
-    snapshot → seed snapshot → comparar → activate.
+    """precondiciones → freeze → atestación completa → snapshot aprobado →
+    seed por referencia → comparar → activate.
 
     Seed usa owner/admin de laboratorio. Operación normal posterior: app_factory
     no-owner. No activa si una etapa falla. No toca Supabase real.
-    No elige LWW si las fuentes legacy divergen.
+    ``expected_station_ids`` es obligatorio: no se infiere consenso porque
+    haya respondido una sola estación. PostgreSQL ``productos.stock`` solo
+    valida el conjunto de productos; las cantidades salen del consenso de
+    estaciones esperado.
     """
     ensure_cutover_schema(sqlite_conn)
     ensure_postgres_cutover_schema(admin_conn)
@@ -2248,6 +2921,29 @@ def run_cutover(
             error="preconditions",
         )
 
+    configured_expected = expected_station_ids
+    if configured_expected is None:
+        env_source = environ if environ is not None else os.environ
+        raw_expected = str(env_source.get(CUTOVER_EXPECTED_STATIONS_ENV, "") or "")
+        configured_expected = tuple(
+            item.strip() for item in raw_expected.split(",") if item.strip()
+        )
+    expected = tuple(str(item).strip() for item in (configured_expected or ()))
+    if not expected:
+        return CutoverResult(
+            state=load_cutover_state(sqlite_conn),
+            aborted=True,
+            error="FLEET_ATTESTATION_REQUIRED: expected_station_ids obligatorio",
+        )
+    if device_id is None and len(expected) == 1:
+        device_id = expected[0]
+    if not device_id or str(device_id).strip() not in set(expected):
+        return CutoverResult(
+            state=load_cutover_state(sqlite_conn),
+            aborted=True,
+            error="FLEET_ATTESTATION_REQUIRED: device_id coordinador debe ser esperado",
+        )
+
     freeze_inventory_writes(sqlite_conn, admin_conn=admin_conn, device_id=device_id)
     snapshot = None
     legacy_recon = None
@@ -2257,21 +2953,39 @@ def run_cutover(
             raise InventoryCutoverError(
                 f"operaciones de inventario en vuelo: {len(inflight)}"
             )
-        legacy_recon = reconcile_legacy_sources(sqlite_conn, admin_conn)
-        if not legacy_recon.ok:
-            abort_pre_activation(
-                sqlite_conn, admin_conn=admin_conn, reason="legacy_reconciliation"
-            )
-            return CutoverResult(
-                state=load_cutover_state(sqlite_conn),
-                reconciliation=legacy_recon,
-                legacy_reconciliation=legacy_recon,
-                aborted=True,
-                error="legacy_reconciliation",
-            )
         current = load_postgres_cutover_state(admin_conn, ensure_schema=False)
-        snapshot = capture_cutover_snapshot(
-            sqlite_conn, admin_conn, epoch=int(current.epoch)
+        cutover_id = str(uuid.uuid4())
+        register_inventory_cutover_fleet(
+            admin_conn,
+            cutover_id=cutover_id,
+            epoch=int(current.epoch),
+            expected_station_ids=expected,
+        )
+        stations = dict(station_sqlite_connections or {})
+        stations[str(device_id).strip()] = sqlite_conn
+        unexpected = sorted(set(stations) - set(expected))
+        if unexpected:
+            raise InventoryCutoverError(
+                "FLEET_ATTESTATION_UNEXPECTED_STATION: " + ", ".join(unexpected)
+            )
+        for station_id in expected:
+            station_conn = stations.get(station_id)
+            if station_conn is None:
+                continue
+            submit_inventory_cutover_attestation(
+                station_conn,
+                admin_conn,
+                cutover_id=cutover_id,
+                epoch=int(current.epoch),
+                device_id=station_id,
+                product_catalog_conn=admin_conn,
+            )
+        snapshot = approve_inventory_cutover_snapshot(
+            admin_conn, cutover_id=cutover_id, epoch=int(current.epoch)
+        )
+        legacy_recon = SeedReconciliation(
+            productos_legacy=len(snapshot.lines),
+            seeded=len(snapshot.lines),
         )
         persist_cutover_snapshot(sqlite_conn, snapshot, admin_conn=admin_conn)
         seed_info = initialize_inventory_balances_from_snapshot(admin_conn, snapshot)

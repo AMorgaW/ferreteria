@@ -47,7 +47,10 @@ def _app_dsn() -> str:
 
 
 def _app_environ():
-    return {"FERREPRO_INVENTORY_DSN": _app_dsn()}
+    return {
+        "FERREPRO_INVENTORY_DSN": _app_dsn(),
+        "FERREPRO_CUTOVER_EXPECTED_STATIONS": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    }
 
 
 class Fase1E3PostgresTest(unittest.TestCase):
