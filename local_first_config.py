@@ -89,6 +89,18 @@ DEFAULT_CONFIG = {
 }
 
 
+def lan_auto_start_enabled(config=None):
+    """True solo si auto_start_server está explícitamente en True.
+
+    Clave ausente, False o cualquier otro valor → False (default seguro).
+    No reescribe el JSON del usuario. Un true histórico arranca el listener
+    de diagnóstico, pero local_server no es writer comercial (F5-M1).
+    """
+    if config is None:
+        config = load_config()
+    return config.get("auto_start_server") is True
+
+
 def load_config():
     cfg_dir = _config_dir()
     cfg_path = _config_path()

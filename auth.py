@@ -3,12 +3,15 @@
 Sistema de autenticación y gestión de usuarios
 """
 import hashlib
+import logging
 import sqlite3
 from typing import Optional, Tuple
 from datetime import datetime
 from models import Usuario, RolUsuario
 from security import (hash_password as _secure_hash, verify_password, needs_rehash,
                       verificar_bloqueo, registrar_fallo, registrar_exito, MAX_INTENTOS)
+
+logger = logging.getLogger(__name__)
 
 class AuthManager:
     """Gestor de autenticación y usuarios"""
@@ -54,7 +57,15 @@ class AuthManager:
                                    (_secure_hash(password), row['id']))
                     conn.commit()
                 except Exception:
-                    pass
+                    logger.warning(
+                        "Fallo al actualizar hash de credenciales (rehash PBKDF2) "
+                        "para usuario_id=%s; el inicio de sesión continúa",
+                        row["id"],
+                    )
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
             # Usuario encontrado y activo
             usuario = Usuario(

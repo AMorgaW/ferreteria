@@ -50,7 +50,7 @@ from repositories.abonos_ventas_repo import AbonosVentasRepository
 from ui_config import COLORS, FONTS, DIMENSIONS, GLOBAL_QSS, make_font
 from ui.widgets import make_line_icon
 from ui.async_worker import FunctionWorker
-from local_first_config import load_config
+from local_first_config import lan_auto_start_enabled, load_config
 from local_server_manager import LocalServerManager
 from performance_trace import mark, timed
 
@@ -879,7 +879,7 @@ class SistemaFerreteriaApp(QMainWindow):
 
     def _verificar_servicios_local_first(self):
         """(Worker) Resuelve el propietario del push sin tocar el GUI thread."""
-        if self.local_first_config.get("auto_start_server", True):
+        if lan_auto_start_enabled(self.local_first_config):
             estado = self.local_server_manager.ensure_running(wait_ready=True, timeout=8.0)
         else:
             estado = {"active": False, "url": None, "disabled": True}
@@ -1162,7 +1162,7 @@ def show_login_and_run(reuse_app=False, server_manager=None, modo_emergencia=Non
     if server_manager is None and _es_local:
         try:
             cfg = load_config()
-            if cfg.get("auto_start_server", True):
+            if lan_auto_start_enabled(cfg):
                 server_manager = LocalServerManager(cfg)
                 import threading
                 threading.Thread(target=server_manager.start, daemon=True).start()
