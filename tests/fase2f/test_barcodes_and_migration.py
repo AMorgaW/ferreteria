@@ -114,8 +114,10 @@ class PackageRoleMigrationTest(unittest.TestCase):
             try:
                 first = default_runner().run(conn, dry_run=False)
                 second = default_runner().run(conn, dry_run=False)
-                self.assertEqual(first[-1].status, "APPLIED")
-                self.assertEqual(second[-1].status, "SKIPPED_APPLIED")
+                self.assertTrue(
+                    all(item.status in ("APPLIED", "SKIPPED_APPLIED") for item in first)
+                )
+                self.assertTrue(all(item.status == "SKIPPED_APPLIED" for item in second))
                 self.assertEqual(first[-1].checksum, second[-1].checksum)
             finally:
                 conn.close()

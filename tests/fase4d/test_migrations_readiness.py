@@ -74,7 +74,9 @@ class MigrationReadinessTest(unittest.TestCase):
             try:
                 first = default_runner().run(conn, dry_run=False)
                 second = default_runner().run(conn, dry_run=False)
-                self.assertTrue(all(item.status == "APPLIED" for item in first))
+                self.assertTrue(
+                    all(item.status in ("APPLIED", "SKIPPED_APPLIED") for item in first)
+                )
                 self.assertTrue(all(item.status == "SKIPPED_APPLIED" for item in second))
             finally:
                 conn.close()

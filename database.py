@@ -35,11 +35,25 @@ class DatabaseManager:
                 # aplicarían sobre el archivo equivocado.
                 from local_first_db import DEFAULT_DB_PATH as _LF_DB
                 ensure_local_first_schema(_LF_DB)
+                self._ensure_sqlite_schema_current(_LF_DB)
             DatabaseManager._schema_initialized = True
 
     def conectar(self):
         """Abre conexión a PostgreSQL (Supabase)."""
         return pg_compat.connect()
+
+    def _ensure_sqlite_schema_current(self, db_path: str) -> None:
+        """Aplica el catálogo versionado SQLite. No toca PostgreSQL remoto."""
+        conn = self.conectar()
+        try:
+            sqlite = schema_bootstrap.is_sqlite_connection(conn)
+        finally:
+            conn.close()
+        if not sqlite:
+            return
+        from schema_lifecycle import ensure_sqlite_schema_current
+
+        ensure_sqlite_schema_current(db_path)
     
     def ejecutar_script(self, script: str):
         """Ejecuta un script SQL (sentencias separadas por ';')"""
@@ -714,9 +728,11 @@ class DatabaseManager:
         Verifica el esquema y agrega columnas faltantes si es necesario.
         """
         conn = self.conectar()
+        sqlite = False
         try:
             schema_bootstrap.apply_engine_schema_fixes(conn)
-            if schema_bootstrap.is_sqlite_connection(conn):
+            sqlite = schema_bootstrap.is_sqlite_connection(conn)
+            if sqlite:
                 from cash_schema import ensure_sqlite_cash_operational_schema
 
                 ensure_sqlite_cash_operational_schema(conn)
@@ -729,6 +745,10 @@ class DatabaseManager:
             raise
         finally:
             conn.close()
+        if sqlite:
+            from local_first_db import DEFAULT_DB_PATH as _LF_DB
+
+            self._ensure_sqlite_schema_current(_LF_DB)
     
     def obtener_estadisticas(self) -> dict:
         """Obtiene estadísticas generales del sistema"""

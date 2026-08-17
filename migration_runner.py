@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Runner mínimo de migraciones SQLite versionadas para Fase 2A.
+"""Runner mínimo de migraciones SQLite versionadas.
 
-No se ejecuta automáticamente al importar ni al arrancar la aplicación. El
-caller debe entregar una conexión explícita. Cada migración es atómica y se
-registra solo después de completar su savepoint.
+No se ejecuta al importar. El arranque productivo llama
+``schema_lifecycle.ensure_sqlite_schema_current``, que invoca ``run``
+explícitamente con ``dry_run=False``. El caller de ``run`` entrega una
+conexión explícita. Cada migración es atómica y se registra solo después
+de completar su savepoint. ``dry_run=True`` sigue siendo el default de
+``run`` para que las herramientas de diagnóstico no muten.
 """
 from __future__ import annotations
 

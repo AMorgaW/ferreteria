@@ -13,14 +13,12 @@ class MigrationRunnerTest(unittest.TestCase):
             conn = env.connect()
             try:
                 first = default_runner().run(conn, dry_run=False)
-                self.assertEqual(
+                self.assertTrue(first)
+                self.assertTrue(
+                    all(item.status == "SKIPPED_APPLIED" for item in first),
                     [item.status for item in first],
-                    [
-                        "APPLIED", "APPLIED", "APPLIED",
-                        "APPLIED", "APPLIED", "APPLIED",
-                        "APPLIED", "APPLIED", "APPLIED",
-                    ],
                 )
+                self.assertEqual(len(first), len(default_runner().migrations))
                 cols = {row["name"] for row in conn.execute("PRAGMA table_info(compras)")}
                 self.assertIn("documento_tipo_normalizado", cols)
                 self.assertIn("numero_factura_normalizada", cols)
@@ -30,36 +28,35 @@ class MigrationRunnerTest(unittest.TestCase):
                 ).fetchone()
                 self.assertIsNotNone(index)
                 second = default_runner().run(conn, dry_run=False)
-                self.assertEqual(
-                    [item.status for item in second],
-                    [
-                        "SKIPPED_APPLIED", "SKIPPED_APPLIED",
-                        "SKIPPED_APPLIED", "SKIPPED_APPLIED",
-                        "SKIPPED_APPLIED", "SKIPPED_APPLIED",
-                        "SKIPPED_APPLIED", "SKIPPED_APPLIED",
-                        "SKIPPED_APPLIED",
-                    ],
-                )
+                self.assertTrue(all(item.status == "SKIPPED_APPLIED" for item in second))
+                self.assertEqual(len(second), len(default_runner().migrations))
             finally:
                 conn.close()
 
     def test_dry_run_does_not_mutate(self):
-        with official_temp_db() as env:
-            conn = env.connect()
-            try:
-                before = conn.total_changes
-                plan = default_runner().run(conn, dry_run=True)
-                self.assertTrue(all(item.status == "PENDING" for item in plan))
-                self.assertEqual(conn.total_changes, before)
-                self.assertIsNone(
-                    conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE name='schema_migrations'"
-                    ).fetchone()
-                )
-                cols = {row["name"] for row in conn.execute("PRAGMA table_info(compras)")}
-                self.assertNotIn("documento_tipo_normalizado", cols)
-            finally:
-                conn.close()
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute(
+                "CREATE TABLE compras (id INTEGER PRIMARY KEY, proveedor_id INTEGER, numero_factura TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE productos (id INTEGER PRIMARY KEY, local_id TEXT UNIQUE)"
+            )
+            conn.commit()
+            before = conn.total_changes
+            plan = default_runner().run(conn, dry_run=True)
+            self.assertTrue(all(item.status == "PENDING" for item in plan))
+            self.assertEqual(conn.total_changes, before)
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='schema_migrations'"
+                ).fetchone()
+            )
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(compras)")}
+            self.assertNotIn("documento_tipo_normalizado", cols)
+        finally:
+            conn.close()
 
     def test_legacy_fixture_missing_columns_is_upgraded(self):
         conn = sqlite3.connect(":memory:")
