@@ -219,6 +219,46 @@ class MigrationLifecycleTest(unittest.TestCase):
             conn.close()
         self.assertNotIn("20990101_999", applied)
 
+    def test_20b_failure_keeps_previous_migration_and_backup_for_pending_rerun(self):
+        path = self._legacy()
+
+        def apply_first(conn):
+            conn.execute(
+                "CREATE TABLE acceptance_previous (id INTEGER PRIMARY KEY)"
+            )
+
+        def fail_second(conn):
+            conn.execute(
+                "CREATE TABLE acceptance_failed (id INTEGER PRIMARY KEY)"
+            )
+            raise RuntimeError("boom after partial DDL")
+
+        runner = MigrationRunner(
+            (
+                Migration("20990101_998", "synthetic_previous", "v1", apply_first),
+                Migration("20990101_999", "synthetic_fail", "v1", fail_second),
+            )
+        )
+        backup_dir = self.folder / "failure-backups"
+        with self.assertRaisesRegex(SchemaLifecycleError, "MIGRATION_FAILED"):
+            ensure_sqlite_schema_current(
+                str(path), runner=runner, backup_dir=str(backup_dir)
+            )
+
+        backups = list(backup_dir.glob("backup_*.db"))
+        manifests = list(backup_dir.glob("backup_*.manifest.json"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(len(manifests), 1)
+        conn = sqlite3.connect(str(path))
+        try:
+            self.assertTrue(table_exists(conn, "acceptance_previous"))
+            self.assertFalse(table_exists(conn, "acceptance_failed"))
+            states = {item.version: item.status for item in runner.plan(conn)}
+        finally:
+            conn.close()
+        self.assertEqual(states["20990101_998"], "APPLIED")
+        self.assertEqual(states["20990101_999"], "PENDING")
+
     def test_missing_db_does_not_create(self):
         missing = self.folder / "no-such" / "ferreteria.db"
         with self.assertRaisesRegex(SchemaLifecycleError, "SQLITE_NOT_FOUND"):

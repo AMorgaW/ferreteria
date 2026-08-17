@@ -826,6 +826,12 @@ class CajaService:
             return CASH_ADMIN_DENIED
         return None
 
+    def _require_admin_read(self) -> None:
+        """Impide exponer arqueo e información administrativa por el servicio."""
+        denied = self._require_admin()
+        if denied:
+            raise PermissionError(denied)
+
     def estacion_actual(self) -> str:
         return self._station()
 
@@ -836,7 +842,15 @@ class CajaService:
         try:
             session = fetch_open_session(conn, self._station())
             if session:
-                session["monto_inicial"] = money(session.get("monto_inicial") or 0)
+                if not is_cash_admin(self._usuario()):
+                    session = {
+                        "id": session.get("id"),
+                        "station_id": session.get("station_id") or self._station(),
+                        "estado": session.get("estado") or ESTADO_OPEN,
+                        "fecha_apertura": session.get("fecha_apertura"),
+                    }
+                else:
+                    session["monto_inicial"] = money(session.get("monto_inicial") or 0)
             try:
                 conn.commit()
             except Exception:
@@ -909,12 +923,15 @@ class CajaService:
             conn.close()
 
     def obtener_resumen_cierre(self) -> dict:
+        self._require_admin_read()
         return self.obtener_resumen_sesion()
 
     def obtener_resumen_dia(self) -> dict:
+        self._require_admin_read()
         return self.obtener_resumen_sesion()
 
     def obtener_resumen_sesion(self, session: Optional[dict] = None) -> dict:
+        self._require_admin_read()
         conn = self.db.conectar()
         try:
             current = session or fetch_open_session(conn, self._station())
@@ -930,6 +947,7 @@ class CajaService:
             conn.close()
 
     def expected_cash(self, session: Optional[dict] = None) -> Decimal:
+        self._require_admin_read()
         return money(self.obtener_resumen_sesion(session)["esperado"])
 
     def cerrar_caja(self, monto_real, observaciones: str = None) -> Tuple[bool, str]:
@@ -1149,6 +1167,7 @@ class CajaService:
     def obtener_historial_cierres(self, limite: int = 30) -> list:
         if not self._usuario():
             return []
+        self._require_admin_read()
         conn = self.db.conectar()
         try:
             rows = conn.execute(
@@ -1170,6 +1189,7 @@ class CajaService:
     def obtener_ultimo_cierre_usuario(self) -> Optional[dict]:
         if not self._usuario():
             return None
+        self._require_admin_read()
         conn = self.db.conectar()
         try:
             row = conn.execute(
@@ -1188,6 +1208,7 @@ class CajaService:
             conn.close()
 
     def obtener_resumen_periodo(self, fecha_inicio: str, fecha_fin: str) -> dict:
+        self._require_admin_read()
         conn = self.db.conectar()
         try:
             return compute_period_cash_summary(conn, fecha_inicio, fecha_fin)

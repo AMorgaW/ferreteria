@@ -14,7 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from schema_lifecycle import ensure_sqlite_schema_current
-from services.operational_balance import compute_receivable
+from services.operational_balance import compute_payable, compute_receivable
 from tests.fase0.harness import REPO_FERRETERIA_DB
 from tests.fase5.helpers import (
     commercial_sha256,
@@ -34,6 +34,21 @@ def _baselines(path, venta_id):
             (venta_id,),
         ).fetchall()
         snap = compute_receivable(conn, venta_id)
+        return rows, snap
+    finally:
+        conn.close()
+
+
+def _purchase_baselines(path, compra_id):
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT amount, source FROM operational_balance_legacy_payments "
+            "WHERE document_tipo='compra' AND document_id=?",
+            (compra_id,),
+        ).fetchall()
+        snap = compute_payable(conn, compra_id)
         return rows, snap
     finally:
         conn.close()
@@ -103,6 +118,49 @@ class Migration010CutoverTest(unittest.TestCase):
         rows, snap = _baselines(self.db_path, venta_id)
         self.assertEqual(len(rows), 1)
         self.assertEqual(Decimal(str(rows[0]["amount"])), Decimal("30"))
+        self.assertEqual(snap.balance, Decimal("70.00"))
+
+    def test_15b_purchase_baseline_and_rerun_match_sales_contract(self):
+        make_legacy_station_db(self.db_path)
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            compra_id = conn.execute(
+                "INSERT INTO compras "
+                "(total, monto_pagado, saldo_pendiente, estado) "
+                "VALUES (100, 30, 70, 'COMPLETADA')"
+            ).lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+        self._migrate()
+        self._migrate()
+        rows, snap = _purchase_baselines(self.db_path, compra_id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(Decimal(str(rows[0]["amount"])), Decimal("30"))
+        self.assertEqual(rows[0]["source"], "CUTOVER_MONTO_PAGADO")
+        self.assertEqual(snap.payments, Decimal("30.00"))
+        self.assertEqual(snap.balance, Decimal("70.00"))
+
+    def test_15c_purchase_existing_abono_prevents_ambiguous_difference(self):
+        make_legacy_station_db(self.db_path)
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            compra_id = conn.execute(
+                "INSERT INTO compras "
+                "(total, monto_pagado, saldo_pendiente, estado) "
+                "VALUES (100, 50, 50, 'COMPLETADA')"
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO abonos_compras (id_compra, monto_abono) VALUES (?, 30)",
+                (compra_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self._migrate()
+        rows, snap = _purchase_baselines(self.db_path, compra_id)
+        self.assertEqual(rows, [])
+        self.assertEqual(snap.payments, Decimal("30.00"))
         self.assertEqual(snap.balance, Decimal("70.00"))
 
 

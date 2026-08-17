@@ -139,21 +139,48 @@ class CajaRolesTest(unittest.TestCase):
                 self.assertEqual(msg, CASH_ADMIN_DENIED)
 
     def test_10_11_12_admin_keeps_open_move_close(self):
+        for rol in ("ADMIN", "GERENTE"):
+            with self.subTest(rol=rol), phase5_env() as env:
+                self._seed(env)
+                svc = caja_service(env, rol=rol)
+                ok, msg = svc.abrir_caja(Decimal("20000"))
+                self.assertTrue(ok, msg)
+                self.assertIsNotNone(svc.obtener_caja_abierta())
+                ok, msg, _mid = svc.registrar_ingreso_manual(Decimal("5000"), "cambio")
+                self.assertTrue(ok, msg)
+                ok, msg, _mid = svc.registrar_egreso(
+                    Decimal("1000"), "Papelería", "bolsas", "EFECTIVO"
+                )
+                self.assertTrue(ok, msg)
+                self.assertEqual(svc.expected_cash(), Decimal("24000.00"))
+                ok, msg = svc.cerrar_caja(Decimal("24000"))
+                self.assertTrue(ok, msg)
+                self.assertIsNone(svc.obtener_caja_abierta())
+
+    def test_12b_employee_service_hides_sensitive_cash_information(self):
         with phase5_env() as env:
             self._seed(env)
-            svc = caja_service(env, rol="ADMIN")
-            ok, msg = svc.abrir_caja(Decimal("20000"))
-            self.assertTrue(ok, msg)
-            self.assertIsNotNone(svc.obtener_caja_abierta())
-            ok, msg, _mid = svc.registrar_ingreso_manual(Decimal("5000"), "cambio")
-            self.assertTrue(ok, msg)
-            ok, msg, _mid = svc.registrar_egreso(
-                Decimal("1000"), "Papelería", "bolsas", "EFECTIVO"
-            )
-            self.assertTrue(ok, msg)
-            ok, msg = svc.cerrar_caja(Decimal("24000"))
-            self.assertTrue(ok, msg)
-            self.assertIsNone(svc.obtener_caja_abierta())
+            open_caja(env, Decimal("12345.67"), "W01")
+            for rol in ("EMPLEADO", "VENDEDOR"):
+                with self.subTest(rol=rol):
+                    svc = caja_service(env, rol=rol)
+                    session = svc.obtener_caja_abierta()
+                    self.assertEqual(session["estado"], "OPEN")
+                    self.assertEqual(session["station_id"], "W01")
+                    self.assertNotIn("monto_inicial", session)
+                    self.assertNotIn("monto_esperado", session)
+                    for read in (
+                        svc.obtener_resumen_sesion,
+                        svc.obtener_resumen_cierre,
+                        svc.obtener_resumen_dia,
+                        svc.expected_cash,
+                        svc.obtener_historial_cierres,
+                        svc.obtener_ultimo_cierre_usuario,
+                    ):
+                        with self.assertRaisesRegex(PermissionError, CASH_ADMIN_DENIED):
+                            read()
+                    with self.assertRaisesRegex(PermissionError, CASH_ADMIN_DENIED):
+                        svc.obtener_resumen_periodo("2026-08-16", "2026-08-16")
 
     def test_13_empleado_cash_sale_one_drawer_in(self):
         with phase5_env() as env:
