@@ -274,6 +274,10 @@ class AuthManager:
                 'realizar_ventas', 'ver_productos', 'gestionar_clientes',
                 'gestionar_movimientos'
             ],
+            'EMPLEADO': [
+                'realizar_ventas', 'ver_productos', 'gestionar_clientes',
+                'gestionar_movimientos'
+            ],
             'BODEGUERO': [
                 'gestionar_movimientos', 'ver_productos', 'gestionar_productos', 'ver_dashboard'
             ],

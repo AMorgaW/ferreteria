@@ -13,7 +13,7 @@ from PySide6.QtGui import QFont, QColor
 
 from datetime import datetime
 from decimal import Decimal
-from services.caja_service import money
+from services.caja_service import is_cash_admin, money
 from ui_config import COLORS, FONTS, ICONS, make_font
 
 
@@ -90,6 +90,16 @@ class CajaUI(QWidget):
         )
         self.btn_abrir.clicked.connect(self.abrir_caja)
 
+        self.btn_ingreso = QPushButton("Ingreso / refuerzo")
+        self.btn_ingreso.setFont(make_font(FONTS['body_bold']))
+        self.btn_ingreso.setCursor(Qt.PointingHandCursor)
+        self.btn_ingreso.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
+            f"border-radius: 9px; padding: 14px 28px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
+        )
+        self.btn_ingreso.clicked.connect(self.registrar_ingreso)
+
         self.btn_cerrar = QPushButton("\U0001f512 Cerrar Caja")
         self.btn_cerrar.setFont(make_font(FONTS['body_bold']))
         self.btn_cerrar.setCursor(Qt.PointingHandCursor)
@@ -114,6 +124,7 @@ class CajaUI(QWidget):
 
         # Add buttons to layout (visibility managed in verificar_estado_caja)
         self.botones_layout.addWidget(self.btn_abrir)
+        self.botones_layout.addWidget(self.btn_ingreso)
         self.botones_layout.addWidget(self.btn_egreso)
         self.botones_layout.addWidget(self.btn_cerrar)
 
@@ -131,17 +142,18 @@ class CajaUI(QWidget):
         self.botones_layout.addWidget(self.btn_reimprimir_cierre)
 
         # Botón para historial de pagos a proveedores
+        self.btn_historial = None
         if self.abonos_repo:
-            btn_historial = QPushButton("\U0001f4dc Historial de Pagos a Proveedores")
-            btn_historial.setFont(make_font(FONTS['body_bold']))
-            btn_historial.setCursor(Qt.PointingHandCursor)
-            btn_historial.setStyleSheet(
+            self.btn_historial = QPushButton("\U0001f4dc Historial de Pagos a Proveedores")
+            self.btn_historial.setFont(make_font(FONTS['body_bold']))
+            self.btn_historial.setCursor(Qt.PointingHandCursor)
+            self.btn_historial.setStyleSheet(
                 f"QPushButton {{ background: {COLORS['primary']}; color: white; border: none; "
                 f"border-radius: 9px; padding: 12px 22px; font-weight: 500; }}"
                 f"QPushButton:hover {{ background: {COLORS['primary_dark']}; }}"
             )
-            btn_historial.clicked.connect(self.ver_historial_pagos)
-            self.botones_layout.addWidget(btn_historial)
+            self.btn_historial.clicked.connect(self.ver_historial_pagos)
+            self.botones_layout.addWidget(self.btn_historial)
 
         frame_layout.addWidget(self.botones_frame)
 
@@ -271,6 +283,27 @@ class CajaUI(QWidget):
             card['lbl_egr'].setVisible(False)
         card['lbl_neto'].setText(f"Neto:  ${neto:,.0f}")
 
+    def _es_admin_caja(self) -> bool:
+        return is_cash_admin(getattr(self.auth, "usuario_actual", None))
+
+    def _estacion_texto(self, caja=None) -> str:
+        if caja and caja.get("station_id"):
+            return str(caja["station_id"])
+        return self.caja_service.estacion_actual()
+
+    def _aplicar_visibilidad_admin(self, *, abierta: bool) -> None:
+        es_admin = self._es_admin_caja()
+        self.botones_frame.setVisible(es_admin)
+        self.resumen_frame.setVisible(es_admin)
+        self.btn_abrir.setVisible(es_admin and not abierta)
+        self.btn_ingreso.setVisible(es_admin and abierta)
+        self.btn_egreso.setVisible(es_admin and abierta)
+        self.btn_cerrar.setVisible(es_admin and abierta)
+        last = self.caja_service.obtener_ultimo_cierre_usuario() if es_admin else None
+        self.btn_reimprimir_cierre.setVisible(bool(last) and es_admin)
+        if self.btn_historial is not None:
+            self.btn_historial.setVisible(es_admin)
+
     def verificar_estado_caja(self):
         """Verifica si hay una caja abierta"""
         caja_abierta = self.caja_service.obtener_caja_abierta()
@@ -284,28 +317,39 @@ class CajaUI(QWidget):
 
     def mostrar_caja_abierta(self, caja):
         """Muestra estado de caja abierta"""
-        es_admin = (self.auth.usuario_actual and
-                    self.auth.usuario_actual.rol in ('ADMIN', 'GERENTE'))
+        es_admin = self._es_admin_caja()
+        estacion = self._estacion_texto(caja)
 
-        self.estado_label.setText("✓  Caja Abierta")
+        self.estado_label.setText("Caja Abierta")
         self.estado_label.setStyleSheet(f"color: {COLORS['success_dark']}; background: transparent; border: none;")
 
-        fecha_apertura = datetime.fromisoformat(caja['fecha_apertura']).strftime('%d/%m/%Y %H:%M')
-        resumen = self.caja_service.obtener_resumen_sesion(caja)
-        esperado = resumen.get('esperado', caja.get('monto_inicial') or 0)
-        self.info_label.setText(
-            f"Abierta el: {fecha_apertura}\n"
-            f"Monto inicial: ${caja['monto_inicial']:,.0f}\n"
-            f"Efectivo esperado: ${esperado:,.0f}"
-        )
+        if es_admin:
+            fecha_raw = caja.get("fecha_apertura") or ""
+            try:
+                fecha_apertura = datetime.fromisoformat(str(fecha_raw)).strftime("%d/%m/%Y %H:%M")
+            except ValueError:
+                fecha_apertura = str(fecha_raw)
+            resumen = self.caja_service.obtener_resumen_sesion(caja)
+            esperado = resumen.get("esperado", caja.get("monto_inicial") or 0)
+            self.info_label.setText(
+                f"Estación: {estacion}\n"
+                f"Abierta el: {fecha_apertura}\n"
+                f"Monto inicial: ${caja['monto_inicial']:,.0f}\n"
+                f"Efectivo esperado: ${esperado:,.0f}"
+            )
+        else:
+            self.info_label.setText(
+                f"Estado: ABIERTA\n"
+                f"Estación: {estacion}\n"
+                "Las ventas en efectivo se registran automáticamente en la caja."
+            )
 
-        self.btn_abrir.setVisible(False)
-        self.btn_egreso.setVisible(True)
-        self.btn_cerrar.setVisible(es_admin)
-        last = self.caja_service.obtener_ultimo_cierre_usuario()
-        self.btn_reimprimir_cierre.setVisible(bool(last) and es_admin)
+        self._aplicar_visibilidad_admin(abierta=True)
 
     def reimprimir_ultimo_cierre(self):
+        if not self._es_admin_caja():
+            QMessageBox.warning(self, "Caja", "Solo un administrador puede reimprimir cierres.")
+            return
         cierre = self.caja_service.obtener_ultimo_cierre_usuario()
         if not cierre:
             QMessageBox.information(self, "Caja", "No hay un cierre para reimprimir.")
@@ -316,25 +360,32 @@ class CajaUI(QWidget):
 
     def mostrar_caja_cerrada(self):
         """Muestra estado de caja cerrada"""
-        es_admin = (self.auth.usuario_actual and
-                    self.auth.usuario_actual.rol in ('ADMIN', 'GERENTE'))
+        es_admin = self._es_admin_caja()
+        estacion = self._estacion_texto()
 
-        self.estado_label.setText("\U0001f512 Caja Cerrada")
+        self.estado_label.setText("Caja Cerrada")
         self.estado_label.setStyleSheet(f"color: {COLORS['danger']}; background: transparent; border: none;")
 
         if es_admin:
-            self.info_label.setText("No hay una caja abierta actualmente")
+            self.info_label.setText(
+                f"Estación: {estacion}\n"
+                "No hay una caja abierta actualmente"
+            )
         else:
-            self.info_label.setText("No hay una caja abierta. Solo un administrador puede abrirla.")
+            self.info_label.setText(
+                f"Estado: CERRADA\n"
+                f"Estación: {estacion}\n"
+                "Solicite a un administrador la apertura de caja."
+            )
 
-        self.btn_cerrar.setVisible(False)
-        self.btn_egreso.setVisible(False)
-        self.btn_abrir.setVisible(es_admin)
-        last = self.caja_service.obtener_ultimo_cierre_usuario()
-        self.btn_reimprimir_cierre.setVisible(bool(last) and es_admin)
+        self._aplicar_visibilidad_admin(abierta=False)
 
     def actualizar_resumen(self):
         """Actualiza el resumen del día"""
+        if not self._es_admin_caja():
+            self.resumen_frame.setVisible(False)
+            return
+
         caja_abierta = self.caja_service.obtener_caja_abierta()
 
         if not caja_abierta:
@@ -372,16 +423,25 @@ class CajaUI(QWidget):
 
     def abrir_caja(self):
         """Abre una nueva caja"""
+        if not self._es_admin_caja():
+            QMessageBox.warning(self, "Caja", "Solo un administrador puede abrir la caja.")
+            return
         FormularioAperturaCaja(self, self.caja_service,
                                callback=self.verificar_estado_caja)
 
     def cerrar_caja(self):
         """Cierra la caja actual. Requiere acción explícita; no reabre sola."""
+        if not self._es_admin_caja():
+            QMessageBox.warning(self, "Caja", "Solo un administrador puede cerrar la caja.")
+            return
         FormularioCierreCaja(self, self.caja_service,
                              callback=self.verificar_estado_caja)
 
     def registrar_egreso(self):
         """Abre el formulario para registrar un egreso"""
+        if not self._es_admin_caja():
+            QMessageBox.warning(self, "Caja", "Solo un administrador puede registrar egresos.")
+            return
         caja_abierta = self.caja_service.obtener_caja_abierta()
         if not caja_abierta:
             QMessageBox.warning(self, "Advertencia", "Debe abrir una caja primero")
@@ -390,10 +450,25 @@ class CajaUI(QWidget):
         FormularioEgreso(self, self.caja_service,
                          callback=self.verificar_estado_caja)
 
+    def registrar_ingreso(self):
+        """Abre el formulario para un ingreso/refuerzo administrativo."""
+        if not self._es_admin_caja():
+            QMessageBox.warning(self, "Caja", "Solo un administrador puede registrar ingresos.")
+            return
+        caja_abierta = self.caja_service.obtener_caja_abierta()
+        if not caja_abierta:
+            QMessageBox.warning(self, "Advertencia", "Debe abrir una caja primero")
+            return
+        FormularioIngresoManual(self, self.caja_service,
+                                callback=self.verificar_estado_caja)
+
     MONTO_INICIAL_DEFAULT = 200_000
 
     def ver_historial_pagos(self):
         """Muestra el historial de pagos a proveedores"""
+        if not self._es_admin_caja():
+            QMessageBox.warning(self, "Caja", "Solo un administrador puede consultar este historial.")
+            return
         if not self.abonos_repo:
             QMessageBox.warning(self, "Advertencia", "Repositorio de abonos no disponible")
             return
@@ -1395,6 +1470,115 @@ class VentanaHistorialPagos(QDialog):
             QMessageBox.critical(self, "Error", f"Error al abrir formulario:\n{str(e)}")
             import traceback
             traceback.print_exc()
+
+
+class FormularioIngresoManual(QDialog):
+    """Ingreso/refuerzo administrativo. No es el DRAWER_IN de una venta."""
+
+    def __init__(self, parent, caja_service, callback=None):
+        super().__init__(parent)
+        self.caja_service = caja_service
+        self.callback = callback
+        self._formatting = False
+
+        self.setWindowTitle("Ingreso de caja")
+        self.setFixedSize(400, 300)
+        self.setModal(True)
+
+        self.crear_formulario()
+        self.exec()
+
+    def crear_formulario(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(30, 30, 30, 30)
+        main_layout.setSpacing(10)
+
+        title = QLabel("Ingreso / refuerzo")
+        title.setFont(make_font(FONTS['heading']))
+        title.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(title)
+        main_layout.addSpacing(12)
+
+        lbl_monto = QLabel("Monto en efectivo:")
+        lbl_monto.setFont(make_font(FONTS['body']))
+        main_layout.addWidget(lbl_monto)
+
+        self.monto_entry = QLineEdit("0")
+        self.monto_entry.setFont(make_font(FONTS['large']))
+        self.monto_entry.setAlignment(Qt.AlignCenter)
+        self.monto_entry.textChanged.connect(self._formatear_monto)
+        main_layout.addWidget(self.monto_entry)
+
+        lbl_motivo = QLabel("Motivo:")
+        lbl_motivo.setFont(make_font(FONTS['body']))
+        main_layout.addWidget(lbl_motivo)
+        self.motivo_entry = QLineEdit()
+        self.motivo_entry.setFont(make_font(FONTS['body']))
+        self.motivo_entry.setPlaceholderText("Obligatorio")
+        main_layout.addWidget(self.motivo_entry)
+
+        main_layout.addStretch()
+
+        btn_layout = QHBoxLayout()
+        btn_guardar = QPushButton("Registrar")
+        btn_guardar.setFont(make_font(FONTS['body_bold']))
+        btn_guardar.setCursor(Qt.PointingHandCursor)
+        btn_guardar.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['success']}; color: white; border: none; "
+            f"border-radius: 6px; padding: 10px 20px; }}"
+            f"QPushButton:hover {{ background: {COLORS['success_dark']}; }}"
+        )
+        btn_guardar.clicked.connect(self.guardar)
+        btn_guardar.setAutoDefault(False)
+        btn_guardar.setDefault(False)
+        btn_layout.addWidget(btn_guardar)
+
+        btn_cancelar = QPushButton("Cancelar")
+        btn_cancelar.setFont(make_font(FONTS['body']))
+        btn_cancelar.setCursor(Qt.PointingHandCursor)
+        btn_cancelar.setStyleSheet(
+            f"QPushButton {{ background: {COLORS['secondary']}; color: white; border: none; "
+            f"border-radius: 6px; padding: 10px 20px; }}"
+            f"QPushButton:hover {{ background: #475569; }}"
+        )
+        btn_cancelar.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_cancelar)
+        main_layout.addLayout(btn_layout)
+
+    def _formatear_monto(self, text):
+        if self._formatting:
+            return
+        self._formatting = True
+        raw = "".join(c for c in text.replace(".", "").replace(",", "") if c.isdigit())
+        if raw:
+            try:
+                self.monto_entry.setText(f"{int(raw):,}".replace(",", "."))
+            except ValueError:
+                pass
+        self._formatting = False
+
+    def guardar(self):
+        try:
+            monto = money(self.monto_entry.text().replace(".", "").replace(",", "."))
+        except ValueError:
+            QMessageBox.critical(self, "Error", "Ingrese un monto válido")
+            return
+        motivo = self.motivo_entry.text().strip()
+        if not motivo:
+            QMessageBox.critical(self, "Error", "El motivo es obligatorio")
+            return
+        usuario = getattr(getattr(self.caja_service, "auth", None), "usuario_actual", None)
+        who = getattr(usuario, "username", None)
+        ok, mensaje, _mid = self.caja_service.registrar_ingreso_manual(
+            monto, motivo, usuario=who
+        )
+        if ok:
+            QMessageBox.information(self, "Éxito", mensaje)
+            if self.callback:
+                self.callback()
+            self.accept()
+        else:
+            QMessageBox.critical(self, "Error", mensaje)
 
 
 class FormularioEgreso(QDialog):

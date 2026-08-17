@@ -519,6 +519,10 @@ class DatabaseManager:
         try:
             with timed("bootstrap.sqlite.migrations"):
                 schema_bootstrap.apply_engine_schema_fixes(conn)
+                if sqlite:
+                    from cash_schema import ensure_sqlite_cash_operational_schema
+
+                    ensure_sqlite_cash_operational_schema(conn)
             self.insertar_categorias_predefinidas(cursor)
             conn.commit()
         except Exception:
@@ -712,6 +716,10 @@ class DatabaseManager:
         conn = self.conectar()
         try:
             schema_bootstrap.apply_engine_schema_fixes(conn)
+            if schema_bootstrap.is_sqlite_connection(conn):
+                from cash_schema import ensure_sqlite_cash_operational_schema
+
+                ensure_sqlite_cash_operational_schema(conn)
             conn.commit()
         except Exception:
             try:

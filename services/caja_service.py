@@ -35,9 +35,16 @@ from cash_schema import (
     SOURCE_INGRESO,
     SOURCE_REVERSAL,
     SOURCE_VENTA,
+    ensure_sqlite_cash_operational_schema,
     is_cash_method,
     new_local_id,
     normalize_payment_method,
+)
+
+CASH_ADMIN_ROLES = frozenset({"ADMIN", "GERENTE"})
+CASH_VIEW_ROLES = frozenset({"ADMIN", "GERENTE", "VENDEDOR", "EMPLEADO"})
+CASH_ADMIN_DENIED = (
+    "Solo administradores o gerentes pueden ejecutar acciones administrativas de caja"
 )
 
 TWOPLACES = Decimal("0.01")
@@ -83,6 +90,38 @@ def resolve_station_id(explicit=None) -> str:
         return get_or_create_device_id()
     except Exception:
         return "LOCAL"
+
+
+def is_cash_admin(usuario) -> bool:
+    """ADMIN/GERENTE: comandos administrativos de caja. No usa rol del widget."""
+    rol = getattr(usuario, "rol", None) if usuario is not None else None
+    return str(rol or "") in CASH_ADMIN_ROLES
+
+
+def can_view_caja(usuario) -> bool:
+    """ADMIN y operador de ventas (VENDEDOR/EMPLEADO) pueden abrir la sección."""
+    rol = getattr(usuario, "rol", None) if usuario is not None else None
+    return str(rol or "") in CASH_VIEW_ROLES
+
+
+def _ensure_cash_schema(conn) -> None:
+    """Aplica el esquema 3D si falta station_id o cash_movements. Solo SQLite."""
+    try:
+        import schema_bootstrap
+    except Exception:
+        return
+    if not schema_bootstrap.is_sqlite_connection(conn):
+        return
+    needs_movements = not schema_bootstrap.table_exists(conn, "cash_movements")
+    needs_station = schema_bootstrap.table_exists(
+        conn, "cierres_caja"
+    ) and not schema_bootstrap.column_exists(conn, "cierres_caja", "station_id")
+    if not (needs_movements or needs_station):
+        return
+    already_in_txn = bool(getattr(conn, "in_transaction", False))
+    ensure_sqlite_cash_operational_schema(conn)
+    if not already_in_txn:
+        conn.commit()
 
 
 def cash_effect_for(direction: str, payment_method: str) -> str:
@@ -134,6 +173,7 @@ def durable_source_identity(conn, table: str, row_id) -> str:
 def fetch_open_session(conn, station_id: Optional[str] = None) -> Optional[dict]:
     if not _table_exists(conn, "cierres_caja"):
         return None
+    _ensure_cash_schema(conn)
     if station_id:
         row = conn.execute(
             """
@@ -154,8 +194,21 @@ def fetch_open_session(conn, station_id: Optional[str] = None) -> Optional[dict]
          ORDER BY fecha_apertura DESC
         """
     ).fetchall()
-    if station_id:
+    if not rows:
         return None
+    if station_id:
+        if len(rows) != 1:
+            return None
+        only = _row_dict(rows[0])
+        current = str(only.get("station_id") or "")
+        if current and current != station_id and not current.startswith("LEGACY-"):
+            return None
+        conn.execute(
+            "UPDATE cierres_caja SET station_id = ? WHERE id = ? AND fecha_cierre IS NULL",
+            (station_id, only["id"]),
+        )
+        only["station_id"] = station_id
+        return only
     if len(rows) == 1:
         return _row_dict(rows[0])
     return None
@@ -209,6 +262,7 @@ def record_cash_effect(
     require_open: bool = False,
 ) -> Tuple[bool, str, Optional[int]]:
     """Persiste exactly-once; sin OPEN deja el efecto físico pendiente."""
+    _ensure_cash_schema(conn)
     if not _table_exists(conn, "cash_movements"):
         if require_open:
             return False, NO_OPEN_SESSION, None
@@ -768,10 +822,12 @@ class CajaService:
         return getattr(self.auth, "usuario_actual", None)
 
     def _require_admin(self) -> Optional[str]:
-        usuario = self._usuario()
-        if not usuario or usuario.rol not in ("ADMIN", "GERENTE"):
-            return "Solo administradores o gerentes pueden abrir o cerrar la caja"
+        if not is_cash_admin(self._usuario()):
+            return CASH_ADMIN_DENIED
         return None
+
+    def estacion_actual(self) -> str:
+        return self._station()
 
     def obtener_caja_abierta(self) -> Optional[dict]:
         if not self._usuario():
@@ -781,6 +837,10 @@ class CajaService:
             session = fetch_open_session(conn, self._station())
             if session:
                 session["monto_inicial"] = money(session.get("monto_inicial") or 0)
+            try:
+                conn.commit()
+            except Exception:
+                pass
             return session
         finally:
             conn.close()
@@ -970,6 +1030,9 @@ class CajaService:
     ) -> Tuple[bool, str, Optional[int]]:
         if not self._usuario():
             return False, "Usuario no identificado", None
+        denied = self._require_admin()
+        if denied:
+            return False, denied, None
         try:
             valor = money(monto)
         except ValueError as exc:
@@ -1041,6 +1104,9 @@ class CajaService:
     ) -> Tuple[bool, str, Optional[int]]:
         if not self._usuario():
             return False, "Usuario no identificado", None
+        denied = self._require_admin()
+        if denied:
+            return False, denied, None
         try:
             valor = money(monto)
         except ValueError as exc:
